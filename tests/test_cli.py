@@ -134,6 +134,52 @@ class TestCLI:
             show_token_status=True,
         )
 
+    def test_strategy_best_requires_switch(self, capsys):
+        """--strategy should only be accepted alongside --switch."""
+        with patch.object(sys, "argv", ["claude-swap", "--strategy", "best", "--list"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--strategy can only be used with --switch" in capsys.readouterr().err
+
+    def test_strategy_next_available_requires_switch(self, capsys):
+        """--strategy next-available should only be accepted alongside --switch."""
+        with patch.object(sys, "argv", ["claude-swap", "--strategy", "next-available", "--list"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+        assert "--strategy can only be used with --switch" in capsys.readouterr().err
+
+    def test_strategy_rejects_unknown_value(self, capsys):
+        """argparse rejects strategies outside the known choices."""
+        with patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "bogus"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 2
+
+    def test_switch_strategy_forwarded(self):
+        """--switch --strategy best forwards the strategy to switch()."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch", "--strategy", "best"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(strategy="best")
+
+    def test_plain_switch_passes_no_strategy(self):
+        """Bare --switch forwards strategy=None."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.switch.assert_called_once_with(strategy=None)
+
     def test_slot_flag_requires_add_account(self, capsys):
         """--slot should only be accepted alongside --add-account or --add-token."""
         with patch.object(sys, "argv", ["claude-swap", "--list", "--slot", "3"]):

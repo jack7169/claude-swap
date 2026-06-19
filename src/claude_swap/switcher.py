@@ -1188,17 +1188,15 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Removed account {account_num}: {email}")
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
-    def list_accounts(
-        self,
-        show_token_status: bool = False,
-    ) -> None:
-        """List all managed accounts."""
-        if not self.sequence_file.exists():
-            print(dimmed("No accounts are managed yet."))
-            self._first_run_setup()
-            return
+    def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str]]:
+        """Build per-account (num, email, org_name, org_uuid, is_active, creds).
 
-        data = self._get_sequence_data_migrated()
+        Shared by list_accounts and the usage-aware switch helpers so the active
+        slot is detected and credentials are read in exactly one place. The
+        active account's credentials come from Claude Code's live store; every
+        other slot reads its backup copy.
+        """
+        data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
@@ -1211,7 +1209,7 @@ class ClaudeAccountSwitcher:
                     active_num = num
                     break
 
-        accounts_info = []
+        accounts_info: list[tuple[int, str, str, str, bool, str]] = []
         for num in data.get("sequence", []):
             account = data.get("accounts", {}).get(str(num), {})
             email = account.get("email", "unknown")
@@ -1225,7 +1223,18 @@ class ClaudeAccountSwitcher:
                 creds = self._read_account_credentials(str(num), email)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds))
+        return accounts_info
 
+    def _collect_usage(
+        self, accounts_info: list[tuple[int, str, str, str, bool, str]]
+    ) -> list[dict | str | None]:
+        """Fetch usage for each account (cache-first), returning one entry per row.
+
+        Each entry is a usage dict, the string ``"no credentials"``, or ``None``
+        when the API call failed. Results are cached under
+        ``<backup_dir>/cache/usage.json`` for ``_USAGE_CACHE_TTL`` seconds and
+        reused only when the cache covers exactly the same set of accounts.
+        """
         def fetch(
             account_info: tuple[int, str, str, str, bool, str]
         ) -> dict | str | None:
@@ -1255,14 +1264,90 @@ class ClaudeAccountSwitcher:
         cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
         account_keys = {str(info[0]) for info in accounts_info}
         if cached is not MISSING and isinstance(cached, dict) and cached.keys() == account_keys:
-            usages = [cached.get(str(info[0])) for info in accounts_info]
-        else:
-            with ThreadPoolExecutor() as executor:
-                usages = list(executor.map(fetch, accounts_info))
-            write_cache(usage_cache_path, {
-                str(info[0]): usage
-                for info, usage in zip(accounts_info, usages)
-            })
+            return [cached.get(str(info[0])) for info in accounts_info]
+
+        with ThreadPoolExecutor() as executor:
+            usages = list(executor.map(fetch, accounts_info))
+        write_cache(usage_cache_path, {
+            str(info[0]): usage
+            for info, usage in zip(accounts_info, usages)
+        })
+        return usages
+
+    def _usage_by_account(self) -> dict[str, dict | str | None]:
+        """Map account number → usage entry (cache-first) for managed accounts."""
+        accounts_info = self._build_accounts_info()
+        usages = self._collect_usage(accounts_info)
+        return {
+            str(info[0]): usage for info, usage in zip(accounts_info, usages)
+        }
+
+    def _select_best_switchable(
+        self, current_num: str | None
+    ) -> tuple[str | None, str]:
+        """Decide the ``best`` strategy target relative to the current account.
+
+        Compares the rate-limit headroom of every *other* switchable account
+        against the current one and only recommends a switch that lands on
+        *strictly more* headroom — never onto an account worse than where the
+        user already is. Returns ``(target, note)``:
+
+        - ``(num, "")`` — switch to ``num`` (strictly more headroom than current)
+        - ``(None, "stay")`` — current account already has the most headroom
+        - ``(None, "exhausted")`` — current is the best but everything is at its
+          limit (switching would not help)
+        - ``(None, "unavailable")`` — no other account has usage data; caller
+          falls back to plain rotation
+        - ``(None, "none")`` — no other switchable account exists
+
+        Ties (including current-vs-other) resolve in favour of staying put.
+        Never raises on network failure.
+        """
+        data = self._get_sequence_data() or {}
+        others = [
+            str(n) for n in data.get("sequence", [])
+            if str(n) != str(current_num) and self._account_is_switchable(str(n))
+        ]
+        if not others:
+            return None, "none"
+
+        usage = self._usage_by_account()
+        scored = [
+            (h, num)
+            for num in others
+            if (h := oauth.account_headroom(usage.get(num))) is not None
+        ]
+        if not scored:
+            return None, "unavailable"
+
+        # max() keeps the first maximal element; `scored` preserves rotation
+        # order, so ties resolve to the earliest slot.
+        best_headroom, best_num = max(scored, key=lambda t: t[0])
+        current_headroom = oauth.account_headroom(usage.get(str(current_num)))
+
+        if current_headroom is None:
+            # Can't compare to the current account — switch only if the best
+            # other account still has room; otherwise everything is exhausted.
+            return (best_num, "") if best_headroom > 0 else (None, "exhausted")
+
+        if best_headroom > current_headroom:
+            return best_num, ""
+        # Current account is the best (or tied). Stay; distinguish the all-maxed
+        # case so the caller can word it accurately.
+        return None, ("exhausted" if current_headroom <= 0 else "stay")
+
+    def list_accounts(
+        self,
+        show_token_status: bool = False,
+    ) -> None:
+        """List all managed accounts."""
+        if not self.sequence_file.exists():
+            print(dimmed("No accounts are managed yet."))
+            self._first_run_setup()
+            return
+
+        accounts_info = self._build_accounts_info()
+        usages = self._collect_usage(accounts_info)
 
         print(bolded("Accounts:"))
         for i, ((num, email, org_name, org_uuid, is_active, _), usage) in enumerate(zip(accounts_info, usages)):
@@ -1398,8 +1483,22 @@ class ClaudeAccountSwitcher:
 
         self.add_account()
 
-    def switch(self) -> None:
-        """Switch to next account in sequence."""
+    def switch(self, strategy: str | None = None) -> None:
+        """Switch to next account in sequence.
+
+        Args:
+            strategy: Usage-aware target selection. ``"best"`` jumps to the
+                  switchable account with the most remaining 5h/7d quota instead
+                  of advancing the rotation; ``"next-available"`` rotates to the
+                  next account, skipping any currently at its 5h/7d limit. ``None``
+                  (the default) performs a plain rotation.
+
+        The usage-aware strategies never block: if usage data can't be fetched,
+        or every candidate is exhausted, the switch falls back to plain rotation.
+        They apply to the normal path (a live Claude login present); the
+        fresh-machine path (no live login, e.g. right after --import) ignores
+        them.
+        """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
 
@@ -1463,6 +1562,39 @@ class ClaudeAccountSwitcher:
             return
 
         active_account = data.get("activeAccountNumber")
+        # Where the user actually is right now (live identity), falling back to
+        # the recorded active slot. Used so usage-aware switching never moves
+        # them onto an account worse than their current one.
+        current_num = next(
+            (num for num, acc in data.get("accounts", {}).items()
+             if acc.get("email") == current_email
+             and acc.get("organizationUuid", "") == current_org_uuid),
+            str(active_account) if active_account is not None else None,
+        )
+
+        # Usage-aware "jump to most headroom". Only switches to strictly more
+        # headroom than the current account; otherwise stays put or (when usage
+        # is unavailable) falls through to plain rotation.
+        if strategy == "best":
+            target, note = self._select_best_switchable(current_num)
+            if target is not None:
+                self._perform_switch(target)
+                return
+            if note == "stay":
+                print(
+                    f"{accent('Already on the account with the most remaining quota')} "
+                    f"(Account-{current_num})."
+                )
+                return
+            if note == "exhausted":
+                warning(
+                    f"All accounts are at their 5h/7d limit — staying on "
+                    f"Account-{current_num}."
+                )
+                return
+            if note == "unavailable":
+                print(dimmed("Usage data unavailable — rotating to the next account."))
+            # note == "none": fall through; rotation reports the lack of targets.
 
         # Find current index and get next, skipping broken candidates.
         # The active slot is never checked here — _perform_switch captures
@@ -1473,17 +1605,38 @@ class ClaudeAccountSwitcher:
         except ValueError:
             current_index = 0
 
+        # Only fetch usage when needed; an empty map means the headroom check
+        # below is always None (skipped), preserving the non-usage-aware path.
+        usage = self._usage_by_account() if strategy == "next-available" else {}
+
         next_account: str | None = None
+        skipped_exhausted: list[str] = []
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
-            if self._account_is_switchable(candidate):
-                next_account = candidate
-                break
-            print(
-                f"{accent('Skipping')} Account-{candidate} "
-                f"(no stored credentials/config, re-add with "
-                f"cswap --add-account --slot {candidate})"
+            if not self._account_is_switchable(candidate):
+                print(
+                    f"{accent('Skipping')} Account-{candidate} "
+                    f"(no stored credentials/config, re-add with "
+                    f"cswap --add-account --slot {candidate})"
+                )
+                continue
+            if strategy == "next-available":
+                headroom = oauth.account_headroom(usage.get(candidate))
+                if headroom is not None and headroom <= 0:
+                    skipped_exhausted.append(candidate)
+                    print(f"{accent('Skipping')} Account-{candidate} (at 5h/7d limit)")
+                    continue
+            next_account = candidate
+            break
+
+        # Every rotation target is at its limit. Switching onto an exhausted
+        # account would not help, so stay on the current one instead.
+        if next_account is None and skipped_exhausted:
+            warning(
+                f"All other accounts are at their 5h/7d limit — staying on "
+                f"Account-{current_num}."
             )
+            return
 
         if next_account is None:
             print(dimmed(

@@ -2475,3 +2475,172 @@ class TestSwitchSkipsBrokenSlots:
 
         with pytest.raises(ConfigError, match="No managed accounts have valid"):
             s.switch()
+
+
+class TestUsageAwareSwitch:
+    """--switch --strategy best / next-available pick targets by remaining 5h/7d
+    quota, and always fall back to plain rotation rather than blocking."""
+
+    def _setup(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        s = ClaudeAccountSwitcher()
+        s.platform = Platform.LINUX
+        s._setup_directories()
+        s._init_sequence_file()
+        return s
+
+    def _seed(self, s: ClaudeAccountSwitcher, num: int, email: str) -> None:
+        s._write_account_credentials(
+            str(num),
+            email,
+            json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": f"sk-{num}",
+                    "refreshToken": f"rt-{num}",
+                },
+            }),
+        )
+        s._write_account_config(
+            str(num),
+            email,
+            json.dumps({
+                "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+            }),
+        )
+        data = s._get_sequence_data()
+        data["accounts"][str(num)] = {
+            "email": email,
+            "uuid": f"uuid-{num}",
+            "organizationUuid": "",
+            "organizationName": "",
+            "added": "2024-01-01T00:00:00Z",
+        }
+        if num not in data["sequence"]:
+            data["sequence"].append(num)
+            data["sequence"].sort()
+        if data["activeAccountNumber"] is None:
+            data["activeAccountNumber"] = num
+        s._write_json(s.sequence_file, data)
+
+    def _make_live(self, temp_home: Path, email: str, num: int) -> None:
+        """Make account `num` the live (active) Claude login."""
+        (temp_home / ".claude" / ".credentials.json").write_text(json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live", "refreshToken": "rt-live"},
+        }))
+        (temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": email, "accountUuid": f"uuid-{num}"},
+        }))
+
+    @staticmethod
+    def _usage(pct: float) -> dict:
+        return {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+
+    def test_best_switches_to_more_headroom(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # Current (1) has 50% headroom; 3 has 80% (best), 2 has 10%.
+        usage = {"1": self._usage(50), "2": self._usage(90), "3": self._usage(20)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_best_stays_when_current_is_already_best(self, temp_home: Path, capsys):
+        """Regression: strategy "best" must NOT move you onto a worse account when you
+        already hold the most headroom (real-world bug: 89% current vs 100% other)."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # Current (1) has 11% headroom; the only other (2) is maxed out.
+        usage = {"1": self._usage(89), "2": self._usage(100)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="best")
+
+        assert "Already on the account with the most remaining quota" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1  # unchanged
+        mock_list.assert_not_called()  # no switch happened
+
+    def test_best_all_exhausted_stays_put(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(100), "2": self._usage(100), "3": self._usage(100)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best")
+
+        out = capsys.readouterr().out
+        assert "All accounts are at their 5h/7d limit" in out
+        assert "staying on Account-1" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1  # unchanged
+
+    def test_best_usage_unavailable_rotates_normally(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # No usage data for any account → unknown → fall back to rotation.
+        with patch.object(s, "_usage_by_account", return_value={"1": None, "2": None}), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="best")
+
+        assert "Usage data unavailable" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_skip_exhausted_skips_limited_account(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(0), "2": self._usage(100), "3": self._usage(20)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (at 5h/7d limit)" in out
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    def test_skip_exhausted_all_limited_stays_put(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage(0), "2": self._usage(100), "3": self._usage(100)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="next-available")
+
+        out = capsys.readouterr().out
+        assert "staying on Account-1" in out
+        # No switch onto an exhausted account; stays on the current one.
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_skip_exhausted_unknown_usage_is_not_skipped(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # Usage unknown for account 2 → must NOT be skipped (give it a chance).
+        with patch.object(s, "_usage_by_account", return_value={"1": None, "2": None}), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="next-available")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
