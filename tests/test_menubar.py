@@ -232,6 +232,13 @@ def test_decide_tie_break_by_7d_then_5h():
     assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
 
 
+def test_decide_tie_break_by_5h_when_worst_and_7d_equal():
+    # Both candidates: worst=40, 7d=40; differ only on 5h -> lower 5h wins.
+    accts = [_acct(1, 99, 10, active=True), _acct(2, 30, 40), _acct(3, 20, 40)]
+    # acct2 key=(40,40,30), acct3 key=(40,40,20) -> acct3 (lower 5h)
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 3)
+
+
 def test_decide_unknown_active():
     accts = [(1, "a@x", True, "no credentials"), _acct(2, 5, 5)]
     assert menubar.decide_auto_switch(accts, 95) == ("unknown_active", None)

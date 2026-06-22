@@ -340,6 +340,10 @@ def run(switcher) -> int:
             threading.Thread(target=self._worker, daemon=True).start()
 
         def _worker(self):
+            # Lock-free handoff: worker only rebinds plain attributes (atomic in
+            # CPython); the main-thread sync tick reads them. Worst case is acting
+            # one tick late on a slightly stale snapshot, which the staleness gate
+            # in _auto_tick already guards against.
             try:
                 snap = _snapshot(self.switcher)
                 self.snapshot = snap
@@ -363,8 +367,9 @@ def run(switcher) -> int:
             cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
             if now - self._last_auto_eval < cadence:
                 return
-            # Mode B: if the snapshot is staler than the cadence, fetch fresh and
-            # evaluate on a later tick so we never act on stale usage.
+            # If the snapshot is staler than the cadence (always true in mode B
+            # with a sub-refresh interval; possible in either mode), fetch fresh
+            # and evaluate on a later tick so we never act on stale usage.
             if now - self._snapshot_at > cadence and not self._refreshing:
                 self.refresh_async()
                 return
