@@ -18,7 +18,7 @@ from claude_swap import menubar
 def test_settings_defaults_when_file_missing(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "nope.json")
     assert s.show_account_name is True
-    assert s.show_quota_pct is True
+    assert s.title_pct == "both"
     assert s.refresh_interval == 60
     assert s.launch_at_login is False
 
@@ -27,7 +27,7 @@ def test_settings_round_trip(tmp_path: Path):
     path = tmp_path / "menubar_settings.json"
     original = menubar.MenuBarSettings(
         show_account_name=False,
-        show_quota_pct=True,
+        title_pct="5h",
         refresh_interval=300,
         launch_at_login=True,
     )
@@ -47,14 +47,14 @@ def test_settings_ignores_unknown_and_bad_types(tmp_path: Path):
     path = tmp_path / "menubar_settings.json"
     path.write_text(
         json.dumps(
-            {"refresh_interval": "fast", "bogus": 1, "show_quota_pct": False}
+            {"refresh_interval": "fast", "bogus": 1, "show_account_name": False}
         ),
         encoding="utf-8",
     )
     s = menubar.MenuBarSettings.load(path)
     # bad-typed refresh_interval falls back to default; valid bool is kept
     assert s.refresh_interval == 60
-    assert s.show_quota_pct is False
+    assert s.show_account_name is False
 
 
 _USAGE = {
@@ -95,40 +95,61 @@ def test_format_account_label():
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
-def test_format_title_both_segments():
-    s = menubar.MenuBarSettings(show_account_name=True, show_quota_pct=True)
+def test_format_title_name_and_5h():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"
 
 
-def test_format_title_name_only():
-    s = menubar.MenuBarSettings(show_account_name=True, show_quota_pct=False)
+def test_format_title_name_only_when_pct_off():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc"
 
 
-def test_format_title_pct_only():
-    s = menubar.MenuBarSettings(show_account_name=False, show_quota_pct=True)
+def test_format_title_5h_only():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="5h")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42%"
 
 
-def test_format_title_icon_only_when_all_off():
-    s = menubar.MenuBarSettings(show_account_name=False, show_quota_pct=False)
+def test_format_title_7d_only():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="7d")
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 18%"
+
+
+def test_format_title_both_windows():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42% · 18%"
+
+
+def test_format_title_both_windows_with_name():
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
+
+
+def test_format_title_icon_only_when_off():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="off")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄"
 
 
 def test_format_title_icon_only_when_no_active_account():
-    s = menubar.MenuBarSettings(show_account_name=True, show_quota_pct=True)
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
     assert menubar.format_title(None, None, s) == "⇄"
 
 
 def test_format_title_truncates_long_local_part():
-    s = menubar.MenuBarSettings(show_account_name=True, show_quota_pct=False)
+    s = menubar.MenuBarSettings(show_account_name=True, title_pct="off")
     title = menubar.format_title("averylonglocalpart@example.com", None, s)
     assert title == "⇄ averylonglo*"  # 12 chars: 11 letters + asterisk marker
 
 
-def test_format_title_drops_pct_when_unavailable():
-    s = menubar.MenuBarSettings(show_account_name=False, show_quota_pct=True)
+def test_format_title_both_drops_unavailable_windows():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
     assert menubar.format_title("loc@x.com", "no credentials", s) == "⇄"
+
+
+def test_format_title_both_keeps_available_window():
+    s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
+    # only 5h present -> 7d dropped, no trailing separator
+    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
 
 
 def test_render_launch_agent_contains_args_and_label():
@@ -294,39 +315,3 @@ def test_plan_none_and_unknown_are_noop():
     assert menubar.plan_auto_switch(("unknown_active", None), st, s, 1e9) == ("noop", None)
 
 
-# --- session % in menu-bar title (show_session_pct) ---------------------------
-
-_USAGE_SESSION = {"five_hour": {"pct": 38.0}, "seven_day": {"pct": 71.0}}
-# tightest (max) = 71; session (5h) = 38
-
-
-def test_settings_show_session_pct_default_false():
-    assert menubar.MenuBarSettings().show_session_pct is False
-
-
-def test_format_title_session_pct_only():
-    s = menubar.MenuBarSettings(
-        show_account_name=False, show_quota_pct=False, show_session_pct=True
-    )
-    assert menubar.format_title("loc@x.com", _USAGE_SESSION, s) == "⇄ 38%"
-
-
-def test_format_title_session_with_name():
-    s = menubar.MenuBarSettings(
-        show_account_name=True, show_quota_pct=False, show_session_pct=True
-    )
-    assert menubar.format_title("loc@x.com", _USAGE_SESSION, s) == "⇄ loc · 38%"
-
-
-def test_format_title_quota_then_session_when_both_on():
-    s = menubar.MenuBarSettings(
-        show_account_name=False, show_quota_pct=True, show_session_pct=True
-    )
-    assert menubar.format_title("loc@x.com", _USAGE_SESSION, s) == "⇄ 71% · 38%"
-
-
-def test_format_title_session_dropped_when_unavailable():
-    s = menubar.MenuBarSettings(
-        show_account_name=False, show_quota_pct=False, show_session_pct=True
-    )
-    assert menubar.format_title("loc@x.com", "no credentials", s) == "⇄"

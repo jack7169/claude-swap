@@ -24,6 +24,7 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
 AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
+TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 
 
 @dataclass
@@ -31,8 +32,7 @@ class MenuBarSettings:
     """User-configurable menu bar behavior, persisted as JSON."""
 
     show_account_name: bool = True
-    show_quota_pct: bool = True
-    show_session_pct: bool = False
+    title_pct: str = "both"  # one of TITLE_PCT_CHOICES
     refresh_interval: int = 60
     launch_at_login: bool = False
     auto_switch_enabled: bool = False
@@ -162,14 +162,14 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(_local_part(active_email))
-    if settings.show_quota_pct:
-        pct = tightest_pct(active_usage)
-        if pct is not None:
-            segments.append(f"{pct:.0f}%")
-    if settings.show_session_pct:
-        session = _window_pct(active_usage, "five_hour")
-        if session is not None:
-            segments.append(f"{session:.0f}%")
+    if settings.title_pct in ("5h", "both"):
+        p = _window_pct(active_usage, "five_hour")
+        if p is not None:
+            segments.append(f"{p:.0f}%")
+    if settings.title_pct in ("7d", "both"):
+        p = _window_pct(active_usage, "seven_day")
+        if p is not None:
+            segments.append(f"{p:.0f}%")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
@@ -468,13 +468,15 @@ def run(switcher) -> int:
             menu = rumps.MenuItem("Settings")
             name_item = rumps.MenuItem("Show account name in menu bar", callback=self.on_toggle_name)
             name_item.state = 1 if self.settings.show_account_name else 0
-            pct_item = rumps.MenuItem("Show quota % in menu bar", callback=self.on_toggle_pct)
-            pct_item.state = 1 if self.settings.show_quota_pct else 0
-            session_item = rumps.MenuItem("Show session % in menu bar", callback=self.on_toggle_session)
-            session_item.state = 1 if self.settings.show_session_pct else 0
             menu.add(name_item)
-            menu.add(pct_item)
-            menu.add(session_item)
+            title_pct = rumps.MenuItem("Title percentage")
+            tp_labels = {"off": "None", "5h": "Session (5h)",
+                         "7d": "Weekly (7d)", "both": "Both (5h · 7d)"}
+            for mode in TITLE_PCT_CHOICES:
+                ch = rumps.MenuItem(tp_labels[mode], callback=self._make_title_pct(mode))
+                ch.state = 1 if self.settings.title_pct == mode else 0
+                title_pct.add(ch)
+            menu.add(title_pct)
             interval = rumps.MenuItem("Refresh interval")
             labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
@@ -610,13 +612,11 @@ def run(switcher) -> int:
             self.settings.show_account_name = not self.settings.show_account_name
             self._save_and_rebuild()
 
-        def on_toggle_pct(self, _sender):
-            self.settings.show_quota_pct = not self.settings.show_quota_pct
-            self._save_and_rebuild()
-
-        def on_toggle_session(self, _sender):
-            self.settings.show_session_pct = not self.settings.show_session_pct
-            self._save_and_rebuild()
+        def _make_title_pct(self, mode):
+            def cb(_sender):
+                self.settings.title_pct = mode
+                self._save_and_rebuild()
+            return cb
 
         def _make_interval(self, secs):
             def cb(_sender):
