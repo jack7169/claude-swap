@@ -25,6 +25,7 @@ AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
 AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
+_FULL_REFRESH_EVERY = 300  # seconds between full (all-account) usage refreshes
 
 
 @dataclass
@@ -282,16 +283,22 @@ def set_launch_at_login(enabled: bool, program_args: list[str]) -> None:
         path.unlink(missing_ok=True)
 
 
-def _snapshot(switcher) -> dict:
+def _snapshot(switcher, full: bool = True) -> dict:
     """Fetch accounts + usage off the main thread. Returns a render snapshot.
 
     Shape: ``{"accounts": [(num, email, is_active, usage), ...],
     "active_email": str | None, "active_usage": dict | str | None}``.
-    Never raises — failures degrade to empty/unknown so the UI stays alive.
+    ``full=False`` fetches only the active account over the network (backups come
+    from cache) to stay under the usage endpoint's per-IP rate limit; ``full=True``
+    fetches all. Never raises — failures degrade to empty/unknown.
     """
     try:
         accounts_info = switcher._build_accounts_info()
-        usages = switcher._collect_usage(accounts_info)
+        only = None
+        if not full:
+            active = next((str(info[0]) for info in accounts_info if info[4]), None)
+            only = {active} if active else None
+        usages = switcher._collect_usage(accounts_info, only=only)
     except Exception:
         switcher._logger.debug("menubar snapshot failed", exc_info=True)
         return {"accounts": [], "active_email": None, "active_usage": None}
@@ -327,6 +334,7 @@ def run(switcher) -> int:
             self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
+            self._last_full_fetch = 0.0
             self._refreshing = False
             self.rebuild_menu()
             # Background refresh on the user's interval, plus a fast UI-sync tick
@@ -335,24 +343,29 @@ def run(switcher) -> int:
             self.refresh_timer.start()
             self.sync_timer = rumps.Timer(self.on_sync_tick, 1)
             self.sync_timer.start()
-            self.refresh_async()  # first fetch
+            self.refresh_async(full=True)  # first fetch is a full one
 
         # ---- refresh plumbing -------------------------------------------------
-        def refresh_async(self):
+        def refresh_async(self, full=False):
             if self._refreshing:
                 return  # in-flight guard: one worker at a time
             self._refreshing = True
-            threading.Thread(target=self._worker, daemon=True).start()
+            threading.Thread(target=self._worker, args=(full,), daemon=True).start()
 
-        def _worker(self):
+        def _worker(self, full):
             # Lock-free handoff: worker only rebinds plain attributes (atomic in
             # CPython); the main-thread sync tick reads them. Worst case is acting
             # one tick late on a slightly stale snapshot, which the staleness gate
             # in _auto_tick already guards against.
             try:
-                snap = _snapshot(self.switcher)
+                now = time.time()
+                if now - self._last_full_fetch >= _FULL_REFRESH_EVERY:
+                    full = True
+                snap = _snapshot(self.switcher, full=full)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
+                if full:
+                    self._last_full_fetch = self._snapshot_at
                 self._dirty = True  # picked up by on_sync_tick on the main thread
             finally:
                 self._refreshing = False
@@ -396,7 +409,7 @@ def run(switcher) -> int:
                 self.state.last_switch_at = now
                 self.state.save(state_path)
                 self._notify_autoswitch(num)
-                self.refresh_async()
+                self.refresh_async(full=True)
             elif action == "notify_noswap":
                 self.state.last_noswap_notify_at = now
                 self.state.save(state_path)
@@ -547,7 +560,7 @@ def run(switcher) -> int:
                     self.state.last_switch_at = time.time()
                     self.state.save(state_path)
                     self._notify_switched()
-                    self.refresh_async()
+                    self.refresh_async(full=True)
             return cb
 
         def _switch(self, strategy):
@@ -556,7 +569,7 @@ def run(switcher) -> int:
                     self.state.last_switch_at = time.time()
                     self.state.save(state_path)
                     self._notify_switched()
-                    self.refresh_async()
+                    self.refresh_async(full=True)
             return cb
 
         def _make_remove(self, num):
@@ -606,7 +619,7 @@ def run(switcher) -> int:
                 self.refresh_async()
 
         def on_refresh_now(self, _sender):
-            self.refresh_async()
+            self.refresh_async(full=True)
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name

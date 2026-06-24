@@ -315,3 +315,30 @@ def test_plan_none_and_unknown_are_noop():
     assert menubar.plan_auto_switch(("unknown_active", None), st, s, 1e9) == ("noop", None)
 
 
+def test_snapshot_full_fetches_all(monkeypatch):
+    seen = {}
+    class _SW:
+        _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
+        def _build_accounts_info(self):
+            creds = ""
+            return [(1, "a@x", "", "", True, creds), (2, "b@x", "", "", False, creds)]
+        def _collect_usage(self, info, only=None):
+            seen["only"] = only
+            return [None, None]
+    menubar._snapshot(_SW(), full=True)
+    assert seen["only"] is None  # full -> all accounts
+
+
+def test_snapshot_incremental_fetches_active_only():
+    seen = {}
+    class _SW:
+        _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
+        def _build_accounts_info(self):
+            return [(1, "a@x", "", "", False, ""), (2, "b@x", "", "", True, "")]
+        def _collect_usage(self, info, only=None):
+            seen["only"] = only
+            return [None, None]
+    menubar._snapshot(_SW(), full=False)
+    assert seen["only"] == {"2"}  # incremental -> only the active account
+
+
