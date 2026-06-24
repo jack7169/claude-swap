@@ -525,6 +525,9 @@ def run(switcher) -> int:
             # with a sub-refresh interval; possible in either mode), fetch fresh
             # and evaluate on a later tick so we never act on stale usage.
             if now - self._snapshot_at > cadence and not self._refreshing:
+                # consume-first forces a full fetch here; between these it may rank
+                # backups up to _FULL_REFRESH_EVERY old — fine, since it ranks by
+                # weekly reset time (days-scale), not by minute-to-minute usage.
                 self.refresh_async(full=(self.settings.auto_switch_strategy == "consume-first"))
                 return
             self._last_auto_eval = now

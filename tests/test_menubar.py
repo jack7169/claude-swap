@@ -455,6 +455,13 @@ def test_consume_first_tie_break_headroom_then_rotation():
     assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
 
 
+def test_consume_first_tie_break_by_rotation_index():
+    # #2 and #3 share reset time AND worst pct -> lower snapshot index (#2) wins.
+    accts = [_cf(1, 99, 99, _R_LATE, active=True),
+             _cf(2, 40, 40, _R_EARLY), _cf(3, 40, 40, _R_EARLY)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
+
+
 def test_consume_first_all_session_limited_is_silent():
     # everyone 5h-saturated but weekly has room -> temporary, silent stay.
     accts = [_cf(1, 99, 10, _R_EARLY, active=True), _cf(2, 98, 20, _R_LATE)]
