@@ -581,12 +581,12 @@ def run(switcher) -> int:
                     cancel="Cancel",
                 ) == 1:  # 1 == OK
                     if self._guard(lambda: self.switcher.remove_account(str(num), force=True)):
-                        self.refresh_async()
+                        self.refresh_async(full=True)
             return cb
 
         def on_add_login(self, _sender):
             if self._guard(self.switcher.add_account):
-                self.refresh_async()
+                self.refresh_async(full=True)
 
         def on_add_token(self, _sender):
             email_win = rumps.Window(
@@ -608,7 +608,7 @@ def run(switcher) -> int:
             if self._guard(lambda: self.switcher.add_account_from_token(
                 token=token_resp.text.strip(), email=email_resp.text.strip(), slot=None,
             )):
-                self.refresh_async()
+                self.refresh_async(full=True)
 
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:
@@ -616,7 +616,7 @@ def run(switcher) -> int:
                             message="No active Claude Code login detected. Log in first.")
                 return
             if self._guard(lambda: self.switcher.add_account(slot=None)):
-                self.refresh_async()
+                self.refresh_async(full=True)
 
         def on_refresh_now(self, _sender):
             self.refresh_async(full=True)
