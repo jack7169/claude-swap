@@ -14,7 +14,7 @@ import plistlib
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -24,6 +24,8 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
 AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
+AUTO_STRATEGY_CHOICES: tuple[str, ...] = ("reactive", "consume-first")
+AUTO_HYSTERESIS = 5.0  # dead band (percent) that prevents auto-switch thrash
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 _FULL_REFRESH_EVERY = 300  # seconds between full (all-account) usage refreshes
 
@@ -40,6 +42,7 @@ class MenuBarSettings:
     auto_switch_threshold: int = 95
     auto_switch_cooldown: int = 600
     auto_switch_interval: int = 0  # 0 == evaluate with each display refresh
+    auto_switch_strategy: str = "reactive"  # one of AUTO_STRATEGY_CHOICES
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -79,6 +82,7 @@ class MenuBarState:
 
     last_switch_at: float = 0.0
     last_noswap_notify_at: float = 0.0
+    blocked: list[str] = field(default_factory=list)  # 5h/limit-blocked account nums
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarState":
@@ -92,9 +96,14 @@ class MenuBarState:
             return defaults
         kwargs = {}
         for f in fields(cls):
+            default = getattr(defaults, f.name)
             val = raw.get(f.name)
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
-                kwargs[f.name] = float(val)
+            if isinstance(default, float):
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    kwargs[f.name] = float(val)
+            elif isinstance(default, list):
+                if isinstance(val, list) and all(isinstance(x, str) for x in val):
+                    kwargs[f.name] = list(val)
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:

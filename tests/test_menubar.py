@@ -342,3 +342,31 @@ def test_snapshot_incremental_fetches_active_only():
     assert seen["only"] == {"2"}  # incremental -> only the active account
 
 
+def test_settings_strategy_default():
+    assert menubar.MenuBarSettings().auto_switch_strategy == "reactive"
+
+
+def test_settings_strategy_round_trip(tmp_path: Path):
+    path = tmp_path / "s.json"
+    s = menubar.MenuBarSettings(auto_switch_strategy="consume-first")
+    s.save(path)
+    assert menubar.MenuBarSettings.load(path).auto_switch_strategy == "consume-first"
+
+
+def test_state_blocked_round_trip(tmp_path: Path):
+    path = tmp_path / "state.json"
+    st = menubar.MenuBarState(last_switch_at=1.0, blocked=["2", "3"])
+    st.save(path)
+    loaded = menubar.MenuBarState.load(path)
+    assert loaded.blocked == ["2", "3"]
+    assert loaded.last_switch_at == 1.0
+
+
+def test_state_blocked_defaults_when_malformed(tmp_path: Path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"blocked": [1, 2]}), encoding="utf-8")  # non-str elems
+    assert menubar.MenuBarState.load(path).blocked == []
+    path.write_text(json.dumps({"blocked": "nope"}), encoding="utf-8")
+    assert menubar.MenuBarState.load(path).blocked == []
+
+
