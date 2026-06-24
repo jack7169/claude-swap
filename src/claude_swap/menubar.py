@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -204,6 +205,44 @@ def _worst_pct(usage: dict | str | None) -> float | None:
     if five is None or seven is None:
         return None
     return max(five, seven)
+
+
+def next_blocked(
+    limiting_by_account: dict[str, float | None],
+    threshold: float,
+    hysteresis: float,
+    prev_blocked,
+) -> frozenset[str]:
+    """Sticky 'at-limit' set with a dead band, to stop auto-switch thrash.
+
+    An account enters the set when its limiting % is ``>= threshold`` and leaves
+    only when it drops below ``threshold - hysteresis``. Unknown (``None``) usage
+    carries the prior membership — a network blip never unblocks an account.
+    """
+    nxt: set[str] = set()
+    for num, pct in limiting_by_account.items():
+        if pct is None:
+            if num in prev_blocked:
+                nxt.add(num)
+            continue
+        if num in prev_blocked:
+            if pct >= threshold - hysteresis:
+                nxt.add(num)
+        elif pct >= threshold:
+            nxt.add(num)
+    return frozenset(nxt)
+
+
+def _resets_at_ts(window: dict | str | None) -> float:
+    """POSIX timestamp of a usage window's ``resets_at``; inf if missing/bad."""
+    if isinstance(window, dict):
+        ra = window.get("resets_at")
+        if isinstance(ra, str):
+            try:
+                return datetime.fromisoformat(ra).timestamp()
+            except ValueError:
+                pass
+    return float("inf")
 
 
 def decide_auto_switch(

@@ -370,3 +370,28 @@ def test_state_blocked_defaults_when_malformed(tmp_path: Path):
     assert menubar.MenuBarState.load(path).blocked == []
 
 
+def test_next_blocked_enter_stay_exit():
+    prev = frozenset()
+    # enter at >= threshold
+    assert menubar.next_blocked({"1": 96.0}, 95, 5, prev) == frozenset({"1"})
+    # stay blocked within the dead band (95-5=90 .. 95)
+    assert menubar.next_blocked({"1": 92.0}, 95, 5, frozenset({"1"})) == frozenset({"1"})
+    # exit only below threshold - hysteresis
+    assert menubar.next_blocked({"1": 89.0}, 95, 5, frozenset({"1"})) == frozenset()
+    # not blocked and below threshold -> stays out
+    assert menubar.next_blocked({"1": 92.0}, 95, 5, frozenset()) == frozenset()
+
+
+def test_next_blocked_unknown_carries_prev():
+    assert menubar.next_blocked({"1": None}, 95, 5, frozenset({"1"})) == frozenset({"1"})
+    assert menubar.next_blocked({"1": None}, 95, 5, frozenset()) == frozenset()
+
+
+def test_resets_at_ts_orders_and_handles_missing():
+    early = {"resets_at": "2026-06-24T07:00:00+00:00"}
+    late = {"resets_at": "2026-06-26T07:00:00+00:00"}
+    assert menubar._resets_at_ts(early) < menubar._resets_at_ts(late)
+    assert menubar._resets_at_ts({"pct": 5.0}) == float("inf")   # no resets_at
+    assert menubar._resets_at_ts({"resets_at": "garbage"}) == float("inf")
+    assert menubar._resets_at_ts(None) == float("inf")
+
