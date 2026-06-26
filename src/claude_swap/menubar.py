@@ -739,6 +739,11 @@ def run(switcher) -> int:
                 self.refresh_async(full=True)
 
         def on_add_token(self, _sender):
+            # A menu-bar (accessory) app isn't the active app, so a modal
+            # rumps.Window can render black/blank until we bring the app
+            # forward. Activate before showing the input dialogs.
+            import AppKit
+            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
             email_win = rumps.Window(
                 title="Add account from setup-token",
                 message="Email for this token:",
