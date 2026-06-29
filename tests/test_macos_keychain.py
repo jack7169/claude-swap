@@ -120,6 +120,39 @@ def test_set_password_raises_on_nonzero():
             macos_keychain.set_password("svc", "acct", "secret")
 
 
+# add-generic-password names the login keychain explicitly so a session without a
+# default keychain (launchd / GUI-app context) doesn't raise errSecNoDefaultKeychain
+# ("A keychain cannot be found to store ..."). Reads/deletes still search the list.
+def test_set_password_targets_login_keychain_stdin_form():
+    with patch("claude_swap.macos_keychain._login_keychain_path",
+               return_value="/fake/login.keychain-db"), \
+         patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", "short-secret")
+        stdin = run.call_args.kwargs["input"]
+        assert '"/fake/login.keychain-db"' in stdin
+
+
+def test_set_password_targets_login_keychain_argv_form():
+    big = "x" * macos_keychain.SECURITY_STDIN_LINE_LIMIT
+    with patch("claude_swap.macos_keychain._login_keychain_path",
+               return_value="/fake/login.keychain-db"), \
+         patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", big)
+        args = run.call_args.args[0]
+        assert args[-1] == "/fake/login.keychain-db"
+
+
+def test_set_password_omits_keychain_when_unresolved():
+    with patch("claude_swap.macos_keychain._login_keychain_path", return_value=None), \
+         patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", "s")
+        stdin = run.call_args.kwargs["input"]
+        assert stdin.rstrip().endswith("-X " + "s".encode().hex())
+
+
 def test_set_get_roundtrip_hex_is_decodable():
     # The hex written on set must decode back to the original UTF-8 secret.
     secret = 'token-with "quotes" and \\ backslash and é'

@@ -93,6 +93,25 @@ def keychain_account_name() -> str:
         return "claude-code-user"
 
 
+def _login_keychain_path() -> str | None:
+    """Absolute path to the user's login keychain, or ``None`` if not found.
+
+    Naming the target keychain on ``add-generic-password`` avoids
+    ``errSecNoDefaultKeychain`` — the GUI dialog "A keychain cannot be found to
+    store …" macOS raises on an *add* when the session has no *default* keychain
+    set. The menu bar runs in a launchd/GUI-app session that often has no default
+    keychain, yet the login keychain file still exists; reads/deletes search the
+    keychain list and are unaffected, so only writes need this explicit target.
+    Returns ``None`` off macOS (no such path), leaving the command unchanged.
+    """
+    keychains_dir = os.path.join(os.path.expanduser("~"), "Library", "Keychains")
+    for name in ("login.keychain-db", "login.keychain"):
+        path = os.path.join(keychains_dir, name)
+        if os.path.exists(path):
+            return path
+    return None
+
+
 def _quote(value: str) -> str:
     """Quote a value for a ``security -i`` stdin command line.
 
@@ -164,11 +183,25 @@ def set_password(service: str, account: str, password: str) -> None:
     :class:`KeychainError` on a non-zero exit or a timeout.
     """
     hex_value = password.encode("utf-8").hex()
+    # Name the login keychain explicitly (trailing positional arg) so the add
+    # never depends on a *default* keychain being set in this session — otherwise
+    # a launchd/GUI-app context raises errSecNoDefaultKeychain and macOS pops
+    # "A keychain cannot be found to store …". None (e.g. off macOS) → unchanged.
+    keychain = _login_keychain_path()
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
     command = (
         f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} "
-        f"-X {hex_value}\n"
+        f"-X {hex_value}"
     )
+    if keychain:
+        command += f" {_quote(keychain)}"
+    command += "\n"
+    argv = [
+        _SECURITY, "add-generic-password", "-U",
+        "-a", account, "-s", service, "-X", hex_value,
+    ]
+    if keychain:
+        argv.append(keychain)
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
             result = subprocess.run(
@@ -183,10 +216,7 @@ def set_password(service: str, account: str, password: str) -> None:
             # recoverable by a determined observer but defeats naive plaintext-grep
             # rules, and the alternative — silent corruption — is strictly worse.
             result = subprocess.run(
-                [
-                    _SECURITY, "add-generic-password", "-U",
-                    "-a", account, "-s", service, "-X", hex_value,
-                ],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=_TIMEOUT,
