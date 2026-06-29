@@ -107,6 +107,39 @@ def _target_has_meaningful_data(target: Path) -> bool:
     return False
 
 
+def _entry_names(path: Path) -> set[str]:
+    """Return the set of top-level entry names in ``path`` (empty if missing)."""
+    try:
+        return {entry.name for entry in path.iterdir()}
+    except (FileNotFoundError, NotADirectoryError):
+        return set()
+
+
+def _target_is_completed_copy(legacy: Path, target: Path) -> bool:
+    """Heuristic: did a cross-FS move already finish, leaving target complete?
+
+    During a cross-filesystem ``shutil.move`` the copy (``copytree``) runs
+    *before* the source removal (``rmtree``). If a prior run was interrupted
+    while deleting ``legacy`` after the copy already finished, ``target`` holds
+    the COMPLETE data and ``legacy`` is a partially-deleted remnant. In that
+    state, wiping ``target`` and re-moving the partial ``legacy`` would
+    permanently lose the files ``rmtree`` had already removed from ``legacy``.
+
+    We only divert to "keep target, drop legacy" on *positive* evidence of that
+    post-copy state: ``target`` holds meaningful data and is a strict superset
+    of ``legacy`` (it contains every top-level entry legacy still has, plus at
+    least one more — the entries ``rmtree`` had already deleted from legacy).
+    Without that superset relationship we keep the original, safe assumption
+    that ``legacy`` is the authoritative source and ``target`` is a discardable
+    partial copy.
+    """
+    if not _target_has_meaningful_data(target):
+        return False
+    target_names = _entry_names(target)
+    legacy_names = _entry_names(legacy)
+    return legacy_names < target_names
+
+
 def _wipe_throwaway_artifacts(target: Path) -> None:
     """Remove cache dir / log files so shutil.move can land on target."""
     try:
@@ -162,8 +195,24 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
 
     try:
         if flag.exists():
-            # Prior run was interrupted before completion. Discard any
-            # (potentially partial) target and retry the move from legacy.
+            # Prior run was interrupted before completion.
+            #
+            # The flag alone can't tell us *which* phase was interrupted. A
+            # cross-FS shutil.move copies legacy→target first, then deletes
+            # legacy. If the kill landed during that final delete (after the
+            # copy completed), target holds the COMPLETE data and legacy is a
+            # partially-deleted remnant. Blindly discarding target and
+            # re-moving the partial legacy would destroy data permanently.
+            #
+            # Only divert when there is positive evidence the copy already
+            # finished (target is a strict superset of the partially-deleted
+            # legacy): keep the complete target and remove the leftover legacy
+            # remnant. Otherwise fall back to the original, safe assumption
+            # that legacy is authoritative and target is a discardable partial.
+            if _target_is_completed_copy(legacy, target):
+                shutil.rmtree(legacy)
+                flag.unlink(missing_ok=True)
+                return False
             if target.exists():
                 shutil.rmtree(target)
         elif target.exists():

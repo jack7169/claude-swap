@@ -29,6 +29,23 @@ def test_build_notification_script_escapes_quotes_and_backslashes():
     )
 
 
+def test_build_notification_script_collapses_newlines():
+    """A stray newline (e.g. an email/identity parsed with a trailing newline)
+    must not render the Notification Center alert as broken multiple lines —
+    osascript accepts a raw newline inside the string literal and stacks it onto
+    separate lines. Control whitespace collapses to single spaces.
+    """
+    script = notify._build_notification_script("t", "line1\nline2")
+    assert "\n" not in script
+    assert script == 'display notification "line1 line2" with title "t"'
+
+
+def test_build_notification_script_collapses_all_control_whitespace():
+    script = notify._build_notification_script("a\tb", "x\r\ny\tz")
+    assert "\n" not in script and "\r" not in script and "\t" not in script
+    assert script == 'display notification "x y z" with title "a b"'
+
+
 def test_notify_noop_off_darwin(monkeypatch):
     monkeypatch.setattr(notify.sys, "platform", "linux")
     called = []

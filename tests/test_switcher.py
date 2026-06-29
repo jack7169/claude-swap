@@ -372,6 +372,87 @@ class TestAddAccountRefresh:
         assert "new-token" in stored["creds"]
 
 
+class TestAddAccountCapturedEmailValidation:
+    """Regression: the captured ~/.claude.json identity must be path-safe.
+
+    ``_get_current_account`` reads ``oauthAccount.emailAddress`` verbatim and
+    ``add_account`` interpolates it into backup filenames. A corrupt/tampered
+    config whose email contains path separators would otherwise escape
+    ``configs_dir`` / ``credentials_dir``. The captured identity must be
+    validated like every other email-input path before it touches the filesystem.
+    """
+
+    def test_add_account_rejects_traversal_email(self, temp_home: Path):
+        """An emailAddress with traversal components is refused, writing nothing."""
+        # Hand-edited config whose email escapes configs_dir when glued into a
+        # backup filename (resolves to backup_dir/evil.json — one level up).
+        malicious_email = "a/../../evil"
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(
+            json.dumps({"oauthAccount": {"emailAddress": malicious_email}})
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        # Mock the credential store so the original (buggy) code path can't touch
+        # the real Keychain; the config write is left real so an escape would
+        # actually land a file outside configs_dir on unfixed code.
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            with pytest.raises(ConfigError):
+                switcher.add_account()
+
+        # No backup file escaped configs_dir (would be backup_dir/evil.json).
+        assert not (switcher.backup_dir / "evil.json").exists()
+        # And nothing was written inside configs_dir either.
+        assert list(switcher.configs_dir.iterdir()) == []
+        # The account was not registered.
+        data = switcher._get_sequence_data()
+        assert data["accounts"] == {}
+
+    def test_add_account_rejects_non_email_identity(self, temp_home: Path):
+        """A malformed (non-email) captured identity is refused before any write."""
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "not-an-email"}})
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            with pytest.raises(ConfigError):
+                switcher.add_account()
+
+        assert list(switcher.configs_dir.iterdir()) == []
+
+    def test_add_account_accepts_valid_email(self, temp_home: Path, capsys):
+        """A normal, well-formed captured email still backs up successfully."""
+        config_path = temp_home / ".claude.json"
+        config_path.write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "good@example.com"}})
+        )
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+
+        creds = json.dumps({"claudeAiOauth": {"accessToken": "tok"}})
+        with patch.object(switcher, "_read_credentials", return_value=creds), \
+             patch.object(switcher, "_write_account_credentials"):
+            switcher.add_account()
+
+        data = switcher._get_sequence_data()
+        assert data["accounts"]["1"]["email"] == "good@example.com"
+        assert "Added" in capsys.readouterr().out
+
+
 class TestGetNextAccountNumber:
     """Test getting next account number."""
 
@@ -3328,6 +3409,36 @@ class TestRemoveAccountForce:
         data = s._get_sequence_data()
         assert "2" not in data["accounts"]
         assert 2 not in data["sequence"]
+
+    def test_removing_active_account_reseats_active_pointer(self, temp_home: Path):
+        """Removing the active account must not leave activeAccountNumber dangling
+        at a deleted slot; it reseats on the first remaining account."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 2
+        s._write_json(s.sequence_file, data)
+
+        with patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("2", force=True)
+
+        data = s._get_sequence_data()
+        assert data["activeAccountNumber"] == 1  # reseated, not the deleted slot 2
+
+    def test_removing_last_active_account_clears_active_pointer(self, temp_home: Path):
+        """Removing the only (active) account sets activeAccountNumber to None."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+
+        with patch.object(s, "_ensure_no_live_session"):
+            s.remove_account("1", force=True)
+
+        data = s._get_sequence_data()
+        assert data["activeAccountNumber"] is None
 
     def test_default_prompt_cancel_does_not_remove(self, temp_home: Path):
         """Default (force=False): answering 'n' cancels removal."""

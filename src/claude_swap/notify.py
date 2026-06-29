@@ -16,6 +16,17 @@ import sys
 _logger = logging.getLogger("claude-swap")
 
 
+def _sanitize(value: str) -> str:
+    """Collapse all whitespace runs (newlines, tabs, CRs) to single spaces.
+
+    osascript accepts a raw newline inside an AppleScript string literal and
+    Notification Center stacks it onto a separate line, so a stray ``\\n`` — e.g.
+    an account email/identity parsed with a trailing newline — renders the alert
+    as broken multiple lines. These are single-line alerts, so flatten first.
+    """
+    return " ".join(value.split())
+
+
 def _escape(value: str) -> str:
     """Escape a string for embedding in an AppleScript double-quoted literal.
 
@@ -26,10 +37,10 @@ def _escape(value: str) -> str:
 
 
 def _build_notification_script(title: str, message: str) -> str:
-    """Build the AppleScript line that posts a notification (escaping included)."""
+    """Build the AppleScript line that posts a notification (sanitize + escape)."""
     return (
-        f'display notification "{_escape(message)}" '
-        f'with title "{_escape(title)}"'
+        f'display notification "{_escape(_sanitize(message))}" '
+        f'with title "{_escape(_sanitize(title))}"'
     )
 
 

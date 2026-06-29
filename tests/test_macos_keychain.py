@@ -170,6 +170,44 @@ def test_set_get_roundtrip_hex_is_decodable():
     assert bytes.fromhex(hex_token).decode("utf-8") == secret
 
 
+# A newline in account/service must NOT split the `security -i` stdin command
+# into a second, injected subcommand (e.g. a $USER carrying `\nlock-keychain`).
+# `security -i` parses stdin line-by-line, so a control char in a quoted value
+# would run the line's tail as its own `security` command. set_password must
+# reject such values rather than emit a multi-line stdin payload.
+@pytest.mark.parametrize("evil", [
+    'me"\nlock-keychain -a INJECTED',          # newline -> injected 2nd line
+    'me\nadd-generic-password -a evil -s evil',  # bare newline
+    'me\radd-generic-password',                  # carriage return
+])
+def test_set_password_rejects_newline_in_account(evil):
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain.set_password("svc", evil, "secret")
+        # The injection must be stopped *before* anything is piped to `security`.
+        run.assert_not_called()
+
+
+def test_set_password_rejects_newline_in_service():
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        with pytest.raises(macos_keychain.KeychainError):
+            macos_keychain.set_password("svc\nlock-keychain", "acct", "secret")
+        run.assert_not_called()
+
+
+def test_set_password_stdin_is_always_single_command_line():
+    # Defense-in-depth: the stdin payload fed to `security -i` carries exactly
+    # one command (one trailing newline, none embedded), so no value can smuggle
+    # a second subcommand.
+    with patch("claude_swap.macos_keychain.subprocess.run") as run:
+        run.return_value = _completed(0)
+        macos_keychain.set_password("svc", "acct", "short-secret")
+        stdin = run.call_args.kwargs["input"]
+        assert stdin.count("\n") == 1 and stdin.endswith("\n")
+
+
 # ---------------------------------------------------------------------------
 # delete_password
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp
 
 if TYPE_CHECKING:
@@ -89,8 +90,18 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
 
 def _atomic_write_file(path: Path, content: str) -> None:
     """Write text atomically with 0600 perms — same pattern as switcher._write_json."""
-    temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-    temp_path.write_text(content, encoding="utf-8")
+    # Append (not with_suffix, which would replace the final dot-segment and
+    # mangle multi-dot destinations like ``my.backup.2026``).
+    temp_path = path.with_name(path.name + f".{os.getpid()}.tmp")
+    try:
+        temp_path.write_text(content, encoding="utf-8")
+    except FileNotFoundError:
+        # A nonexistent parent directory surfaces here as a raw OSError that
+        # the CLI's ClaudeSwitchError handler wouldn't catch — turn it into a
+        # clean TransferError, mirroring the import-side missing-file guard.
+        raise TransferError(
+            f"export destination directory does not exist: {path.parent}"
+        )
     if sys.platform != "win32":
         os.chmod(temp_path, 0o600)
     shutil.move(str(temp_path), str(path))
@@ -169,13 +180,23 @@ def export_accounts(
 
         if is_active:
             creds_text = switcher._read_credentials()
-            if not creds_text:
-                raise CredentialReadError(
-                    f"failed to read live credentials for active account {email}"
-                )
             config_path = switcher._get_claude_config_path()
-            if not config_path.exists():
-                raise ConfigError("Claude config file not found")
+            if not creds_text or not config_path.exists():
+                # In the all-accounts case, a transiently unreadable live vault
+                # (locked Keychain, credential file mid-rotation) must not poison
+                # the whole backup — skip with a warning, same as a damaged
+                # backup slot. Only hard-fail when the user named this account.
+                if explicit_account:
+                    if not creds_text:
+                        raise CredentialReadError(
+                            f"failed to read live credentials for active account {email}"
+                        )
+                    raise ConfigError("Claude config file not found")
+                _eprint(
+                    f"Skipping Account-{num} ({email}): live credentials/config "
+                    f"temporarily unreadable"
+                )
+                continue
             config_text = config_path.read_text(encoding="utf-8")
         else:
             creds_text = switcher._read_account_credentials(num, email)
@@ -372,104 +393,109 @@ def import_accounts(
     )
     resolved_active_slot: str | None = None
 
-    for entry in normalized:
-        is_envelope_active = (
-            envelope_active_str is not None
-            and entry["exported_num"] == envelope_active_str
-        )
+    # Hold the same cross-process lock that switch/switch_to take around their
+    # sequence.json updates, so a concurrent switch or the menu-bar refresh
+    # cannot interleave a write between our read-modify-write of sequence.json
+    # and silently drop a just-imported account (lost-update race).
+    with FileLock(switcher.lock_file):
+        for entry in normalized:
+            is_envelope_active = (
+                envelope_active_str is not None
+                and entry["exported_num"] == envelope_active_str
+            )
 
-        # Re-read sequence each iteration so per-account writes see prior updates
-        data = switcher._get_sequence_data_migrated() or {
-            "activeAccountNumber": None,
-            "lastUpdated": get_timestamp(),
-            "sequence": [],
-            "accounts": {},
-        }
-        existing_slot = switcher._find_account_slot(
-            data, entry["email"], entry["org_uuid"]
-        )
+            # Re-read sequence each iteration so per-account writes see prior updates
+            data = switcher._get_sequence_data_migrated() or {
+                "activeAccountNumber": None,
+                "lastUpdated": get_timestamp(),
+                "sequence": [],
+                "accounts": {},
+            }
+            existing_slot = switcher._find_account_slot(
+                data, entry["email"], entry["org_uuid"]
+            )
 
-        if existing_slot is not None:
-            if not force:
-                _eprint(
-                    f"Skipped {entry['email']} (already exists, use --force)"
-                )
-                skipped += 1
-                # Even when skipped, the envelope's active account exists
-                # locally — record where so we can seed activeAccountNumber.
-                if is_envelope_active:
-                    resolved_active_slot = existing_slot
-                continue
-            target_num = existing_slot
-            outcome = "overwrote"
-            # The credential write below invalidates the slot's non-live
-            # session profile (chokepoint in _write_account_credentials), so
-            # the next `cswap run` re-bootstraps from the imported creds. A
-            # live session keeps running on its own copy — warn about it.
-            live_pids = switcher._live_session_pids(target_num, entry["email"])
-            if live_pids:
-                _eprint(
-                    f"Warning: {entry['email']} (slot {target_num}) has a live "
-                    f"session-mode instance (PID {', '.join(map(str, live_pids))}); "
-                    "its session profile keeps the pre-import credentials until "
-                    "it is restarted via 'cswap run'."
-                )
-        else:
-            if entry["exported_num"] not in data.get("accounts", {}):
-                target_num = entry["exported_num"]
+            if existing_slot is not None:
+                if not force:
+                    _eprint(
+                        f"Skipped {entry['email']} (already exists, use --force)"
+                    )
+                    skipped += 1
+                    # Even when skipped, the envelope's active account exists
+                    # locally — record where so we can seed activeAccountNumber.
+                    if is_envelope_active:
+                        resolved_active_slot = existing_slot
+                    continue
+                target_num = existing_slot
+                outcome = "overwrote"
+                # The credential write below invalidates the slot's non-live
+                # session profile (chokepoint in _write_account_credentials), so
+                # the next `cswap run` re-bootstraps from the imported creds. A
+                # live session keeps running on its own copy — warn about it.
+                live_pids = switcher._live_session_pids(target_num, entry["email"])
+                if live_pids:
+                    _eprint(
+                        f"Warning: {entry['email']} (slot {target_num}) has a live "
+                        f"session-mode instance (PID {', '.join(map(str, live_pids))}); "
+                        "its session profile keeps the pre-import credentials until "
+                        "it is restarted via 'cswap run'."
+                    )
             else:
-                target_num = str(switcher._get_next_account_number())
-            outcome = "imported"
+                if entry["exported_num"] not in data.get("accounts", {}):
+                    target_num = entry["exported_num"]
+                else:
+                    target_num = str(switcher._get_next_account_number())
+                outcome = "imported"
 
-        switcher._write_account_credentials(
-            target_num, entry["email"], entry["creds_text"]
-        )
-        switcher._write_account_config(
-            target_num, entry["email"], entry["config_text"]
-        )
+            switcher._write_account_credentials(
+                target_num, entry["email"], entry["creds_text"]
+            )
+            switcher._write_account_config(
+                target_num, entry["email"], entry["config_text"]
+            )
 
-        data.setdefault("accounts", {})
-        data.setdefault("sequence", [])
-        new_record = {
-            "email": entry["email"],
-            "uuid": entry["uuid"],
-            "organizationUuid": entry["org_uuid"],
-            "organizationName": entry["org_name"],
-            "added": entry["added"],
-        }
-        if entry["kind"] == "api_key":
-            new_record["kind"] = "api_key"
-        data["accounts"][target_num] = new_record
-        if int(target_num) not in data["sequence"]:
-            data["sequence"].append(int(target_num))
-            data["sequence"].sort()
-        data["lastUpdated"] = get_timestamp()
-        switcher._write_json(switcher.sequence_file, data)
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            new_record = {
+                "email": entry["email"],
+                "uuid": entry["uuid"],
+                "organizationUuid": entry["org_uuid"],
+                "organizationName": entry["org_name"],
+                "added": entry["added"],
+            }
+            if entry["kind"] == "api_key":
+                new_record["kind"] = "api_key"
+            data["accounts"][target_num] = new_record
+            if int(target_num) not in data["sequence"]:
+                data["sequence"].append(int(target_num))
+                data["sequence"].sort()
+            data["lastUpdated"] = get_timestamp()
+            switcher._write_json(switcher.sequence_file, data)
 
-        if is_envelope_active:
-            resolved_active_slot = target_num
+            if is_envelope_active:
+                resolved_active_slot = target_num
 
-        if outcome == "overwrote":
-            _eprint(f"Overwrote {entry['email']} (slot {target_num})")
-            overwritten += 1
-        else:
-            _eprint(f"Imported {entry['email']} → slot {target_num}")
-            imported += 1
+            if outcome == "overwrote":
+                _eprint(f"Overwrote {entry['email']} (slot {target_num})")
+                overwritten += 1
+            else:
+                _eprint(f"Imported {entry['email']} → slot {target_num}")
+                imported += 1
 
-    # Migration UX: if the destination has no recorded active account
-    # (clean home, no prior preference), seed activeAccountNumber from the
-    # *resolved* slot of the envelope's active account — not the envelope's
-    # raw slot number, which may already be occupied locally by an unrelated
-    # account. If the user already has an active selection locally, leave it.
-    final = switcher._get_sequence_data()
-    if (
-        final is not None
-        and final.get("activeAccountNumber") in (None, 0)
-        and resolved_active_slot is not None
-    ):
-        final["activeAccountNumber"] = int(resolved_active_slot)
-        final["lastUpdated"] = get_timestamp()
-        switcher._write_json(switcher.sequence_file, final)
+        # Migration UX: if the destination has no recorded active account
+        # (clean home, no prior preference), seed activeAccountNumber from the
+        # *resolved* slot of the envelope's active account — not the envelope's
+        # raw slot number, which may already be occupied locally by an unrelated
+        # account. If the user already has an active selection locally, leave it.
+        final = switcher._get_sequence_data()
+        if (
+            final is not None
+            and final.get("activeAccountNumber") in (None, 0)
+            and resolved_active_slot is not None
+        ):
+            final["activeAccountNumber"] = int(resolved_active_slot)
+            final["lastUpdated"] = get_timestamp()
+            switcher._write_json(switcher.sequence_file, final)
 
     _eprint(
         f"Done: {imported} imported, {overwritten} overwritten, {skipped} skipped"

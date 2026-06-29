@@ -780,6 +780,19 @@ class ClaudeAccountSwitcher:
             raise ConfigError("No active Claude account found. Please log in first.")
         current_email, current_org_uuid = identity
 
+        # The captured identity comes straight from ~/.claude.json's
+        # oauthAccount.emailAddress, which is then interpolated into backup
+        # filenames (.claude-config-N-EMAIL.json / .creds-N-EMAIL.enc). Unlike
+        # the user-supplied --email path, this value is otherwise unvalidated, so
+        # a corrupt or tampered config carrying path separators (e.g. '/' or
+        # '..') would escape configs_dir/credentials_dir. Reject anything that
+        # isn't a well-formed email before it reaches the filesystem.
+        if not self._validate_email(current_email):
+            raise ConfigError(
+                f"Active Claude account has an unexpected email address: "
+                f"{current_email!r}. Refusing to back it up."
+            )
+
         # When no slot specified and account already exists, refresh credentials in place
         if slot is None and self._account_exists(current_email, current_org_uuid):
             seq = self._get_sequence_data()
@@ -1276,6 +1289,11 @@ class ClaudeAccountSwitcher:
         # Update sequence.json
         del data["accounts"][account_num]
         data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
+        # Removing the active account would leave activeAccountNumber dangling at a
+        # slot that no longer exists in accounts/sequence. Reseat it on the first
+        # remaining account (or None) so sequence.json stays internally consistent.
+        if str(active_account) == account_num:
+            data["activeAccountNumber"] = data["sequence"][0] if data["sequence"] else None
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)

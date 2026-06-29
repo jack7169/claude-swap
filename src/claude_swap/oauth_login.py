@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode
@@ -223,7 +224,9 @@ def run_login_flow(
         result = parse_callback_query(query)
         if result.error == "access_denied":
             raise LoginError("Sign-in was cancelled in the browser.")
-        if result.error or not result.code:
+        if result.error:
+            raise LoginError(f"The browser sign-in failed ({result.error}).")
+        if not result.code:
             raise LoginError("The browser sign-in returned an invalid response.")
         if result.state != state:
             raise LoginError("Sign-in state mismatch — possible cross-request error.")
@@ -274,8 +277,25 @@ def exchange_code(code: str, verifier: str, redirect_uri: str, state: str) -> di
         ) from e
 
 
+def _is_callback_path(path: str) -> bool:
+    """True only for the OAuth callback endpoint (``/callback``).
+
+    The collector is one-shot: the FIRST GET to reach the ephemeral loopback port
+    latches it. Without this guard a browser favicon/preconnect or any stray probe
+    that races ahead of the real redirect would win the slot and abort login. Query
+    string is ignored — only the path component must match.
+    """
+    return urlsplit(path).path == CALLBACK_PATH
+
+
 class _CallbackHandler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 (http.server API)
+        # Ignore anything that isn't the real callback so a stray request can't
+        # latch the one-shot collector and drop the genuine redirect.
+        if not _is_callback_path(self.path):
+            self.send_response(404)
+            self.end_headers()
+            return
         self.server.collector.submit(self.path)  # type: ignore[attr-defined]
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")

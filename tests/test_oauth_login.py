@@ -69,6 +69,16 @@ def test_parse_callback_handles_leading_question_mark_and_path():
     assert (r.code, r.state, r.error) == ("x", "y", None)
 
 
+def test_is_callback_path_accepts_only_callback_endpoint():
+    # Only the real /callback endpoint may latch the one-shot collector; a stray
+    # favicon/preconnect/probe to the loopback port must be ignored.
+    assert oauth_login._is_callback_path("/callback?code=x&state=y") is True
+    assert oauth_login._is_callback_path("/callback") is True
+    assert oauth_login._is_callback_path("/favicon.ico") is False
+    assert oauth_login._is_callback_path("/") is False
+    assert oauth_login._is_callback_path("/callbackx") is False
+
+
 def test_build_token_exchange_body_and_headers():
     url, body, headers = oauth_login.build_token_exchange(
         code="c1",
@@ -247,6 +257,17 @@ def test_run_login_flow_invalid_callback_query_raises():
     # Garbage callback (no code/state) -> LoginError before any exchange.
     with pytest.raises(oauth_login.LoginError):
         _run_flow_with_exchange("foo=bar", lambda **k: {"access_token": "x"})
+
+
+def test_run_login_flow_non_denied_error_surfaces_provider_error_code():
+    # A non-access_denied provider error must surface the real error code so the
+    # failure is diagnosable, not collapsed into a generic 'invalid response'.
+    with pytest.raises(oauth_login.LoginError) as exc:
+        _run_flow_with_exchange(
+            "error=temporarily_unavailable&state=STATE123",
+            lambda **k: {"access_token": "x"},
+        )
+    assert "temporarily_unavailable" in str(exc.value)
 
 
 @pytest.mark.parametrize("bad", [None, "not-a-dict", {}, {"error": "invalid_grant"}])

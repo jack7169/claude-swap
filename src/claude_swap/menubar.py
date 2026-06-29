@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from claude_swap import oauth
+from claude_swap import notify, oauth
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import abbreviate_path, entrypoint_label, ide_short_name
 from claude_swap.process_detection import get_running_instances
@@ -408,11 +408,14 @@ def decide_consume_first(
 
     Eligible accounts have 5h not blocked (hysteresis) AND 7d below the threshold;
     the eligible account whose 7d window resets soonest (then most headroom, then
-    rotation order) is optimal. Returns ``("switch", num)``, ``("none", None)``
-    (already optimal), ``("unknown_active", None)``, ``("no_candidate", None)``
-    (all weekly-exhausted -> notify), ``("no_candidate_unverifiable", None)``, or
-    ``("all_session_limited", None)`` (weekly room but all 5h-blocked -> silent).
-    Total — never raises.
+    rotation order) is optimal. The active account wins exact ties (it is already
+    optimal — never switch to an equally-good peer), and a missing/unparseable 7d
+    reset time on the active account never demotes it below peers (an unknown reset
+    means "no information", not "resets last"). Returns ``("switch", num)``,
+    ``("none", None)`` (already optimal), ``("unknown_active", None)``,
+    ``("no_candidate", None)`` (all weekly-exhausted -> notify),
+    ``("no_candidate_unverifiable", None)``, or ``("all_session_limited", None)``
+    (weekly room but all 5h-blocked -> silent). Total — never raises.
     """
     active = next((a for a in accounts if a[2]), None)
     if active is None:
@@ -420,7 +423,12 @@ def decide_consume_first(
     if _window_pct(active[3], "five_hour") is None or _window_pct(active[3], "seven_day") is None:
         return ("unknown_active", None)
 
-    eligible: list[tuple[float, float, int, int]] = []
+    # The active account's known 7d reset; if it's missing/unparseable we treat it
+    # as "no information" rather than the worst case, so a peer never displaces a
+    # healthy active account just because the API omitted its resets_at.
+    active_reset = _resets_at_ts(active[3].get("seven_day"))
+
+    eligible: list[tuple[float, float, int, int, bool]] = []
     any_unverifiable = False
     any_weekly_room = False
     for idx, (num, _email, is_active, usage) in enumerate(accounts):
@@ -434,15 +442,24 @@ def decide_consume_first(
             any_weekly_room = True
         limit5 = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
         if five < limit5 and seven < threshold:
-            eligible.append((_resets_at_ts(usage.get("seven_day")), _worst_pct(usage), idx, num))
+            reset = _resets_at_ts(usage.get("seven_day"))
+            # If the active account's reset is unknown, don't let a peer's known
+            # (finite) reset rank ahead of it: raise the peer's reset to the
+            # active's (inf) so only headroom/rotation can distinguish them.
+            if not is_active and active_reset == float("inf"):
+                reset = active_reset
+            eligible.append((reset, _worst_pct(usage), not is_active, idx, num))
     if not eligible:
         if any_unverifiable:
             return ("no_candidate_unverifiable", None)
         if any_weekly_room:
             return ("all_session_limited", None)
         return ("no_candidate", None)
-    eligible.sort(key=lambda e: (e[0], e[1], e[2]))
-    best_num = eligible[0][3]
+    # Tie-break order: soonest 7d reset, most headroom, then the active account
+    # (not is_active == False sorts first), then rotation index. The is_active
+    # term makes an equally-optimal active account always win.
+    eligible.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
+    best_num = eligible[0][4]
     if best_num == active[0]:
         return ("none", None)
     return ("switch", best_num)
@@ -607,6 +624,10 @@ def _gui_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
+_BOOTSTRAP_ATTEMPTS = 3
+_BOOTSTRAP_RETRY_DELAY = 0.1  # seconds; lets an async bootout settle before retry
+
+
 def install_startup() -> Path:
     """Write the LaunchAgent plist and (re)load it into the GUI session.
 
@@ -628,9 +649,31 @@ def install_startup() -> Path:
     )
     domain = _gui_domain()
     target = f"{domain}/{LAUNCH_AGENT_LABEL}"
-    # bootout is best-effort: the agent may not be loaded yet on a first install.
-    subprocess.run(["launchctl", "bootout", domain, str(plist_path)], capture_output=True)
-    subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], capture_output=True)
+    # bootout is best-effort AND asynchronous: re-installing over a running agent,
+    # it can return before launchd has finished tearing the old job down, so an
+    # immediate bootstrap of the same label transiently fails ("service already
+    # bootstrapped" / EIO). Retry a few times — re-booting out and pausing briefly
+    # between attempts — before treating a failure as real (e.g. no Aqua GUI domain
+    # over SSH, or an MDM/SIP policy blocking it).
+    bootstrap = None
+    for attempt in range(_BOOTSTRAP_ATTEMPTS):
+        subprocess.run(["launchctl", "bootout", domain, str(plist_path)], capture_output=True)
+        bootstrap = subprocess.run(
+            ["launchctl", "bootstrap", domain, str(plist_path)], capture_output=True
+        )
+        if bootstrap.returncode == 0:
+            break
+        if attempt + 1 < _BOOTSTRAP_ATTEMPTS:
+            time.sleep(_BOOTSTRAP_RETRY_DELAY)
+    # If bootstrap still failed, the agent was NOT loaded. Surface that instead of
+    # letting the caller report a misleading "installed and running" success.
+    if bootstrap.returncode != 0:
+        detail = (bootstrap.stderr or b"").decode("utf-8", "replace").strip()
+        raise ClaudeSwitchError(
+            "Failed to load the menu bar login item via "
+            f"'launchctl bootstrap {domain}'"
+            + (f": {detail}" if detail else ".")
+        )
     # Start it now too, so installing also launches the app immediately.
     subprocess.run(["launchctl", "kickstart", "-k", target], capture_output=True)
     return plist_path
@@ -644,13 +687,40 @@ def uninstall_startup() -> bool:
     )
     existed = plist_path.exists()
     if existed:
-        plist_path.unlink()
+        # missing_ok guards a TOCTOU race: a concurrent uninstall or an external
+        # deletion between exists() and unlink() must not raise FileNotFoundError.
+        plist_path.unlink(missing_ok=True)
     return existed
+
+
+def _guard_against_terminal_suspend() -> None:
+    """Ignore SIGTSTP so Ctrl+Z in a controlling terminal can't suspend the app.
+
+    Run as ``cswap --menubar`` in a foreground terminal, the menu bar app owns an
+    NSStatusItem but its Cocoa runloop is an ordinary foreground job. Ctrl+Z
+    sends SIGTSTP and *stops* the process: the icon stays drawn but is frozen and
+    unresponsive, and a stopped process can't act on the SIGHUP sent when the
+    terminal later closes — so the icon lingers as a phantom that's hard to kill.
+
+    Ignoring SIGTSTP keeps the runloop alive (Ctrl+Z becomes a no-op); a normal
+    terminal close then delivers SIGHUP, the process exits, and the system clears
+    the icon. No-op under launchd (no controlling tty) and anywhere SIGTSTP is
+    absent or can't be set (e.g. not the main thread).
+    """
+    import signal
+
+    try:
+        signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+    except (ValueError, AttributeError, OSError):
+        # ValueError: not on the main thread; AttributeError: no SIGTSTP (Windows).
+        pass
 
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     import rumps  # lazy: optional dependency, imported only when launching
+
+    _guard_against_terminal_suspend()
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     state_path = switcher.backup_dir / "menubar_state.json"
@@ -778,7 +848,9 @@ def run(switcher) -> int:
                     self.switcher.switch_to(str(num))
                 except ClaudeSwitchError as e:
                     self.switcher._logger.warning("auto-switch failed: %s", e)
-                    rumps.notification("claude-swap", "Auto-switch failed", str(e))
+                    # notify.notify (osascript) works from this non-bundled
+                    # LaunchAgent process; rumps.notification would raise here.
+                    notify.notify("claude-swap", f"Auto-switch failed: {e}")
                     return
                 self.state.last_switch_at = now
                 self.state.save(state_path)
@@ -788,13 +860,19 @@ def run(switcher) -> int:
                 # one here too would double-notify.
                 self.refresh_async(full=True)
             elif action == "notify_noswap":
+                # Post first, then record the rate-limit timestamp only after the
+                # alert is dispatched — otherwise a failed notification would burn
+                # the NOSWAP_NOTIFY_EVERY budget and suppress retries for an hour.
+                # notify.notify (osascript) works from this non-bundled process and
+                # never raises; rumps.notification would raise here.
+                notify.notify(
+                    "claude-swap",
+                    f"Claude limit — no fresh account. Active account is at its "
+                    f"limit (≥{self.settings.auto_switch_threshold}%) but no other "
+                    "account has headroom.",
+                )
                 self.state.last_noswap_notify_at = now
                 self.state.save(state_path)
-                rumps.notification(
-                    "claude-swap", "Claude limit — no fresh account",
-                    f"Active account is at its limit (≥{self.settings.auto_switch_threshold}%) "
-                    "but no other account has headroom.",
-                )
 
         # ---- menu construction ------------------------------------------------
         def rebuild_menu(self):
@@ -1028,22 +1106,27 @@ def run(switcher) -> int:
                         account_uuid=result.identity.account_uuid,
                     )
                     self.switcher._logger.info("browser sign-in added account %s", num)
+                    # Refresh first so a notification failure can never skip the
+                    # UI refresh and leave the just-added account missing.
+                    self.refresh_async(full=True)
                     # Confirm the add (this is not a swap, so it doesn't go through
                     # the unified swap notifier — post a distinct "added" alert).
-                    rumps.notification(
+                    # notify.notify (osascript) works from this non-bundled process
+                    # and never raises; rumps.notification would raise here.
+                    notify.notify(
                         "claude-swap",
-                        "Account added",
-                        f"Signed in and added {result.identity.email or f'Account-{num}'}. "
+                        f"Account added — signed in and added "
+                        f"{result.identity.email or f'Account-{num}'}. "
                         "Switch to it from the menu when ready.",
                     )
-                    self.refresh_async(full=True)
                 except ClaudeSwitchError as e:
                     self.switcher._logger.warning("browser sign-in failed: %s", e)
-                    rumps.notification("claude-swap", "Sign-in failed", str(e))
+                    notify.notify("claude-swap", f"Sign-in failed: {e}")
                 except Exception:
                     self.switcher._logger.debug("browser sign-in error", exc_info=True)
-                    rumps.notification("claude-swap", "Sign-in failed",
-                                       "An unexpected error occurred during sign-in.")
+                    notify.notify("claude-swap",
+                                  "Sign-in failed: an unexpected error occurred "
+                                  "during sign-in.")
 
             threading.Thread(target=worker, daemon=True).start()
 

@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 from pathlib import Path
 from unittest.mock import patch
 
@@ -340,6 +341,95 @@ class TestCLI:
         assert exc_info.value.code == 2
         assert "--full can only be used with --export" in capsys.readouterr().err
 
+    def test_export_empty_string_still_dispatches(self):
+        """An empty --export value must still reach export_accounts, not silently
+        no-op (regression: dispatch used truthiness instead of presence)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.export_accounts") as export_fn, \
+             patch.object(sys, "argv", ["claude-swap", "--export", ""]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        export_fn.assert_called_once_with(
+            switcher_cls.return_value, "", account=None, full=False
+        )
+
+    def test_import_empty_string_still_dispatches(self):
+        """An empty --import value must still reach import_accounts, not silently
+        no-op (regression: dispatch used truthiness instead of presence)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.import_accounts") as import_fn, \
+             patch.object(sys, "argv", ["claude-swap", "--import", ""]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "", force=False
+        )
+
+    def test_switch_to_empty_string_still_dispatches(self):
+        """An empty --switch-to value must still reach switch_to, not silently
+        no-op (regression: dispatch used truthiness instead of presence)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch-to", ""]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        switcher_cls.return_value.switch_to.assert_called_once_with(
+            "", json_output=False
+        )
+
+    def test_remove_account_empty_string_still_dispatches(self):
+        """An empty --remove-account value must still reach remove_account, not
+        silently no-op (regression: dispatch used truthiness instead of presence)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--remove-account", ""]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        switcher_cls.return_value.remove_account.assert_called_once_with("")
+
+    def test_full_with_empty_export_does_not_misfire_validation(self):
+        """--full --export "" must not error claiming --export is absent
+        (regression: validation used `not args.export` instead of `is None`)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.export_accounts") as export_fn, \
+             patch.object(sys, "argv", ["claude-swap", "--export", "", "--full"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        export_fn.assert_called_once_with(
+            switcher_cls.return_value, "", account=None, full=True
+        )
+
+    def test_force_with_empty_import_does_not_misfire_validation(self):
+        """--force --import "" must not error claiming --import is absent
+        (regression: validation used `not args.import_` instead of `is None`)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.import_accounts") as import_fn, \
+             patch.object(sys, "argv", ["claude-swap", "--import", "", "--force"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        import_fn.assert_called_once_with(
+            switcher_cls.return_value, "", force=True
+        )
+
+    def test_account_with_empty_export_does_not_misfire_validation(self):
+        """--account 2 --export "" must not error claiming --export is absent
+        (regression: validation used `not args.export` instead of `is None`)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch("claude_swap.transfer.export_accounts") as export_fn, \
+             patch.object(
+                 sys, "argv", ["claude-swap", "--export", "", "--account", "2"]
+             ), \
+             patch("os.geteuid", return_value=1000), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+        export_fn.assert_called_once_with(
+            switcher_cls.return_value, "", account="2", full=False
+        )
+
     def test_full_flag_dispatches_with_full_true(self):
         """--export --full should pass full=True into export_accounts."""
         with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
@@ -411,6 +501,9 @@ class TestCLI:
         monkeypatch.setattr(sys, "argv", ["cswap", "--menubar"])
         monkeypatch.setattr(sys, "platform", "darwin")
         monkeypatch.setattr("claude_swap.menubar.run", _fake_run, raising=False)
+        # The launch path probes ``import rumps`` first; the extra isn't a dev
+        # dependency, so inject a stand-in module to exercise the happy path.
+        monkeypatch.setitem(sys.modules, "rumps", types.ModuleType("rumps"))
         # geteuid only exists on POSIX; ensure non-root path
         monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
 
@@ -418,6 +511,34 @@ class TestCLI:
             cli.main()
         assert exc.value.code == 0
         assert called.get("ran") is True
+
+    def test_menubar_missing_rumps_shows_friendly_error(self, monkeypatch, capsys):
+        """Without the 'menubar' extra, --menubar must print an install hint and
+        exit 1 — not crash with a raw ModuleNotFoundError. Regression guard: the
+        lazy ``import rumps`` lives inside menubar.run(), so guarding the *symbol*
+        import (``from ...menubar import run``) never catches the missing extra.
+        """
+        class _FakeSwitcher:
+            def __init__(self, *a, **k):
+                pass
+            def _is_running_in_container(self):
+                return False
+            def set_switch_notifier(self, callback):
+                pass
+
+        monkeypatch.setattr(cli, "ClaudeAccountSwitcher", _FakeSwitcher)
+        monkeypatch.setattr(sys, "argv", ["cswap", "--menubar"])
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(cli.os, "geteuid", lambda: 1000, raising=False)
+        # Simulate the optional extra being absent: ``import rumps`` raises.
+        monkeypatch.setitem(sys.modules, "rumps", None)
+
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+        err = capsys.readouterr().err.lower()
+        assert "rumps" in err
+        assert "menubar" in err
 
 
 class TestCLICommands:

@@ -7,9 +7,11 @@ currently running. Uses the same mechanism Claude Code itself uses internally.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,6 +88,61 @@ def _is_pid_alive_windows(pid: int) -> bool:
         return False
 
 
+# Allowance (seconds) for the gap between a process spawning and writing its
+# session file, plus any clock skew, before we treat a later process start time
+# as evidence of PID reuse rather than the original session.
+_PID_REUSE_TOLERANCE_S = 120
+
+
+def get_process_start_time(pid: int) -> float | None:
+    """Return the process start time as epoch seconds, or None if unknown.
+
+    Used to detect PID reuse: a recycled PID belongs to a process that started
+    after the original one died. Only POSIX is supported via ``ps``; on other
+    platforms (or when ``ps`` is unavailable) this returns None and callers fall
+    back to a plain liveness check.
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        proc = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, ValueError) as exc:
+        logger.debug("Could not read start time for pid %s: %s", pid, exc)
+        return None
+    raw = proc.stdout.strip()
+    if proc.returncode != 0 or not raw:
+        return None
+    try:
+        # ps lstart format, e.g. "Mon Jun 29 19:35:56 2026" (local time).
+        dt = datetime.datetime.strptime(raw, "%a %b %d %H:%M:%S %Y")
+        return dt.timestamp()
+    except (ValueError, OverflowError) as exc:
+        logger.debug("Could not parse start time %r for pid %s: %s", raw, pid, exc)
+        return None
+
+
+def _pid_matches_started_at(pid: int, started_at_ms: int) -> bool:
+    """Whether the live PID plausibly belongs to the session that wrote the file.
+
+    Detects PID reuse: if the running process started well after the session
+    file's recorded ``startedAt``, the PID was recycled by an unrelated process
+    and the original session is dead. Conservative -- when the process start
+    time can't be determined or no ``startedAt`` was recorded, it returns True so
+    real sessions are never dropped.
+    """
+    if not started_at_ms:
+        return True
+    proc_start = get_process_start_time(pid)
+    if proc_start is None:
+        return True
+    return proc_start <= (started_at_ms / 1000) + _PID_REUSE_TOLERANCE_S
+
+
 def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
     """Read session PID files and return only those with alive processes."""
     sessions_dir = (claude_dir or get_claude_dir()) / "sessions"
@@ -98,6 +155,11 @@ def list_sessions(claude_dir: Path | None = None) -> list[ClaudeSession]:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = data["pid"]
             if not is_pid_alive(pid):
+                continue
+            if not _pid_matches_started_at(pid, data.get("startedAt", 0)):
+                logger.debug(
+                    "Skipping session file %s: pid %s appears reused", path, pid
+                )
                 continue
             sessions.append(ClaudeSession(
                 pid=pid,

@@ -118,7 +118,17 @@ def _quote(value: str) -> str:
     ``security -i`` re-parses each line shell-style, so wrap the value in double
     quotes and backslash-escape any embedded ``"``/``\\`` (e.g. the active-
     credential service name contains a space).
+
+    Quoting cannot contain a newline: ``security -i`` splits stdin on line
+    boundaries *before* tokenising, so an embedded ``\\n``/``\\r`` would end the
+    command early and run the value's tail as a separate ``security`` subcommand
+    (command injection). Reject any control character outright rather than emit a
+    multi-line payload — valid accounts/services never contain one.
     """
+    if any(ch in value for ch in "\n\r") or any(ord(ch) < 0x20 for ch in value):
+        raise KeychainError(
+            "keychain account/service name contains an illegal control character"
+        )
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 

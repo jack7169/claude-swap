@@ -14,6 +14,7 @@ from claude_swap.process_detection import (
     ClaudeSession,
     IdeInstance,
     get_claude_dir,
+    get_process_start_time,
     get_running_instances,
     is_pid_alive,
     list_ide_instances,
@@ -63,6 +64,42 @@ class TestIsPidAlive:
 
     def test_negative_pid(self):
         assert is_pid_alive(-1) is False
+
+
+# --- get_process_start_time ---
+
+
+class TestGetProcessStartTime:
+    def test_returns_none_when_ps_fails(self):
+        completed = type("P", (), {"returncode": 1, "stdout": ""})()
+        with patch("claude_swap.process_detection.sys.platform", "darwin"), patch(
+            "claude_swap.process_detection.subprocess.run", return_value=completed
+        ):
+            assert get_process_start_time(99999) is None
+
+    def test_returns_none_on_windows(self):
+        with patch("claude_swap.process_detection.sys.platform", "win32"):
+            assert get_process_start_time(1234) is None
+
+    def test_returns_none_on_unparseable_output(self):
+        completed = type("P", (), {"returncode": 0, "stdout": "garbage output"})()
+        with patch("claude_swap.process_detection.sys.platform", "darwin"), patch(
+            "claude_swap.process_detection.subprocess.run", return_value=completed
+        ):
+            assert get_process_start_time(1234) is None
+
+    def test_parses_lstart(self):
+        completed = type(
+            "P", (), {"returncode": 0, "stdout": "Mon Jun 29 19:35:56 2026   \n"}
+        )()
+        with patch("claude_swap.process_detection.sys.platform", "darwin"), patch(
+            "claude_swap.process_detection.subprocess.run", return_value=completed
+        ):
+            result = get_process_start_time(1234)
+        assert result is not None
+        assert result == pytest.approx(
+            time.mktime(time.strptime("Mon Jun 29 19:35:56 2026", "%a %b %d %H:%M:%S %Y"))
+        )
 
 
 # --- list_sessions ---
@@ -176,6 +213,61 @@ class TestListSessions:
         assert s.started_at == 1700000000000
         assert s.kind == "bg"
         assert s.entrypoint == "claude-desktop"
+
+    def test_reused_pid_is_not_live(self, tmp_path):
+        """A stale session file whose PID was recycled by a newer process must
+        not be reported as live (PID reuse: the running process started well
+        after the recorded startedAt)."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        started_ms = 1_700_000_000_000  # the original (dead) session's start
+        _write_session(sessions_dir, 4242, startedAt=started_ms)
+
+        # PID is alive, but the live process started long after startedAt,
+        # i.e. the PID was reused by an unrelated process.
+        process_start = started_ms / 1000 + 3600  # one hour later
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True), patch(
+            "claude_swap.process_detection.get_process_start_time",
+            return_value=process_start,
+        ):
+            result = list_sessions(tmp_path)
+
+        assert result == []
+
+    def test_original_pid_within_tolerance_is_live(self, tmp_path):
+        """A genuine session whose process start time matches startedAt (within
+        tolerance) must still be reported as live."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        started_ms = 1_700_000_000_000
+        _write_session(sessions_dir, 4243, startedAt=started_ms)
+
+        # Process started just after the recorded startedAt, within tolerance.
+        process_start = started_ms / 1000 + 1
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True), patch(
+            "claude_swap.process_detection.get_process_start_time",
+            return_value=process_start,
+        ):
+            result = list_sessions(tmp_path)
+
+        assert len(result) == 1
+        assert result[0].pid == 4243
+
+    def test_unknown_process_start_time_keeps_session(self, tmp_path):
+        """When the process start time cannot be determined, fall back to the
+        plain liveness check and keep the session (never drop a real one)."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, 4244, startedAt=1_700_000_000_000)
+
+        with patch("claude_swap.process_detection.is_pid_alive", return_value=True), patch(
+            "claude_swap.process_detection.get_process_start_time",
+            return_value=None,
+        ):
+            result = list_sessions(tmp_path)
+
+        assert len(result) == 1
+        assert result[0].pid == 4244
 
 
 # --- list_ide_instances ---

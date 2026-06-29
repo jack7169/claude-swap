@@ -266,6 +266,51 @@ class TestMigrateLegacyBackupDir:
         assert not (target / "stale-partial.json").exists()
         assert (target / "sequence.json").read_text() == '{"src": "legacy"}'
 
+    def test_does_not_destroy_complete_target_after_interrupted_source_cleanup(
+        self, isolated_home: Path
+    ):
+        """Flag present + target is the COMPLETE copy, legacy a partial remnant.
+
+        Cross-FS shutil.move copies legacy→target, THEN deletes legacy. If a
+        prior run was killed mid-rmtree(legacy) AFTER the copy completed, target
+        holds the complete data while legacy is a partially-deleted remnant and
+        the flag is still present. The recovery branch must NOT wipe the
+        complete target and overwrite it with the partial legacy — that would
+        permanently lose credentials/config rmtree had already removed from
+        legacy. Instead it keeps target and drops the legacy remnant.
+        """
+        # target = the complete, post-copy copy (strict superset of legacy).
+        target = isolated_home / ".local" / "share" / "claude-swap"
+        target.mkdir(parents=True)
+        (target / "sequence.json").write_text('{"complete": true}')
+        (target / "credentials").mkdir()
+        (target / "credentials" / "cred1.enc").write_text("real-creds-1")
+        (target / "credentials" / "cred2.enc").write_text("real-creds-2")
+        (target / "configs").mkdir()
+        (target / "configs" / "a.json").write_text('{"a": 1}')
+
+        # legacy = partially-deleted remnant: rmtree already removed
+        # sequence.json + cred2 + configs, leaving only a subset behind.
+        legacy = isolated_home / LEGACY_BACKUP_DIRNAME
+        legacy.mkdir()
+        (legacy / "credentials").mkdir()
+        (legacy / "credentials" / "cred1.enc").write_text("partial-leftover")
+
+        flag = target.parent / f".{target.name}.migrating"
+        flag.touch()
+
+        result = migrate_legacy_backup_dir(target)
+
+        # The complete data in target must be fully preserved.
+        assert (target / "sequence.json").read_text() == '{"complete": true}'
+        assert (target / "credentials" / "cred1.enc").read_text() == "real-creds-1"
+        assert (target / "credentials" / "cred2.enc").read_text() == "real-creds-2"
+        assert (target / "configs" / "a.json").read_text() == '{"a": 1}'
+        # The legacy remnant and the flag are cleaned up; no second move ran.
+        assert not legacy.exists()
+        assert not flag.exists()
+        assert result is False
+
     def test_cleans_stale_flag_after_completed_move(self, isolated_home: Path):
         """Flag present + legacy gone = move completed but flag wasn't unlinked.
 

@@ -299,13 +299,13 @@ Examples:
     if args.email is not None and args.add_token is None:
         parser.error("--email can only be used with --add-token")
 
-    if args.account is not None and not args.export:
+    if args.account is not None and args.export is None:
         parser.error("--account can only be used with --export")
 
-    if args.force and not args.import_:
+    if args.force and args.import_ is None:
         parser.error("--force can only be used with --import")
 
-    if args.full and not args.export:
+    if args.full and args.export is None:
         parser.error("--full can only be used with --export")
 
     # Self-upgrade runs before switcher init so we don't touch config/keychain
@@ -376,7 +376,7 @@ Examples:
                 email=args.email,
                 slot=args.slot,
             )
-        elif args.remove_account:
+        elif args.remove_account is not None:
             switcher.remove_account(args.remove_account)
         elif args.list:
             payload = switcher.list_accounts(
@@ -385,17 +385,17 @@ Examples:
             )
         elif args.switch:
             payload = switcher.switch(strategy=args.strategy, json_output=args.json)
-        elif args.switch_to:
+        elif args.switch_to is not None:
             payload = switcher.switch_to(args.switch_to, json_output=args.json)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:
             switcher.purge()
-        elif args.export:
+        elif args.export is not None:
             from claude_swap.transfer import export_accounts
 
             export_accounts(switcher, args.export, account=args.account, full=args.full)
-        elif args.import_:
+        elif args.import_ is not None:
             from claude_swap.transfer import import_accounts
 
             import_accounts(switcher, args.import_, force=args.force)
@@ -413,14 +413,20 @@ Examples:
             if sys.platform != "darwin":
                 error("The menu bar is only available on macOS.")
                 sys.exit(1)
+            # Probe the optional dependency itself: menubar.run() imports rumps
+            # lazily inside its body, so guarding ``import run`` never catches a
+            # missing extra — the import only fails once run() is invoked.
             try:
-                from claude_swap.menubar import run as menubar_run
+                import rumps  # noqa: F401  presence check before launch
             except ImportError:
                 error(
-                    "Menu bar mode requires 'rumps'. "
-                    "Install with: pip install 'claude-swap[menubar]'"
+                    "Menu bar mode requires the 'menubar' extra (rumps). "
+                    "Reinstall with it:\n"
+                    "  uv tool install 'claude-swap[menubar]'"
+                    "   (or: pip install 'claude-swap[menubar]')"
                 )
                 sys.exit(1)
+            from claude_swap.menubar import run as menubar_run
             sys.exit(menubar_run(switcher))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope

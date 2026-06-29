@@ -530,6 +530,20 @@ def test_render_launch_agent_plist_has_core_keys():
     assert parsed["LimitLoadToSessionType"] == "Aqua"
 
 
+def test_guard_against_terminal_suspend_ignores_sigtstp():
+    """Ctrl+Z must not be able to suspend (freeze) the menu bar: SIGTSTP is set
+    to SIG_IGN. Save/restore the disposition so we don't disable job control for
+    the rest of the test session."""
+    import signal
+
+    prev = signal.getsignal(signal.SIGTSTP)
+    try:
+        menubar._guard_against_terminal_suspend()
+        assert signal.getsignal(signal.SIGTSTP) == signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGTSTP, prev)
+
+
 def test_render_launch_agent_plist_keepalive_respects_clean_quit():
     # Restart on crash, but a clean Quit from the menu must stay quit
     # (KeepAlive only when the process exited non-zero).
@@ -565,12 +579,24 @@ def _fake_home(monkeypatch, tmp_path):
     monkeypatch.setattr(menubar.Path, "home", classmethod(lambda cls: tmp_path))
 
 
-def _capture_launchctl(monkeypatch):
-    """Stub subprocess.run so tests never load a real launchd agent."""
+def _fake_completed(returncode=0, stderr=b""):
+    """Minimal stand-in for subprocess.CompletedProcess (returncode + stderr)."""
+    return type("CP", (), {"returncode": returncode, "stderr": stderr})()
+
+
+def _capture_launchctl(monkeypatch, returncode=0, stderr=b""):
+    """Stub subprocess.run so tests never load a real launchd agent.
+
+    Returns a fake CompletedProcess so install_startup can inspect the bootstrap
+    returncode without spawning launchctl.
+    """
     calls: list[list[str]] = []
-    monkeypatch.setattr(
-        menubar.subprocess, "run", lambda *a, **k: calls.append(list(a[0]))
-    )
+
+    def fake_run(*a, **k):
+        calls.append(list(a[0]))
+        return _fake_completed(returncode=returncode, stderr=stderr)
+
+    monkeypatch.setattr(menubar.subprocess, "run", fake_run)
     return calls
 
 
@@ -606,6 +632,228 @@ def test_uninstall_startup_returns_false_when_not_installed(tmp_path, monkeypatc
     _fake_home(monkeypatch, tmp_path)
     _capture_launchctl(monkeypatch)
     assert menubar.uninstall_startup() is False
+
+
+# --- Finding 1: install_startup must surface a launchctl bootstrap failure -----
+
+def test_install_startup_raises_when_bootstrap_fails(tmp_path, monkeypatch):
+    # Over SSH/headless or under an MDM/SIP policy, `launchctl bootstrap gui/$UID`
+    # returns non-zero and nothing is loaded. install_startup must NOT report
+    # success: it raises ClaudeSwitchError so the CLI can report the real failure
+    # instead of claiming the agent is installed and running.
+    _fake_home(monkeypatch, tmp_path)
+
+    def fake_run(*a, **k):
+        argv = list(a[0])
+        if "bootstrap" in argv:
+            return _fake_completed(returncode=5, stderr=b"Could not find domain for: gui/501")
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(menubar.subprocess, "run", fake_run)
+
+    with pytest.raises(menubar.ClaudeSwitchError) as exc:
+        menubar.install_startup()
+    # The captured launchctl stderr is surfaced for diagnosis.
+    assert "Could not find domain" in str(exc.value)
+
+
+def test_install_startup_retries_transient_bootstrap_failure(tmp_path, monkeypatch):
+    # Re-installing over a running agent, the async bootout can leave the first
+    # bootstrap racing ("already bootstrapped"). A transient failure that clears on
+    # retry must NOT raise — the agent loads on a subsequent attempt.
+    _fake_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(menubar.time, "sleep", lambda *_a, **_k: None)
+    seq = {"n": 0}
+
+    def fake_run(*a, **k):
+        argv = list(a[0])
+        if "bootstrap" in argv:
+            seq["n"] += 1
+            # First bootstrap fails (race), second succeeds.
+            return _fake_completed(returncode=5 if seq["n"] == 1 else 0,
+                                   stderr=b"Bootstrap failed: 5: Input/output error")
+        return _fake_completed(returncode=0)
+
+    monkeypatch.setattr(menubar.subprocess, "run", fake_run)
+    path = menubar.install_startup()  # must not raise
+    assert path.exists()
+    assert seq["n"] >= 2  # retried past the transient failure
+
+
+def test_install_startup_succeeds_when_bootstrap_ok(tmp_path, monkeypatch):
+    # The common interactive-GUI path: bootstrap returns 0 -> no exception, and
+    # the kickstart call still runs (install also launches the app immediately).
+    _fake_home(monkeypatch, tmp_path)
+    calls = _capture_launchctl(monkeypatch)  # returncode 0
+    path = menubar.install_startup()
+    assert path.exists()
+    assert any("kickstart" in c for c in calls)
+
+
+# --- Finding 2: uninstall_startup must survive a unlink TOCTOU race ------------
+
+def test_uninstall_startup_tolerates_plist_vanishing_after_exists(tmp_path, monkeypatch):
+    # Simulate the TOCTOU window: exists() returns True, then the plist is gone
+    # before unlink() (a concurrent uninstall, manual rm, or external cleanup).
+    # uninstall must not raise FileNotFoundError.
+    _fake_home(monkeypatch, tmp_path)
+    _capture_launchctl(monkeypatch)
+    path = menubar.install_startup()
+    assert path.exists()
+
+    real_exists = menubar.Path.exists
+
+    def exists_then_delete(self):
+        result = real_exists(self)
+        if self == path and result:
+            # Delete the file in the window between exists() and unlink().
+            real_unlink = type(self).unlink
+            real_unlink(self)
+        return result
+
+    monkeypatch.setattr(menubar.Path, "exists", exists_then_delete)
+
+    # Without missing_ok=True this raises FileNotFoundError.
+    assert menubar.uninstall_startup() is True
+    assert not path.exists()
+
+
+# --- Findings 3/4/5: menu-bar banner notifications must route through ----------
+# notify.notify (osascript, works from the non-bundled LaunchAgent) and never
+# through rumps.notification (raises RuntimeError without a .app bundle).
+
+import ast as _ast
+
+
+def _menubar_source_tree():
+    src_path = Path(menubar.__file__)
+    return _ast.parse(src_path.read_text(encoding="utf-8"))
+
+
+def _find_function(tree, name):
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and node.name == name:
+            return node
+    raise AssertionError(f"function {name!r} not found")
+
+
+def _attr_calls(node, attr_path):
+    """Yield Call nodes whose func is the dotted ``attr_path`` (e.g. 'rumps.notification')."""
+    obj, attr = attr_path.split(".")
+    for n in _ast.walk(node):
+        if (
+            isinstance(n, _ast.Call)
+            and isinstance(n.func, _ast.Attribute)
+            and n.func.attr == attr
+            and isinstance(n.func.value, _ast.Name)
+            and n.func.value.id == obj
+        ):
+            yield n
+
+
+def test_no_rumps_notification_calls_remain():
+    # rumps.notification raises under the LaunchAgent (no bundle id); every
+    # banner must go through notify.notify instead. Comments/docstrings are
+    # ignored because we inspect the AST, not the text.
+    tree = _menubar_source_tree()
+    calls = list(_attr_calls(tree, "rumps.notification"))
+    assert calls == [], f"rumps.notification still called at lines {[c.lineno for c in calls]}"
+
+
+def test_menubar_imports_notify():
+    # The module must use the osascript notifier.
+    assert hasattr(menubar, "notify")
+    assert menubar.notify.notify.__module__ == "claude_swap.notify"
+
+
+def test_notify_noswap_persists_timestamp_after_notifying():
+    # Finding 4: the rate-limit timestamp (last_noswap_notify_at) must be written
+    # AFTER the notification is dispatched, or a failed notification would burn the
+    # NOSWAP_NOTIFY_EVERY budget and suppress retries for an hour.
+    run_fn = _find_function(_menubar_source_tree(), "_maybe_auto_switch")
+    notify_line = None
+    persist_line = None
+    for n in _ast.walk(run_fn):
+        # The notify.notify call for the no-swap banner.
+        if (
+            isinstance(n, _ast.Call)
+            and isinstance(n.func, _ast.Attribute)
+            and n.func.attr == "notify"
+            and isinstance(n.func.value, _ast.Name)
+            and n.func.value.id == "notify"
+        ):
+            notify_line = n.lineno
+        # The assignment self.state.last_noswap_notify_at = now
+        if isinstance(n, _ast.Assign):
+            for tgt in n.targets:
+                if isinstance(tgt, _ast.Attribute) and tgt.attr == "last_noswap_notify_at":
+                    persist_line = n.lineno
+    assert notify_line is not None and persist_line is not None
+    assert notify_line < persist_line, "must notify before persisting the rate-limit timestamp"
+
+
+def test_browser_signin_refreshes_before_success_notification():
+    # Finding 5: refresh_async(full=True) must run BEFORE the "Account added"
+    # notification so a notification failure can never skip the UI refresh and
+    # leave the just-added account missing from the menu.
+    tree = _menubar_source_tree()
+    worker = _find_function(tree, "worker")
+    refresh_lines = []
+    notify_lines = []
+    for n in _ast.walk(worker):
+        if (
+            isinstance(n, _ast.Call)
+            and isinstance(n.func, _ast.Attribute)
+            and n.func.attr == "refresh_async"
+        ):
+            refresh_lines.append(n.lineno)
+        if (
+            isinstance(n, _ast.Call)
+            and isinstance(n.func, _ast.Attribute)
+            and n.func.attr == "notify"
+            and isinstance(n.func.value, _ast.Name)
+            and n.func.value.id == "notify"
+        ):
+            notify_lines.append(n.lineno)
+    assert refresh_lines and notify_lines
+    # The success-path refresh must precede the success-path "Account added" notify
+    # (the earliest notify in source order).
+    assert min(refresh_lines) < min(notify_lines), \
+        "must refresh before the success notification"
+
+
+# --- Finding 6: consume-first must not switch off an equally-optimal active ----
+
+def test_consume_first_stays_on_tie_when_active_listed_after_peer():
+    # Active account ties a peer on BOTH the 7d reset time AND worst-pct, and the
+    # active account is listed AFTER the equally-good peer. The active account is
+    # already optimal -> stay, not a pointless switch to the peer.
+    accts = [_cf(1, 10, 10, _R_EARLY), _cf(2, 10, 10, _R_EARLY, active=True)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("none", None)
+
+
+# --- Finding 7: consume-first must not churn off a healthy active account whose
+# 7d reset time is missing/unparseable (API omitted resets_at). ----------------
+
+def _cf_no_reset(num, pct5, pct7, active=False):
+    return (num, f"a{num}@x.com", active,
+            {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}})  # no resets_at
+
+
+def test_consume_first_stays_when_active_reset_missing():
+    # Active #2 has a healthy 7d pct but no resets_at; peer #1 has a parseable
+    # reset. The active must not be demoted below the peer (an unknown reset is
+    # "no information", not "resets last").
+    accts = [_cf(1, 10, 10, _R_EARLY), _cf_no_reset(2, 10, 10, active=True)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("none", None)
+
+
+def test_consume_first_missing_active_reset_does_not_switch_to_worse_peer():
+    # Active #2 has huge headroom (5%/5%) but no resets_at; peer #1 is far worse
+    # (50%/50%) with a parseable reset. Switching to the strictly worse account
+    # would be wrong.
+    accts = [_cf(1, 50, 50, _R_EARLY), _cf_no_reset(2, 5, 5, active=True)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("none", None)
 
 
 # --- account_detail_lines (Feature 1: flat indented status view) -------------

@@ -1215,3 +1215,168 @@ class TestImportSessionInvalidation:
         assert (session_dir / ".credentials.json").read_text() == "pre-import creds"
         alice = s._read_account_credentials("1", "alice@example.com")
         assert json.loads(alice)["_marker"] == "NEW"
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: import holds the FileLock during sequence.json read-modify-write
+# ---------------------------------------------------------------------------
+
+
+class TestImportHoldsLock:
+    """import_accounts must acquire switcher.lock_file around its sequence.json
+    writes, matching switch/switch_to, so a concurrent switch or the menu-bar
+    refresh can't interleave and silently drop a just-imported account."""
+
+    def test_import_acquires_file_lock_for_sequence_writes(self, temp_home: Path):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        out = temp_home / "x.cswap"
+        export_accounts(s, str(out), account="1")
+
+        # Import into a fresh home and spy on the FileLock the transfer module
+        # uses. On the unlocked (buggy) code, transfer never references
+        # FileLock at all, so this spy is never invoked.
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        seen_lock_paths: list[Path] = []
+
+        import claude_swap.transfer as transfer_mod
+
+        real_file_lock = transfer_mod.FileLock
+
+        class _SpyLock(real_file_lock):  # type: ignore[misc, valid-type]
+            def __enter__(self_inner):
+                seen_lock_paths.append(self_inner.lock_path)
+                return super().__enter__()
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                with patch.object(transfer_mod, "FileLock", _SpyLock):
+                    import_accounts(dst, str(out))
+
+                # The lock that was held must be the switcher's lock_file —
+                # the same lock switch_to/_perform_switch acquire.
+                assert dst.lock_file in seen_lock_paths
+
+                # And the account still landed (lock didn't break the write).
+                seq = dst._get_sequence_data()
+                assert seq["accounts"]["1"]["email"] == "alice@example.com"
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: live active-account read failure must not poison all-account export
+# ---------------------------------------------------------------------------
+
+
+class TestExportSkipsBrokenActiveSlot:
+    """If the live active account's credentials are transiently unreadable, an
+    all-accounts export must skip-with-warning (not abort the whole backup);
+    an explicit single-account export of that slot must still hard-fail."""
+
+    def _make_active(self, switcher: ClaudeAccountSwitcher, email: str, org_uuid: str = "") -> None:
+        """Write ~/.claude.json so _get_current_account() reports this identity."""
+        config_path = switcher._get_claude_config_path()
+        config_path.write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {
+                        "emailAddress": email,
+                        "organizationUuid": org_uuid,
+                    }
+                }
+            )
+        )
+
+    def test_all_accounts_skips_unreadable_active_live_vault(
+        self, temp_home: Path, capsys
+    ):
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        _seed_account(s, 2, "bob@example.com")
+        # Make alice (slot 1) the live active account.
+        self._make_active(s, "alice@example.com")
+
+        out = temp_home / "backup.cswap"
+        # Live vault read transiently fails (empty) — e.g. Keychain locked or
+        # credential file mid-rotation. The active branch must skip, not abort.
+        with patch.object(s, "_read_credentials", return_value=""):
+            export_accounts(s, str(out))
+
+        envelope = json.loads(out.read_text())
+        # The healthy backup of bob is still exported; alice is skipped.
+        assert [a["email"] for a in envelope["accounts"]] == ["bob@example.com"]
+
+        captured = capsys.readouterr()
+        assert "Skipping Account-1" in captured.err
+        assert "alice@example.com" in captured.err
+
+    def test_explicit_active_with_unreadable_live_vault_hard_fails(
+        self, temp_home: Path
+    ):
+        from claude_swap.exceptions import CredentialReadError
+
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+        self._make_active(s, "alice@example.com")
+
+        with patch.object(s, "_read_credentials", return_value=""):
+            with pytest.raises(CredentialReadError, match="live credentials"):
+                export_accounts(s, str(temp_home / "x.cswap"), account="1")
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: atomic write — multi-dot temp name + nonexistent parent guard
+# ---------------------------------------------------------------------------
+
+
+class TestAtomicWriteDestination:
+    def test_multi_dot_destination_preserved(self, temp_home: Path):
+        """A destination like ``my.backup.2026`` must land at exactly that path
+        (with_suffix would have produced a mangled temp name, but the final
+        path must always be intact)."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+
+        out = temp_home / "my.backup.2026"
+        export_accounts(s, str(out))
+
+        assert out.exists()
+        envelope = json.loads(out.read_text())
+        assert envelope["accounts"][0]["email"] == "alice@example.com"
+        # No stray temp file left behind in the directory.
+        assert not list(temp_home.glob("*.tmp"))
+
+    def test_temp_name_appends_rather_than_replaces_suffix(self, temp_home: Path):
+        """_atomic_write_file must append the .<pid>.tmp marker, keeping the
+        full original filename (including any dotted segments) intact."""
+        from claude_swap.transfer import _atomic_write_file
+
+        captured: dict[str, Path] = {}
+        orig_write_text = Path.write_text
+
+        def _spy_write_text(self_path, *args, **kwargs):
+            captured["temp"] = Path(self_path)
+            return orig_write_text(self_path, *args, **kwargs)
+
+        dest = temp_home / "my.backup.2026"
+        with patch.object(Path, "write_text", _spy_write_text):
+            _atomic_write_file(dest, "data\n")
+
+        # The temp filename must contain the full original name, not a version
+        # with the final dot-segment ("2026") dropped.
+        assert captured["temp"].name.startswith("my.backup.2026.")
+        assert dest.read_text() == "data\n"
+
+    def test_export_to_nonexistent_parent_dir_raises_transfer_error(
+        self, temp_home: Path
+    ):
+        """Exporting under a directory that does not exist must raise a clean
+        TransferError, not a raw FileNotFoundError that escapes the CLI's
+        ClaudeSwitchError handler."""
+        s = _linux_switcher(temp_home)
+        _seed_account(s, 1, "alice@example.com")
+
+        missing = temp_home / "does_not_exist" / "sub" / "out.cswap"
+        with pytest.raises(TransferError, match="directory does not exist"):
+            export_accounts(s, str(missing))
