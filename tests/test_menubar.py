@@ -7,6 +7,7 @@ These tests never import or run rumps/AppKit. They exercise the pure helpers
 from __future__ import annotations
 
 import json
+import plistlib
 from pathlib import Path
 
 import pytest
@@ -508,3 +509,100 @@ def test_usage_summary_omits_countdown_when_passed_or_missing():
     # 5h reset already passed (stale data) -> omit; 7d has no resets_at -> omit
     usage = {"five_hour": {"pct": 53.0, "resets_at": _iso(-60)}, "seven_day": {"pct": 8.0}}
     assert menubar.usage_summary(usage, _NOW) == "5h 53% · 7d 8%"
+
+
+# --- LaunchAgent plist rendering (cswap --install-startup) -------------------
+
+def test_render_launch_agent_plist_has_core_keys():
+    xml = menubar.render_launch_agent_plist(
+        label="com.claude-swap.menubar",
+        program_args=["/path/python", "-m", "claude_swap", "--menubar"],
+    )
+    parsed = plistlib.loads(xml.encode("utf-8"))
+    assert parsed["Label"] == "com.claude-swap.menubar"
+    assert parsed["ProgramArguments"] == [
+        "/path/python", "-m", "claude_swap", "--menubar",
+    ]
+    # Start at login and whenever the agent is bootstrapped.
+    assert parsed["RunAtLoad"] is True
+    # Must load into the GUI (Aqua) session: a menu-bar icon needs WindowServer,
+    # and Keychain access only works from the user's unlocked GUI session.
+    assert parsed["LimitLoadToSessionType"] == "Aqua"
+
+
+def test_render_launch_agent_plist_keepalive_respects_clean_quit():
+    # Restart on crash, but a clean Quit from the menu must stay quit
+    # (KeepAlive only when the process exited non-zero).
+    xml = menubar.render_launch_agent_plist(
+        label="x", program_args=["cswap", "--menubar"],
+    )
+    parsed = plistlib.loads(xml.encode("utf-8"))
+    assert parsed["KeepAlive"] == {"SuccessfulExit": False}
+
+
+def test_render_launch_agent_plist_includes_log_paths_when_given():
+    xml = menubar.render_launch_agent_plist(
+        label="x",
+        program_args=["cswap", "--menubar"],
+        stdout_path="/tmp/out.log",
+        stderr_path="/tmp/err.log",
+    )
+    parsed = plistlib.loads(xml.encode("utf-8"))
+    assert parsed["StandardOutPath"] == "/tmp/out.log"
+    assert parsed["StandardErrorPath"] == "/tmp/err.log"
+
+
+def test_render_launch_agent_plist_omits_log_paths_when_absent():
+    xml = menubar.render_launch_agent_plist(
+        label="x", program_args=["cswap", "--menubar"],
+    )
+    parsed = plistlib.loads(xml.encode("utf-8"))
+    assert "StandardOutPath" not in parsed
+    assert "StandardErrorPath" not in parsed
+
+
+def _fake_home(monkeypatch, tmp_path):
+    monkeypatch.setattr(menubar.Path, "home", classmethod(lambda cls: tmp_path))
+
+
+def _capture_launchctl(monkeypatch):
+    """Stub subprocess.run so tests never load a real launchd agent."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        menubar.subprocess, "run", lambda *a, **k: calls.append(list(a[0]))
+    )
+    return calls
+
+
+def test_install_startup_writes_valid_plist_and_bootstraps(tmp_path, monkeypatch):
+    _fake_home(monkeypatch, tmp_path)
+    calls = _capture_launchctl(monkeypatch)
+
+    path = menubar.install_startup()
+
+    assert path == tmp_path / "Library/LaunchAgents/com.claude-swap.menubar.plist"
+    parsed = plistlib.loads(path.read_bytes())
+    assert parsed["Label"] == menubar.LAUNCH_AGENT_LABEL
+    assert parsed["ProgramArguments"][-1] == "--menubar"
+    # It must (re)load into the user's GUI domain.
+    assert any("bootstrap" in c and any("gui/" in a for a in c) for c in calls)
+
+
+def test_uninstall_startup_unloads_and_removes_plist(tmp_path, monkeypatch):
+    _fake_home(monkeypatch, tmp_path)
+    calls = _capture_launchctl(monkeypatch)
+
+    path = menubar.install_startup()
+    assert path.exists()
+
+    existed = menubar.uninstall_startup()
+
+    assert existed is True
+    assert not path.exists()
+    assert any("bootout" in c for c in calls)
+
+
+def test_uninstall_startup_returns_false_when_not_installed(tmp_path, monkeypatch):
+    _fake_home(monkeypatch, tmp_path)
+    _capture_launchctl(monkeypatch)
+    assert menubar.uninstall_startup() is False

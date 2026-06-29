@@ -186,6 +186,39 @@ class TestCLI:
             strategy=None, json_output=False
         )
 
+    def test_install_startup_invokes_installer_and_exits_zero(self, capsys):
+        """--install-startup installs the LaunchAgent without needing a switcher."""
+        with patch.object(sys, "argv", ["claude-swap", "--install-startup"]), \
+             patch("sys.platform", "darwin"), \
+             patch("claude_swap.menubar.install_startup") as install:
+            install.return_value = Path("/Users/x/Library/LaunchAgents/foo.plist")
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 0
+        install.assert_called_once_with()
+
+    def test_uninstall_startup_invokes_uninstaller_and_exits_zero(self, capsys):
+        """--uninstall-startup unloads and removes the LaunchAgent."""
+        with patch.object(sys, "argv", ["claude-swap", "--uninstall-startup"]), \
+             patch("sys.platform", "darwin"), \
+             patch("claude_swap.menubar.uninstall_startup", return_value=True) as uninstall:
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 0
+        uninstall.assert_called_once_with()
+
+    def test_install_startup_rejected_off_macos(self, capsys):
+        """Startup items are macOS-only; other platforms get a clean error."""
+        with patch.object(sys, "argv", ["claude-swap", "--install-startup"]), \
+             patch("sys.platform", "linux"):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 1
+        assert "only available on macOS" in capsys.readouterr().err
+
     def test_slot_flag_requires_add_account(self, capsys):
         """--slot should only be accepted alongside --add-account or --add-token."""
         with patch.object(sys, "argv", ["claude-swap", "--list", "--slot", "3"]):

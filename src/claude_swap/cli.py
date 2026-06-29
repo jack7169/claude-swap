@@ -249,6 +249,16 @@ Examples:
         help="Launch the macOS menu bar app (macOS only)",
     )
     group.add_argument(
+        "--install-startup",
+        action="store_true",
+        help="Install the menu bar app as a login item (macOS) and start it now",
+    )
+    group.add_argument(
+        "--uninstall-startup",
+        action="store_true",
+        help="Remove the menu bar login item (macOS)",
+    )
+    group.add_argument(
         "--upgrade",
         action="store_true",
         help="Upgrade claude-swap to the latest version on PyPI",
@@ -308,6 +318,25 @@ Examples:
         except KeyboardInterrupt:
             print(f"\n{dimmed('Upgrade cancelled')}")
             sys.exit(130)
+
+    # Startup-item management is a macOS-only filesystem/launchctl operation that
+    # needs no switcher, config, or Keychain — handle it before init like --upgrade.
+    if args.install_startup or args.uninstall_startup:
+        if sys.platform != "darwin":
+            error("Startup items are only available on macOS.")
+            sys.exit(1)
+        from claude_swap.menubar import install_startup, uninstall_startup
+
+        if args.install_startup:
+            path = install_startup()
+            print(f"Installed menu bar login item: {path}")
+            print("It now starts automatically at login and is running.")
+        else:
+            if uninstall_startup():
+                print("Removed the menu bar login item.")
+            else:
+                print("No menu bar login item was installed.")
+        sys.exit(0)
 
     # Initialize switcher and dispatch under a single error handler so
     # init-time failures (e.g. MigrationError on a backup-dir collision)

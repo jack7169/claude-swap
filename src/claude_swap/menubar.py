@@ -10,6 +10,10 @@ the app glue.
 from __future__ import annotations
 
 import json
+import os
+import plistlib
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
@@ -450,6 +454,99 @@ def _snapshot(switcher, full: bool = True) -> dict:
         "active_email": active_email,
         "active_usage": active_usage,
     }
+
+
+LAUNCH_AGENT_LABEL = "com.claude-swap.menubar"
+
+
+def render_launch_agent_plist(
+    *,
+    label: str,
+    program_args: list[str],
+    stdout_path: str | None = None,
+    stderr_path: str | None = None,
+) -> str:
+    """Render a per-user LaunchAgent plist for the menu bar app.
+
+    The agent loads into the user's GUI (``Aqua``) session so the menu-bar icon
+    can reach WindowServer *and* ``security`` can read the unlocked login
+    Keychain — a background/daemon session can do neither. ``KeepAlive`` restarts
+    the app only when it exits non-zero, so an explicit Quit from the menu stays
+    quit while a crash is recovered automatically.
+    """
+    plist: dict = {
+        "Label": label,
+        "ProgramArguments": list(program_args),
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "LimitLoadToSessionType": "Aqua",
+        "ProcessType": "Interactive",
+    }
+    if stdout_path is not None:
+        plist["StandardOutPath"] = stdout_path
+    if stderr_path is not None:
+        plist["StandardErrorPath"] = stderr_path
+    return plistlib.dumps(plist).decode("utf-8")
+
+
+def launch_agent_plist_path() -> Path:
+    """Path of the menu-bar LaunchAgent plist in the user's ``LaunchAgents`` dir."""
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+
+
+def _menubar_program_args() -> list[str]:
+    """Argv launchd should run: the current interpreter + ``-m claude_swap``.
+
+    Pinning to ``sys.executable -m claude_swap`` (rather than the ``cswap``
+    console script) ties the agent to the exact interpreter cswap is installed
+    in, with no dependence on ``PATH`` or a shebang being resolvable at login.
+    """
+    return [sys.executable, "-m", "claude_swap", "--menubar"]
+
+
+def _gui_domain() -> str:
+    return f"gui/{os.getuid()}"
+
+
+def install_startup() -> Path:
+    """Write the LaunchAgent plist and (re)load it into the GUI session.
+
+    Idempotent: re-running rewrites the plist and reloads the agent so a changed
+    interpreter path or config takes effect. Returns the plist path.
+    """
+    log_dir = Path.home() / "Library" / "Logs" / "claude-swap"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    plist_path = launch_agent_plist_path()
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(
+        render_launch_agent_plist(
+            label=LAUNCH_AGENT_LABEL,
+            program_args=_menubar_program_args(),
+            stdout_path=str(log_dir / "menubar.out.log"),
+            stderr_path=str(log_dir / "menubar.err.log"),
+        ),
+        encoding="utf-8",
+    )
+    domain = _gui_domain()
+    target = f"{domain}/{LAUNCH_AGENT_LABEL}"
+    # bootout is best-effort: the agent may not be loaded yet on a first install.
+    subprocess.run(["launchctl", "bootout", domain, str(plist_path)], capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], capture_output=True)
+    # Start it now too, so installing also launches the app immediately.
+    subprocess.run(["launchctl", "kickstart", "-k", target], capture_output=True)
+    return plist_path
+
+
+def uninstall_startup() -> bool:
+    """Unload the agent and delete its plist. Returns True if a plist existed."""
+    plist_path = launch_agent_plist_path()
+    subprocess.run(
+        ["launchctl", "bootout", _gui_domain(), str(plist_path)], capture_output=True
+    )
+    existed = plist_path.exists()
+    if existed:
+        plist_path.unlink()
+    return existed
 
 
 def run(switcher) -> int:
