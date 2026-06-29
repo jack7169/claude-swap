@@ -158,6 +158,24 @@ cswap --install-startup     # install the login item and start it now
 cswap --uninstall-startup   # remove it
 ```
 
+The login item is the recommended way to keep the menu bar running. Prefer it
+over leaving `cswap --menubar` running in a terminal — a terminal you later close
+or suspend shouldn't own a GUI app.
+
+### Menu bar troubleshooting (macOS)
+
+- **`ModuleNotFoundError: No module named 'rumps'`** (or *"Menu bar mode requires
+  the 'menubar' extra"*) — the menu bar ships as an optional extra that a plain
+  install doesn't pull in. Reinstall with it:
+  `uv tool install 'claude-swap[menubar]'` (or `pipx install 'claude-swap[menubar]'`).
+- **The icon is gone after you quit it (or it stopped).** A clean *Quit* stays
+  quit by design. Start it again with `cswap --install-startup` (idempotent — it
+  reloads and launches the app) or
+  `launchctl kickstart -k gui/$(id -u)/com.claude-swap.menubar`.
+- **A frozen, unresponsive icon.** Suspending `cswap --menubar` (Ctrl+Z in its
+  terminal) used to leave a frozen "phantom" icon; that's now prevented (the app
+  ignores Ctrl+Z), and the login item avoids the situation entirely.
+
 ### Other commands
 
 ```bash
