@@ -105,10 +105,24 @@ uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar
 cswap --menubar
 ```
 
-The menu shows every managed account's 5h / 7d / spend usage, switches accounts
-(specific / rotate / best / next-available), and mirrors the TUI's add / remove /
-refresh actions. A Settings submenu controls what the menu-bar title shows and
-the refresh interval.
+The dropdown lists every managed account with a one-line 5h / 7d / spend summary
+and, indented beneath each, its 5h and 7d detail — percentage, reset clock-time,
+and live countdown, matching `cswap --list`. Below the accounts, a **Running
+instances** section shows where Claude Code is currently active (CLI / IDE, by
+folder). Click an account to switch to it; the rotate / best / next-available
+actions and the TUI's add / remove / refresh actions are all here too. A Settings
+submenu controls what the menu-bar title shows and the refresh interval.
+
+Every switch — from the menu, the CLI (`cswap --switch`), or auto-switch — posts
+a single macOS notification reminding you to restart Claude Code (the swap takes
+effect within ~30s).
+
+**Add an account three ways** (under *Add account*): **From current login**
+(capture the account Claude Code is signed into now), **From setup-token…**
+(paste an `sk-ant-oat01-…` token), or **Sign in with browser…**, which opens
+Claude's OAuth login in your browser and adds the account automatically once you
+approve — no CLI or pre-obtained token needed. Browser sign-in is add-only: it
+never changes your active account.
 
 **Auto-switch.** Enable *Settings → Auto-switch accounts* to have the app
 switch automatically when the active account crosses a usage threshold. When the
@@ -134,6 +148,15 @@ enable it.
 
 A small hysteresis dead band prevents switching back and forth when an account
 hovers at the threshold.
+
+**Start at login.** Install the menu-bar app as a per-user login item so it
+launches automatically and keeps running (it loads into your GUI session so it
+can reach the menu bar and your login Keychain):
+
+```bash
+cswap --install-startup     # install the login item and start it now
+cswap --uninstall-startup   # remove it
+```
 
 ### Other commands
 
