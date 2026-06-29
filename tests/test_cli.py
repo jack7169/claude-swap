@@ -186,6 +186,38 @@ class TestCLI:
             strategy=None, json_output=False
         )
 
+    def test_macos_wires_swap_notifier(self):
+        """On macOS, main() registers a notifier that routes through notify.notify."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("sys.platform", "darwin"), \
+             patch("claude_swap.notify.notify") as mock_notify, \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+            switcher_cls.return_value.set_switch_notifier.assert_called_once()
+            cb = switcher_cls.return_value.set_switch_notifier.call_args[0][0]
+            # Invoke the callback INSIDE the patched context so it hits the mock
+            # (and never spawns a real osascript on this macOS test host).
+            cb(2, "a@b.com")
+            mock_notify.assert_called_once()
+            title, message = mock_notify.call_args[0]
+            assert title == "claude-swap"
+            assert "Account-2" in message
+            assert "a@b.com" in message
+
+    def test_non_macos_does_not_wire_notifier(self):
+        """Off macOS, no notifier is registered (osascript is mac-only)."""
+        with patch("claude_swap.cli.ClaudeAccountSwitcher") as switcher_cls, \
+             patch.object(sys, "argv", ["claude-swap", "--switch"]), \
+             patch("os.geteuid", return_value=1000), \
+             patch("sys.platform", "linux"), \
+             patch("claude_swap.update_check.check_for_update", return_value=None):
+            cli.main()
+
+        switcher_cls.return_value.set_switch_notifier.assert_not_called()
+
     def test_install_startup_invokes_installer_and_exits_zero(self, capsys):
         """--install-startup installs the LaunchAgent without needing a switcher."""
         with patch.object(sys, "argv", ["claude-swap", "--install-startup"]), \
@@ -368,6 +400,8 @@ class TestCLI:
                 pass
             def _is_running_in_container(self):
                 return False
+            def set_switch_notifier(self, callback):
+                called["notifier"] = callback
 
         def _fake_run(switcher):
             called["ran"] = True

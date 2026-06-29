@@ -154,6 +154,12 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
+        # Optional swap notifier (cli.main wires this on macOS). Invoked from the
+        # single _perform_switch chokepoint so CLI, menu, and auto-switch swaps
+        # all notify through one path. Default None -> no-op (the test suite runs
+        # on macOS but never spawns osascript unless a notifier is set).
+        self._on_switch = None
+
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
         # live config (platform, _logger, credentials_dir) back off this switcher.
@@ -1105,6 +1111,93 @@ class ClaudeAccountSwitcher:
             f"{accent('Added')} Account {account_num}: {email} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
+
+    def add_account_from_oauth(
+        self,
+        *,
+        credentials: str,
+        email: str | None,
+        org_name: str | None = None,
+        org_uuid: str | None = None,
+        account_uuid: str | None = None,
+        slot: int | None = None,
+    ) -> str:
+        """Store a full-OAuth account from a completed browser login (add-only).
+
+        Unlike add_account_from_token (which stores a scope-limited setup-token with
+        no org), this persists the real refresh token and organization identity. When
+        an account with the same (email, org) already exists, its credentials/config
+        are refreshed in place. Returns the account number.
+
+        Note: when ``email`` is None a unique placeholder is synthesized per call, so
+        each sign-in adds a fresh account; update-in-place only applies when a real
+        email arrives from the OAuth response.
+        """
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+
+        org_uuid = org_uuid or ""
+        org_name = org_name or ""
+        account_uuid = account_uuid or ""
+
+        if email and not self._validate_email(email):
+            raise ValidationError(f"Invalid email format: {email}")
+        if not email:
+            if slot is None:
+                slot = self._get_next_account_number()
+            email = f"signed-in-{slot}@token.local"
+
+        self._reject_cross_kind_collision(email, is_api_key=False)
+
+        config = json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": account_uuid,
+                "organizationUuid": org_uuid or None,
+                "organizationName": org_name or None,
+            }
+        })
+
+        # Update in place when this (email, org) account already exists.
+        if slot is None and self._account_exists(email, org_uuid):
+            seq = self._get_sequence_data()
+            account_num = self._find_account_slot(seq, email, org_uuid)
+            if account_num is None:
+                raise ConfigError(f"Existing account metadata for {email} is inconsistent")
+            self._write_account_credentials(account_num, email, credentials)
+            self._write_account_config(account_num, email, config)
+            # Keep the sequence record's identity in sync with the freshly-signed-in
+            # config (org may have been renamed; account_uuid may now be known).
+            record = seq["accounts"].get(account_num, {})
+            record["organizationUuid"] = org_uuid
+            record["organizationName"] = org_name
+            record["uuid"] = account_uuid
+            seq["accounts"][account_num] = record
+            seq["lastUpdated"] = get_timestamp()
+            self._write_json(self.sequence_file, seq)
+            self._logger.info(f"Updated signed-in credentials for account {account_num}: {email}")
+            return account_num
+
+        account_num = str(slot) if slot is not None else str(self._get_next_account_number())
+        self._write_account_credentials(account_num, email, credentials)
+        self._write_account_config(account_num, email, config)
+
+        data = self._get_sequence_data()
+        data["accounts"][account_num] = {
+            "email": email,
+            "uuid": account_uuid,
+            "organizationUuid": org_uuid,
+            "organizationName": org_name,
+            "added": get_timestamp(),
+        }
+        if int(account_num) not in data["sequence"]:
+            data["sequence"].append(int(account_num))
+            data["sequence"].sort()
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+        self._logger.info(f"Added account {account_num} from browser sign-in: {email}")
+        return account_num
 
     def remove_account(self, identifier: str, force: bool = False) -> None:
         """Remove account from managed accounts.
@@ -2182,7 +2275,41 @@ class ClaudeAccountSwitcher:
         op = self._perform_switch(target_account, emit_output=not json_output)
         return self._switch_result_from_op(op, "direct") if json_output else None
 
+    def set_switch_notifier(self, callback) -> None:
+        """Register a ``callback(account_num: int, email: str)`` fired on every
+        successful switch. Set by ``cli.main`` on macOS; ``--menubar`` reuses the
+        same instance, so CLI, menu, and auto-switch swaps all notify."""
+        self._on_switch = callback
+
+    def _announce_switch(self, account_num: int | str, email: str) -> None:
+        """Fire the swap notifier, if one is registered. Never raises — a
+        notification failure must not break or roll back a committed switch."""
+        if self._on_switch is None:
+            return
+        try:
+            self._on_switch(int(account_num), email)
+        except Exception:
+            self._logger.debug("swap notifier failed", exc_info=True)
+
     def _perform_switch(self, target_account: str, emit_output: bool = True) -> dict:
+        """Switch accounts, then notify once the lock has been released.
+
+        Delegates the locked transaction to ``_perform_switch_locked`` and only
+        announces *afterwards*, so the notifier (which may shell out to
+        ``osascript``) never runs while the FileLock is held — matching the
+        "release the lock before any network/subprocess I/O" rule the post-switch
+        display already follows. This is the single chokepoint both ``switch``
+        and ``switch_to`` funnel through, so CLI, menu, and auto-switch swaps all
+        notify here exactly once (and never on a failed/rolled-back switch, which
+        raises out of ``_perform_switch_locked`` before returning).
+        """
+        op = self._perform_switch_locked(target_account, emit_output)
+        to = op.get("to")
+        if to is not None:
+            self._announce_switch(to["number"], to["email"])
+        return op
+
+    def _perform_switch_locked(self, target_account: str, emit_output: bool = True) -> dict:
         """Perform the actual account switch with transaction support.
 
         Returns ``{"from": ref|None, "to": ref, "warnings": [...]}``, capturing the

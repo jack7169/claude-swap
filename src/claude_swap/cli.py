@@ -354,6 +354,20 @@ Examples:
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
+        # Wire the unified swap notifier (macOS only — osascript posts the alert).
+        # The same switcher instance is handed to --menubar, so CLI swaps, menu
+        # clicks, and auto-switch all notify through this one path.
+        if sys.platform == "darwin":
+            from claude_swap import notify as _notify
+
+            switcher.set_switch_notifier(
+                lambda num, email: _notify.notify(
+                    "claude-swap",
+                    f"Switched to Account-{num} ({email}) — restart Claude Code "
+                    "to apply (active within ~30s).",
+                )
+            )
+
         if args.add_account:
             switcher.add_account(slot=args.slot)
         elif args.add_token is not None:

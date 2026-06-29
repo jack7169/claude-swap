@@ -20,7 +20,10 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
+from claude_swap import oauth
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.printer import abbreviate_path, entrypoint_label, ide_short_name
+from claude_swap.process_detection import get_running_instances
 
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
@@ -184,6 +187,81 @@ def format_account_label(
 ) -> str:
     """Build one account row's menu label."""
     return f"{num}  {email}  {usage_summary(usage, now)}"
+
+
+def account_detail_lines(usage: dict | str | None) -> list[str]:
+    """Per-window detail rows for the dropdown, mirroring the CLI's usage tree.
+
+    Each known rate-limit window (5h, 7d) becomes a row like
+    ``"5h:  5%   resets 18:59   in 4h 46m"``. The clock-time + countdown are
+    derived live from ``resets_at`` via :func:`oauth.format_reset` — the exact
+    formatter the CLI uses — so a stale (cached) ``clock``/``countdown`` can't
+    show a wrong time. A window with unknown ``pct`` is omitted entirely; the
+    reset segment is dropped when ``resets_at`` is missing or unparseable.
+    """
+    if not isinstance(usage, dict):
+        return []
+    lines: list[str] = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = usage.get(key)
+        if not isinstance(window, dict):
+            continue
+        pct = window.get("pct")
+        if not isinstance(pct, (int, float)):
+            continue
+        row = f"{label}: {pct:>2.0f}%"
+        resets_at = window.get("resets_at")
+        if isinstance(resets_at, str):
+            try:
+                countdown, clock = oauth.format_reset(resets_at)
+            except ValueError:
+                pass  # unparseable -> show the percent without a reset segment
+            else:
+                row += f"   resets {clock}   in {countdown}"
+        lines.append(row)
+    return lines
+
+
+def group_running_instances(sessions, ides) -> list[tuple[str, str, int, bool]]:
+    """Group running Claude Code sessions/IDEs for the dropdown.
+
+    Mirrors ``switcher.status`` exactly: sessions group by
+    ``(entrypoint_label, abbreviated cwd)``; each IDE lockfile contributes its
+    workspace folders under ``(ide_short_name, abbreviated folder)``. A session
+    and an IDE pointing at the same folder collapse into one group. Returns
+    ``(label, folder, session_count, has_ide)`` tuples in first-seen order
+    (sessions before IDE-only folders).
+    """
+    groups: dict[tuple[str, str], dict[str, int]] = {}
+    for session in sessions:
+        key = (entrypoint_label(session.entrypoint), abbreviate_path(session.cwd))
+        groups.setdefault(key, {"sessions": 0, "ide": 0})["sessions"] += 1
+    for ide in ides:
+        name = ide_short_name(ide.ide_name)
+        for folder in ide.workspace_folders:
+            key = (name, abbreviate_path(folder))
+            groups.setdefault(key, {"sessions": 0, "ide": 0})["ide"] += 1
+    return [
+        (label, folder, counts["sessions"], counts["ide"] > 0)
+        for (label, folder), counts in groups.items()
+    ]
+
+
+def format_instance_row(group: tuple[str, str, int, bool]) -> str:
+    """Render one running-instance group row, e.g.
+    ``"VS Code   ~/Dev/TL-Starnav  (2 sessions, IDE)"``.
+
+    The ``(... sessions, IDE)`` suffix mirrors ``switcher.status``: the session
+    count is singular for 1, and ``IDE`` is appended when an IDE lockfile points
+    at the same folder.
+    """
+    label, folder, session_count, has_ide = group
+    parts: list[str] = []
+    if session_count:
+        parts.append(f"{session_count} session{'s' if session_count > 1 else ''}")
+    if has_ide:
+        parts.append("IDE")
+    return f"{label}   {folder}  ({', '.join(parts)})"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -426,11 +504,13 @@ def _snapshot(switcher, full: bool = True) -> dict:
     """Fetch accounts + usage off the main thread. Returns a render snapshot.
 
     Shape: ``{"accounts": [(num, email, is_active, usage), ...],
-    "active_email": str | None, "active_usage": dict | str | None}``.
+    "active_email": str | None, "active_usage": dict | str | None,
+    "instances": [(label, folder, session_count, has_ide), ...]}``.
     ``full=False`` fetches only the active account over the network (backups come
     from cache) to stay under the usage endpoint's per-IP rate limit; ``full=True``
     fetches all. Never raises — failures degrade to empty/unknown.
     """
+    instances = _snapshot_instances(switcher)
     try:
         accounts_info = switcher._build_accounts_info()
         only = None
@@ -440,7 +520,10 @@ def _snapshot(switcher, full: bool = True) -> dict:
         usages = switcher._collect_usage(accounts_info, only=only)
     except Exception:
         switcher._logger.debug("menubar snapshot failed", exc_info=True)
-        return {"accounts": [], "active_email": None, "active_usage": None}
+        return {
+            "accounts": [], "active_email": None, "active_usage": None,
+            "instances": instances,
+        }
 
     accounts = []
     active_email = None
@@ -453,7 +536,23 @@ def _snapshot(switcher, full: bool = True) -> dict:
         "accounts": accounts,
         "active_email": active_email,
         "active_usage": active_usage,
+        "instances": instances,
     }
+
+
+def _snapshot_instances(switcher) -> list[tuple[str, str, int, bool]]:
+    """Grouped running Claude instances for the dropdown; ``[]`` on any failure.
+
+    Detecting instances is local file I/O independent of the usage fetch, so it
+    runs even when the account snapshot degrades. The menu must never break, so
+    every failure mode (missing dirs, unreadable lockfiles) collapses to ``[]``.
+    """
+    try:
+        sessions, ides = get_running_instances()
+        return group_running_instances(sessions, ides)
+    except Exception:
+        switcher._logger.debug("menubar instance detection failed", exc_info=True)
+        return []
 
 
 LAUNCH_AGENT_LABEL = "com.claude-swap.menubar"
@@ -561,7 +660,10 @@ def run(switcher) -> int:
             super().__init__(ICON, quit_button=None)
             self.switcher = switcher
             self.settings = MenuBarSettings.load(settings_path)
-            self.snapshot = {"accounts": [], "active_email": None, "active_usage": None}
+            self.snapshot = {
+                "accounts": [], "active_email": None, "active_usage": None,
+                "instances": [],
+            }
             self._dirty = False
             self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
@@ -680,7 +782,10 @@ def run(switcher) -> int:
                     return
                 self.state.last_switch_at = now
                 self.state.save(state_path)
-                self._notify_autoswitch(num)
+                # No rumps.notification here: the swap notification is posted by
+                # the unified notifier (switch_to -> _perform_switch ->
+                # _announce_switch -> notify.notify), wired in cli.main. Posting
+                # one here too would double-notify.
                 self.refresh_async(full=True)
             elif action == "notify_noswap":
                 self.state.last_noswap_notify_at = now
@@ -691,53 +796,65 @@ def run(switcher) -> int:
                     "but no other account has headroom.",
                 )
 
-        def _notify_autoswitch(self, num):
-            email = next(
-                (e for n, e, _a, _u in self.snapshot["accounts"] if n == num), str(num)
-            )
-            rumps.notification(
-                "claude-swap", "Auto-switched account",
-                f"Switched to {email} — restart Claude Code to apply (active within ~30s).",
-            )
-
         # ---- menu construction ------------------------------------------------
         def rebuild_menu(self):
             self.title = format_title(
                 self.snapshot["active_email"], self.snapshot["active_usage"], self.settings
             )
+            # Built imperatively (not via `self.menu = [list]`) because the
+            # disabled detail/instance rows can share identical text across
+            # accounts (e.g. two unused accounts both "5h:  0%"). rumps keys
+            # menu items by title and silently drops a duplicate-titled item, so
+            # those rows are added with explicit unique keys via `self.menu[k]=`.
             self.menu.clear()
-            account_items = []
-            for num, email, is_active, usage in self.snapshot["accounts"]:
+            accounts = self.snapshot["accounts"]
+            for num, email, is_active, usage in accounts:
                 item = rumps.MenuItem(
                     format_account_label(num, email, usage),
                     callback=self._make_switch_to(num),
                 )
                 item.state = 1 if is_active else 0
-                account_items.append(item)
-            if not account_items:
-                account_items.append(rumps.MenuItem("No managed accounts", callback=None))
+                self.menu.add(item)  # title carries the slot number -> unique
+                for i, line in enumerate(account_detail_lines(usage)):
+                    self.menu[f"detail-{num}-{i}"] = rumps.MenuItem(
+                        f"    {line}", callback=None
+                    )
+            if not accounts:
+                self.menu.add(rumps.MenuItem("No managed accounts", callback=None))
 
-            self.menu = [
-                *account_items,
-                None,
-                rumps.MenuItem("Rotate to next", callback=self._switch(None)),
-                rumps.MenuItem("Switch to best", callback=self._switch("best")),
-                rumps.MenuItem("Next available", callback=self._switch("next-available")),
-                None,
-                self._add_menu(rumps),
-                self._remove_menu(rumps),
-                rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds),
-                None,
-                self._settings_menu(rumps),
-                rumps.MenuItem("Refresh now", callback=self.on_refresh_now),
-                rumps.MenuItem("Quit", callback=rumps.quit_application),
-            ]
+            instances = self.snapshot.get("instances") or []
+            if instances:
+                self.menu.add(None)
+                self.menu.add(rumps.MenuItem("Running instances", callback=None))
+                for i, group in enumerate(instances):
+                    self.menu[f"instance-{i}"] = rumps.MenuItem(
+                        f"    {format_instance_row(group)}", callback=None
+                    )
+
+            self.menu.add(None)
+            self.menu.add(rumps.MenuItem("Rotate to next", callback=self._switch(None)))
+            self.menu.add(rumps.MenuItem("Switch to best", callback=self._switch("best")))
+            self.menu.add(
+                rumps.MenuItem("Next available", callback=self._switch("next-available"))
+            )
+            self.menu.add(None)
+            self.menu.add(self._add_menu(rumps))
+            self.menu.add(self._remove_menu(rumps))
+            self.menu.add(
+                rumps.MenuItem("Refresh current credentials", callback=self.on_refresh_creds)
+            )
+            self.menu.add(None)
+            self.menu.add(self._settings_menu(rumps))
+            self.menu.add(rumps.MenuItem("Refresh now", callback=self.on_refresh_now))
+            self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
             if hasattr(self.switcher, "add_account_from_token"):
                 menu.add(rumps.MenuItem("From setup-token…", callback=self.on_add_token))
+            if hasattr(self.switcher, "add_account_from_oauth"):
+                menu.add(rumps.MenuItem("Sign in with browser…", callback=self.on_add_browser_login))
             return menu
 
         def _remove_menu(self, rumps):
@@ -823,21 +940,15 @@ def run(switcher) -> int:
                 rumps.alert(title="claude-swap", message=str(e))
                 return False
 
-        def _notify_switched(self):
-            # macOS-only app, so always the Keychain-TTL guidance from
-            # ClaudeAccountSwitcher._print_switch_followup.
-            rumps.notification(
-                "claude-swap",
-                "Account switched",
-                "Switch takes effect within ~30s — restart Claude Code to apply immediately.",
-            )
+        # Swap notifications are posted by the unified notifier wired in
+        # cli.main (switch/switch_to -> _perform_switch -> _announce_switch ->
+        # notify.notify), so the menu callbacks below no longer post their own.
 
         def _make_switch_to(self, num):
             def cb(_sender):
                 if self._guard(lambda: self.switcher.switch_to(str(num))):
                     self.state.last_switch_at = time.time()
                     self.state.save(state_path)
-                    self._notify_switched()
                     self.refresh_async(full=True)
             return cb
 
@@ -846,7 +957,6 @@ def run(switcher) -> int:
                 if self._guard(lambda: self.switcher.switch(strategy=strategy)):
                     self.state.last_switch_at = time.time()
                     self.state.save(state_path)
-                    self._notify_switched()
                     self.refresh_async(full=True)
             return cb
 
@@ -892,6 +1002,50 @@ def run(switcher) -> int:
                 token=token_resp.text.strip(), email=email_resp.text.strip(), slot=None,
             )):
                 self.refresh_async(full=True)
+
+        def on_add_browser_login(self, _sender):
+            # Bring the accessory app forward so any future dialogs render, then run the
+            # OAuth login off the main thread (it blocks until the browser callback).
+            import webbrowser
+
+            import AppKit
+            from claude_swap import oauth_login
+
+            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
+            def worker():
+                try:
+                    result = oauth_login.run_login_flow(
+                        open_browser=webbrowser.open,
+                        make_server=oauth_login.LoopbackServer,
+                        exchange=oauth_login.exchange_code,
+                    )
+                    num = self.switcher.add_account_from_oauth(
+                        credentials=result.credentials,
+                        email=result.identity.email,
+                        org_name=result.identity.org_name,
+                        org_uuid=result.identity.org_uuid,
+                        account_uuid=result.identity.account_uuid,
+                    )
+                    self.switcher._logger.info("browser sign-in added account %s", num)
+                    # Confirm the add (this is not a swap, so it doesn't go through
+                    # the unified swap notifier — post a distinct "added" alert).
+                    rumps.notification(
+                        "claude-swap",
+                        "Account added",
+                        f"Signed in and added {result.identity.email or f'Account-{num}'}. "
+                        "Switch to it from the menu when ready.",
+                    )
+                    self.refresh_async(full=True)
+                except ClaudeSwitchError as e:
+                    self.switcher._logger.warning("browser sign-in failed: %s", e)
+                    rumps.notification("claude-swap", "Sign-in failed", str(e))
+                except Exception:
+                    self.switcher._logger.debug("browser sign-in error", exc_info=True)
+                    rumps.notification("claude-swap", "Sign-in failed",
+                                       "An unexpected error occurred during sign-in.")
+
+            threading.Thread(target=worker, daemon=True).start()
 
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:

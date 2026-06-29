@@ -1540,6 +1540,184 @@ class TestPerformSwitchPostDisplay:
         assert config_path.read_text() == original_config_text
 
 
+class TestPerformSwitchNotifier:
+    """The injected swap notifier fires exactly once per successful switch, for
+    every origin (CLI / menu / auto-switch all funnel through _perform_switch)."""
+
+    def _normal_switch(self, temp_home, sample_sequence_data, notifier):
+        helper = TestPerformSwitchPostDisplay()
+        switcher, creds_store, configs_store = helper._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live-1", "refreshToken": "rt-1"},
+        })}
+        patches = helper._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        if notifier is not None:
+            switcher.set_switch_notifier(notifier)
+        try:
+            switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+        return switcher
+
+    def test_notifier_fires_once_with_integer_slot_and_email(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        seen: list[tuple] = []
+        self._normal_switch(
+            temp_home, sample_sequence_data,
+            lambda num, email: seen.append((num, email)),
+        )
+        assert seen == [(2, "account2@example.com")]
+
+    def test_notifier_default_is_noop(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        # No notifier set -> the switch completes without error (default None).
+        switcher = self._normal_switch(temp_home, sample_sequence_data, None)
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_notifier_exception_does_not_break_switch(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        # A raising notifier is swallowed; the swap still commits.
+        def boom(_num, _email):
+            raise RuntimeError("notifier blew up")
+
+        switcher = self._normal_switch(temp_home, sample_sequence_data, boom)
+        assert switcher._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_notifier_fires_on_activation_path(
+        self, temp_home: Path, mock_claude_config: Path,
+    ):
+        # Activation path (no managed live account) also notifies once.
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com", "uuid": "",
+                    "organizationUuid": "", "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps(
+                {"claudeAiOauth": {"accessToken": "target-token", "refreshToken": None}}
+            ),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps(
+                {"oauthAccount": {"emailAddress": "target@example.com", "accountUuid": ""}}
+            ),
+        }
+        # No live identity managed -> activation branch.
+        live_state = {"creds": json.dumps(
+            {"claudeAiOauth": {"accessToken": "live", "refreshToken": "live-rt"}}
+        )}
+        helper = TestPerformSwitchPostDisplay()
+        patches = helper._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        seen: list[tuple] = []
+        switcher.set_switch_notifier(lambda num, email: seen.append((num, email)))
+        try:
+            with patch.object(switcher, "_get_current_account", return_value=None):
+                switcher._perform_switch("1", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+        assert seen == [(1, "target@example.com")]
+
+    def test_notifier_runs_with_lock_released(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        """Regression: the notifier must fire only AFTER the FileLock is released,
+        so a notifier that shells out to osascript never blocks the lock. If the
+        announce ran inside the lock, the probe acquire below would fail."""
+        from claude_swap.locking import FileLock
+
+        helper = TestPerformSwitchPostDisplay()
+        switcher, creds_store, configs_store = helper._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live-1", "refreshToken": "rt-1"},
+        })}
+        patches = helper._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        lock_free = {"ok": None}
+
+        def probe_notifier(_num, _email):
+            probe = FileLock(switcher.lock_file)
+            lock_free["ok"] = probe.acquire(timeout=0.5)
+            if lock_free["ok"]:
+                probe.release()
+
+        switcher.set_switch_notifier(probe_notifier)
+        try:
+            switcher._perform_switch("2", emit_output=False)
+        finally:
+            for p in patches:
+                p.stop()
+        assert lock_free["ok"] is True  # lock was free when the notifier fired
+
+    def test_notifier_fires_through_switch_to_public_api(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        """The public switch_to() funnels through _perform_switch and notifies."""
+        helper = TestPerformSwitchPostDisplay()
+        switcher, creds_store, configs_store = helper._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live-1", "refreshToken": "rt-1"},
+        })}
+        patches = helper._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        seen: list[tuple] = []
+        switcher.set_switch_notifier(lambda num, email: seen.append((num, email)))
+        try:
+            switcher.switch_to("2", json_output=True)  # json -> no network display
+        finally:
+            for p in patches:
+                p.stop()
+        assert seen == [(2, "account2@example.com")]
+
+    def test_notifier_fires_through_switch_rotation_public_api(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+    ):
+        """The public switch() rotation funnels through _perform_switch and notifies."""
+        helper = TestPerformSwitchPostDisplay()
+        switcher, creds_store, configs_store = helper._setup_two_accounts(
+            temp_home, sample_sequence_data,
+        )
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-live-1", "refreshToken": "rt-1"},
+        })}
+        patches = helper._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        seen: list[tuple] = []
+        switcher.set_switch_notifier(lambda num, email: seen.append((num, email)))
+        try:
+            switcher.switch(json_output=True)  # rotate 1 -> 2
+        finally:
+            for p in patches:
+                p.stop()
+        assert seen == [(2, "account2@example.com")]
+
+
 # ── Task 1: AccountInfo org fields ───────────────────────────────────────────
 
 class TestAccountInfoOrgFields:
@@ -3528,3 +3706,80 @@ class TestCollectUsageBackoff:
         out = s._collect_usage(self._info(), only={"1", "2"})
         assert sorted(calls) == ["1", "2"]       # fetched again
         assert out[0] == {"five_hour": {"pct": 5.0}}
+
+
+class TestAddAccountFromOAuth:
+    def _switcher(self, temp_home):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+        sw = ClaudeAccountSwitcher()
+        sw._setup_directories()
+        sw._init_sequence_file()
+        return sw
+
+    def test_adds_new_account_with_real_org_and_credentials(self, temp_home: Path):
+        sw = self._switcher(temp_home)
+        creds_store: dict = {}
+        cfg_store: dict = {}
+        with patch.object(sw, "_write_account_credentials",
+                          side_effect=lambda n, e, c: creds_store.__setitem__((str(n), e), c)), \
+             patch.object(sw, "_write_account_config",
+                          side_effect=lambda n, e, c: cfg_store.__setitem__((str(n), e), c)):
+            num = sw.add_account_from_oauth(
+                credentials='{"claudeAiOauth": {"accessToken": "sk-at"}}',
+                email="me@example.com", org_name="Acme", org_uuid="org-1",
+                account_uuid="acc-1",
+            )
+        assert num == "1"
+        assert creds_store[("1", "me@example.com")] == '{"claudeAiOauth": {"accessToken": "sk-at"}}'
+        cfg = json.loads(cfg_store[("1", "me@example.com")])["oauthAccount"]
+        assert cfg["emailAddress"] == "me@example.com"
+        assert cfg["organizationUuid"] == "org-1"
+        assert cfg["organizationName"] == "Acme"
+        assert cfg["accountUuid"] == "acc-1"
+        data = sw._get_sequence_data()
+        rec = data["accounts"]["1"]
+        assert rec["email"] == "me@example.com"
+        assert rec["organizationUuid"] == "org-1"
+        assert rec["organizationName"] == "Acme"
+        assert 1 in data["sequence"]
+
+    def test_synthesizes_email_when_missing(self, temp_home: Path):
+        sw = self._switcher(temp_home)
+        with patch.object(sw, "_write_account_credentials"), \
+             patch.object(sw, "_write_account_config"):
+            num = sw.add_account_from_oauth(
+                credentials='{"claudeAiOauth": {"accessToken": "x"}}', email=None,
+            )
+        data = sw._get_sequence_data()
+        assert data["accounts"][num]["email"].endswith("@token.local")
+
+    def test_updates_existing_account_in_place(self, temp_home: Path):
+        sw = self._switcher(temp_home)
+        with patch.object(sw, "_write_account_credentials"), \
+             patch.object(sw, "_write_account_config"):
+            first = sw.add_account_from_oauth(
+                credentials='{"claudeAiOauth": {"accessToken": "v1"}}',
+                email="me@example.com", org_uuid="org-1",
+            )
+            again = sw.add_account_from_oauth(
+                credentials='{"claudeAiOauth": {"accessToken": "v2"}}',
+                email="me@example.com", org_uuid="org-1",
+            )
+        assert first == again  # same slot, updated in place
+        assert len(sw._get_sequence_data()["sequence"]) == 1
+
+    def test_in_place_update_syncs_org_metadata_to_record(self, temp_home: Path):
+        sw = self._switcher(temp_home)
+        with patch.object(sw, "_write_account_credentials"), \
+             patch.object(sw, "_write_account_config"):
+            num = sw.add_account_from_oauth(
+                credentials="{}", email="me@example.com", org_uuid="org-1",
+                org_name="Old Name", account_uuid="",
+            )
+            sw.add_account_from_oauth(
+                credentials="{}", email="me@example.com", org_uuid="org-1",
+                org_name="New Name", account_uuid="acc-9",
+            )
+        rec = sw._get_sequence_data()["accounts"][num]
+        assert rec["organizationName"] == "New Name"
+        assert rec["uuid"] == "acc-9"

@@ -606,3 +606,172 @@ def test_uninstall_startup_returns_false_when_not_installed(tmp_path, monkeypatc
     _fake_home(monkeypatch, tmp_path)
     _capture_launchctl(monkeypatch)
     assert menubar.uninstall_startup() is False
+
+
+# --- account_detail_lines (Feature 1: flat indented status view) -------------
+# Mirrors the CLI's per-window tree rows in the dropdown. format_reset is mocked
+# so the clock/countdown are deterministic and free of tz/now coupling.
+
+def test_account_detail_lines_both_windows(monkeypatch):
+    resets = {"r5": ("4h 46m", "18:59"), "r7": ("2d 3h", "Jul 1 09:00")}
+    monkeypatch.setattr(menubar.oauth, "format_reset", lambda ra: resets[ra])
+    usage = {
+        "five_hour": {"pct": 5, "resets_at": "r5"},
+        "seven_day": {"pct": 42, "resets_at": "r7"},
+    }
+    assert menubar.account_detail_lines(usage) == [
+        "5h:  5%   resets 18:59   in 4h 46m",
+        "7d: 42%   resets Jul 1 09:00   in 2d 3h",
+    ]
+
+
+def test_account_detail_lines_omits_window_with_unknown_pct(monkeypatch):
+    monkeypatch.setattr(menubar.oauth, "format_reset", lambda ra: ("1h", "10:00"))
+    usage = {
+        "five_hour": {"resets_at": "x"},          # no pct -> omitted
+        "seven_day": {"pct": 30, "resets_at": "x"},
+    }
+    assert menubar.account_detail_lines(usage) == ["7d: 30%   resets 10:00   in 1h"]
+
+
+def test_account_detail_lines_omits_reset_segment_when_no_resets_at():
+    # No resets_at -> just the percent, and format_reset is never called.
+    assert menubar.account_detail_lines({"five_hour": {"pct": 12}}) == ["5h: 12%"]
+
+
+def test_account_detail_lines_omits_reset_segment_when_unparseable(monkeypatch):
+    def boom(_ra):
+        raise ValueError("bad date")
+    monkeypatch.setattr(menubar.oauth, "format_reset", boom)
+    usage = {"five_hour": {"pct": 12, "resets_at": "not-a-date"}}
+    assert menubar.account_detail_lines(usage) == ["5h: 12%"]
+
+
+def test_account_detail_lines_non_dict_returns_empty():
+    assert menubar.account_detail_lines("rate limited") == []
+    assert menubar.account_detail_lines(None) == []
+    assert menubar.account_detail_lines({}) == []
+
+
+def test_account_detail_lines_ignores_spend_window():
+    # Only the 5h/7d rate-limit windows are rendered; the $ spend axis is omitted.
+    usage = {"five_hour": {"pct": 5}, "spend": {"pct": 30}}
+    assert menubar.account_detail_lines(usage) == ["5h:  5%"]
+
+
+# --- group_running_instances (Feature 1: "Running instances" section) --------
+# Grouping mirrors switcher.status exactly, reusing the same printer helpers.
+
+from claude_swap.process_detection import ClaudeSession, IdeInstance  # noqa: E402
+
+
+def _session(entrypoint, cwd, pid=1234):
+    return ClaudeSession(
+        pid=pid, session_id="s", cwd=cwd, started_at=0,
+        kind="interactive", entrypoint=entrypoint,
+    )
+
+
+def _ide(ide_name, folders, pid=4321, port=5000):
+    return IdeInstance(
+        port=port, pid=pid, ide_name=ide_name, workspace_folders=list(folders),
+    )
+
+
+def test_group_running_instances_counts_sessions_per_group():
+    sessions = [
+        _session("cli", "/work/a"),
+        _session("cli", "/work/a"),
+        _session("claude-vscode", "/work/b"),
+    ]
+    groups = menubar.group_running_instances(sessions, [])
+    assert ("CLI", "/work/a", 2, False) in groups
+    assert ("VS Code", "/work/b", 1, False) in groups
+    assert len(groups) == 2
+
+
+def test_group_running_instances_merges_ide_into_session_group():
+    # A session and an IDE lockfile on the same folder collapse into one group.
+    sessions = [_session("claude-vscode", "/work/proj")]
+    ides = [_ide("Visual Studio Code", ["/work/proj"])]
+    assert menubar.group_running_instances(sessions, ides) == [
+        ("VS Code", "/work/proj", 1, True),
+    ]
+
+
+def test_group_running_instances_ide_only_group_per_folder():
+    ides = [_ide("Cursor", ["/work/x", "/work/y"])]
+    assert menubar.group_running_instances([], ides) == [
+        ("Cursor", "/work/x", 0, True),
+        ("Cursor", "/work/y", 0, True),
+    ]
+
+
+def test_group_running_instances_empty():
+    assert menubar.group_running_instances([], []) == []
+
+
+def test_group_running_instances_abbreviates_home(monkeypatch, tmp_path):
+    _fake_home(monkeypatch, tmp_path)
+    sess = _session("cli", str(tmp_path / "Dev" / "proj"))
+    assert menubar.group_running_instances([sess], []) == [
+        ("CLI", "~/Dev/proj", 1, False),
+    ]
+
+
+# --- format_instance_row (Feature 1) -----------------------------------------
+
+def test_format_instance_row_sessions_and_ide():
+    assert menubar.format_instance_row(("VS Code", "~/Dev/TL-Starnav", 2, True)) == (
+        "VS Code   ~/Dev/TL-Starnav  (2 sessions, IDE)"
+    )
+
+
+def test_format_instance_row_single_session_is_singular():
+    assert menubar.format_instance_row(("CLI", "~/x", 1, False)) == "CLI   ~/x  (1 session)"
+
+
+def test_format_instance_row_ide_only():
+    assert menubar.format_instance_row(("Cursor", "~/y", 0, True)) == "Cursor   ~/y  (IDE)"
+
+
+# --- _snapshot grows a grouped "instances" list (Feature 1) ------------------
+
+class _SnapSW:
+    _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
+
+    def _build_accounts_info(self):
+        return [(1, "a@x", "", "", True, "")]
+
+    def _collect_usage(self, info, only=None):
+        return [None]
+
+
+def test_snapshot_includes_grouped_instances(monkeypatch):
+    monkeypatch.setattr(
+        menubar, "get_running_instances",
+        lambda: ([_session("claude-vscode", "/work/a")],
+                 [_ide("Visual Studio Code", ["/work/a"])]),
+    )
+    snap = menubar._snapshot(_SnapSW(), full=True)
+    assert snap["instances"] == [("VS Code", "/work/a", 1, True)]
+
+
+def test_snapshot_instances_degrade_to_empty_on_failure(monkeypatch):
+    def boom():
+        raise OSError("filesystem unavailable")
+    monkeypatch.setattr(menubar, "get_running_instances", boom)
+    snap = menubar._snapshot(_SnapSW(), full=True)
+    assert snap["instances"] == []
+
+
+def test_snapshot_degraded_path_includes_empty_instances(monkeypatch):
+    class _BrokenSW:
+        _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
+
+        def _build_accounts_info(self):
+            raise RuntimeError("boom")
+
+    snap = menubar._snapshot(_BrokenSW(), full=True)
+    assert snap["instances"] == []
+    assert snap["accounts"] == []
