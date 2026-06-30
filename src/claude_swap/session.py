@@ -253,6 +253,12 @@ class SessionManager:
         Windows: ``os.exec*`` detaches from the console confusingly, so stay
         resident as a thin wrapper and mirror claude's exit code.
         """
+        # execvpe replaces this process without flushing Python's I/O buffers,
+        # so any buffered status line (e.g. "Launching… [session mode]") would
+        # be silently dropped when stdout is not a TTY (block-buffered). Flush
+        # explicitly so the line is always emitted before the hand-off.
+        sys.stdout.flush()
+        sys.stderr.flush()
         argv = [claude_bin, *claude_args]
         if sys.platform == "win32":
             try:
@@ -312,11 +318,20 @@ class SessionManager:
                 self._sync_sharing(session_dir, share)
                 return session_dir, account_num, email
 
+            # The profile exists but is auth-invalid (e.g. a revoked/expired
+            # token). If a claude is *still running* against it, re-seeding or
+            # rmtree-ing the profile would pull credentials/keychain/dir out
+            # from under that live process — refuse, mirroring the switcher's
+            # live-session guard. (The stale-marker path above already declined
+            # to invalidate under a live session; this extends the same
+            # protection to the validation-failure re-bootstrap.)
+            self._ensure_profile_not_live(session_dir, account_num, email)
+
             self._bootstrap(session_dir, account_num, email, org_uuid)
             self._sync_sharing(session_dir, share)
 
             if not self._is_session_valid(session_dir, email, org_uuid):
-                self._cleanup_failed_session(session_dir)
+                self._cleanup_failed_session(session_dir, account_num, email)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
                     f"validation. Log in with that account and re-add it: "
@@ -433,7 +448,32 @@ class SessionManager:
         except (json.JSONDecodeError, AttributeError):
             return True  # unknown shape — let the refresh attempt decide
 
-    def _cleanup_failed_session(self, session_dir: Path) -> None:
+    @staticmethod
+    def _ensure_profile_not_live(
+        session_dir: Path, account_num: str, email: str
+    ) -> None:
+        """Refuse to re-seed/remove a profile that has a live claude running.
+
+        Pulling a profile's credentials, keychain entry, or directory out from
+        under a running ``claude`` is worse than any staleness it might have —
+        the live process keeps its own copy and manages it. Mirrors the
+        switcher's destructive-operation live-session guard.
+        """
+        live = live_sessions_for(session_dir)
+        if live:
+            pids = ", ".join(str(s.pid) for s in live)
+            raise SessionError(
+                f"Account-{account_num} ({email}) has a live session-mode Claude "
+                f"instance (PID {pids}) using a profile that needs re-seeding. "
+                f"Exit the running instance first, then retry 'cswap run'."
+            )
+
+    def _cleanup_failed_session(
+        self, session_dir: Path, account_num: str, email: str
+    ) -> None:
+        # Never tear down a profile a claude is still running against: removing
+        # the dir/keychain out from under it would break the live process.
+        self._ensure_profile_not_live(session_dir, account_num, email)
         # Keychain first: claude may have partially migrated the seed, and the
         # hashed service name can't be recomputed once the dir is gone.
         delete_macos_keychain_entry(session_dir)

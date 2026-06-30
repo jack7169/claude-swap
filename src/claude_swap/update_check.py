@@ -9,15 +9,39 @@ import sys
 import urllib.request
 from pathlib import Path
 
+try:
+    from packaging.version import InvalidVersion, Version
+    _HAVE_PACKAGING = True
+except ImportError:  # pragma: no cover - packaging is a declared dependency
+    # Defensive: the passive update check must "never fail" even in a stripped
+    # environment that somehow lacks the declared `packaging` dependency. Degrade
+    # to "no update" instead of letting an ImportError surface at command tail.
+    _HAVE_PACKAGING = False
+
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
 CACHE_PATH = CACHE_DIR / "update_check.json"
 CACHE_TTL = 24 * 3600  # 24 hours
+# A *failed* PyPI fetch is cached for only this long, so a single transient
+# network error can't suppress every update check for the full CACHE_TTL.
+NEGATIVE_CACHE_TTL = 15 * 60  # 15 minutes
 PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
 
 
-def _parse_version(v: str) -> tuple[int, ...]:
-    return tuple(int(x) for x in v.split("."))
+def _parse_version(v: str) -> Version | None:
+    """Parse a PEP 440 version string, or None if it's unparseable.
+
+    Uses ``packaging.version.Version`` so pre-release/post/dev/epoch forms
+    (e.g. ``0.15.0b1`` — which this project ships — ``1.3.0.post1``, ``1.3rc1``)
+    compare correctly instead of crashing a naive int-split. A garbage version
+    yields ``None`` so callers can treat it as "no update" rather than raising.
+    """
+    if not _HAVE_PACKAGING:
+        return None
+    try:
+        return Version(v)
+    except (InvalidVersion, TypeError):
+        return None
 
 
 def _detect_install_method() -> str | None:
@@ -48,8 +72,18 @@ def check_for_update(current_version: str) -> str | None:
     try:
         latest_version = None
 
-        # Try reading cache
+        # Try reading cache. A cached *failure* (None) is honoured only for the
+        # short NEGATIVE_CACHE_TTL so a transient error doesn't suppress checks
+        # for the full CACHE_TTL; a cached *success* lasts the full CACHE_TTL.
         cached_data = read_cache(CACHE_PATH, CACHE_TTL)
+        if cached_data is MISSING or cached_data is None:
+            # Either there's no fresh entry, or the fresh entry is a cached
+            # *failure* (None). A failure is only trustworthy for the short
+            # negative TTL, so re-read at that TTL: a recent failure stays
+            # honoured (skips the network), an older one falls back to MISSING
+            # and triggers a retry.
+            cached_data = read_cache(CACHE_PATH, NEGATIVE_CACHE_TTL)
+
         if cached_data is not MISSING:
             latest_version = cached_data
         else:
@@ -62,10 +96,19 @@ def check_for_update(current_version: str) -> str | None:
             except Exception:
                 latest_version = None
 
-            # Write cache regardless of success/failure
+            # Cache the result. A successful fetch lives for the full CACHE_TTL;
+            # a failure (None) is still written (so a flapping network doesn't
+            # hammer PyPI every run) but is only trusted for NEGATIVE_CACHE_TTL
+            # at read time above, so the next run within 24h retries.
             write_cache(CACHE_PATH, latest_version)
 
-        if latest_version and _parse_version(latest_version) > _parse_version(current_version):
+        latest_parsed = _parse_version(latest_version) if latest_version else None
+        current_parsed = _parse_version(current_version)
+        if (
+            latest_parsed is not None
+            and current_parsed is not None
+            and latest_parsed > current_parsed
+        ):
             method = _detect_install_method()
             direct = {
                 "uv": "uv tool upgrade claude-swap",

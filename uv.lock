@@ -45,6 +45,7 @@ version = "0.15.0b1"
 source = { editable = "." }
 dependencies = [
     { name = "keyring" },
+    { name = "packaging" },
 ]
 
 [package.optional-dependencies]
@@ -60,6 +61,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "keyring", specifier = ">=25.0.0" },
+    { name = "packaging", specifier = ">=21.0" },
     { name = "rumps", marker = "extra == 'menubar'", specifier = ">=0.4.0" },
 ]
 provides-extras = ["menubar"]

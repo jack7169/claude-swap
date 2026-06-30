@@ -245,9 +245,16 @@ def migrate_windows_keyring_to_files(switcher: "ClaudeAccountSwitcher") -> bool:
             continue
 
         # Data is safely in the file now → files are authoritative. Remove the
-        # source entry, and the redundant account-None entry, best-effort.
+        # source entry, and the redundant account-None entry, best-effort. Only
+        # delete the account-None alias when its email unambiguously maps to this
+        # one slot (matching the read-side attribution rule); otherwise it's an
+        # ambiguous entry we never migrated and must not destroy.
         _delete_keyring_quietly(keyring, switcher, source_username)
-        if str(account_num) != "None" and source_username != none_user:
+        if (
+            str(account_num) != "None"
+            and source_username != none_user
+            and email_counts[email] == 1
+        ):
             _delete_keyring_quietly(keyring, switcher, none_user)
         migrated += 1
 
@@ -461,9 +468,17 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
             failed += 1
             continue
 
-        # Data is safely in the security service now → remove the keyring source(s).
+        # Data is safely in the security service now → remove the keyring
+        # source(s). Only delete the account-None alias when its email
+        # unambiguously maps to this one slot (matching the read-side
+        # attribution rule); otherwise it's an ambiguous entry we never migrated
+        # and must not destroy.
         _delete_old(source_username)
-        if str(account_num) != "None" and source_username != none_user:
+        if (
+            str(account_num) != "None"
+            and source_username != none_user
+            and email_counts[email] == 1
+        ):
             _delete_old(none_user)
         # Verify the removal: keyring masks a *denied* delete as the same
         # PasswordDeleteError a missing entry raises, so a leftover would

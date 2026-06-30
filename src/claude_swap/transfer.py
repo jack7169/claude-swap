@@ -435,6 +435,12 @@ def import_accounts(
                 data, entry["email"], entry["org_uuid"]
             )
 
+            # When overwriting an existing slot, snapshot its current
+            # (creds, config) so a mid-overwrite failure can restore the slot to
+            # its original, internally-consistent pair instead of leaving the
+            # new creds beside the old config (or vice versa).
+            overwrite_snapshot: tuple[str, str] | None = None
+
             if existing_slot is not None:
                 if not force:
                     _eprint(
@@ -448,6 +454,10 @@ def import_accounts(
                     continue
                 target_num = existing_slot
                 outcome = "overwrote"
+                overwrite_snapshot = (
+                    switcher._read_account_credentials(target_num, entry["email"]),
+                    switcher._read_account_config(target_num, entry["email"]),
+                )
                 # The credential write below invalidates the slot's non-live
                 # session profile (chokepoint in _write_account_credentials), so
                 # the next `cswap run` re-bootstraps from the imported creds. A
@@ -467,30 +477,50 @@ def import_accounts(
                     target_num = str(switcher._get_next_account_number())
                 outcome = "imported"
 
-            switcher._write_account_credentials(
-                target_num, entry["email"], entry["creds_text"]
-            )
-            switcher._write_account_config(
-                target_num, entry["email"], entry["config_text"]
-            )
+            try:
+                switcher._write_account_credentials(
+                    target_num, entry["email"], entry["creds_text"]
+                )
+                switcher._write_account_config(
+                    target_num, entry["email"], entry["config_text"]
+                )
 
-            data.setdefault("accounts", {})
-            data.setdefault("sequence", [])
-            new_record = {
-                "email": entry["email"],
-                "uuid": entry["uuid"],
-                "organizationUuid": entry["org_uuid"],
-                "organizationName": entry["org_name"],
-                "added": entry["added"],
-            }
-            if entry["kind"] == "api_key":
-                new_record["kind"] = "api_key"
-            data["accounts"][target_num] = new_record
-            if int(target_num) not in data["sequence"]:
-                data["sequence"].append(int(target_num))
-                data["sequence"].sort()
-            data["lastUpdated"] = get_timestamp()
-            switcher._write_json(switcher.sequence_file, data)
+                data.setdefault("accounts", {})
+                data.setdefault("sequence", [])
+                new_record = {
+                    "email": entry["email"],
+                    "uuid": entry["uuid"],
+                    "organizationUuid": entry["org_uuid"],
+                    "organizationName": entry["org_name"],
+                    "added": entry["added"],
+                }
+                if entry["kind"] == "api_key":
+                    new_record["kind"] = "api_key"
+                data["accounts"][target_num] = new_record
+                if int(target_num) not in data["sequence"]:
+                    data["sequence"].append(int(target_num))
+                    data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+                switcher._write_json(switcher.sequence_file, data)
+            except BaseException:
+                # An overwrite that failed partway leaves the slot with a mix of
+                # new + old creds/config. Best-effort restore the pre-overwrite
+                # snapshot so the slot stays in its original consistent state,
+                # then re-raise. (Fresh imports have no prior slot to restore —
+                # a later cleanup phase handles those; nothing to roll back here.)
+                if overwrite_snapshot is not None:
+                    snap_creds, snap_config = overwrite_snapshot
+                    try:
+                        switcher._write_account_credentials(
+                            target_num, entry["email"], snap_creds
+                        )
+                        switcher._write_account_config(
+                            target_num, entry["email"], snap_config
+                        )
+                    except BaseException:
+                        # Restore is best-effort; surface the original failure.
+                        pass
+                raise
 
             if is_envelope_active:
                 resolved_active_slot = target_num

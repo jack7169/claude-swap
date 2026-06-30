@@ -112,6 +112,26 @@ def _login_keychain_path() -> str | None:
     return None
 
 
+def _validate_name(value: str) -> None:
+    """Reject an account/service name containing a control character (< 0x20).
+
+    Why every entry point validates, not just ``set_password``: on a write the
+    name rides a ``security -i`` stdin command line that is split on ``\\n``/``\\r``
+    *before* tokenising, so a control char there would end the command early and
+    run the value's tail as a separate ``security`` subcommand (command
+    injection). The read/delete/exists paths build argv lists, so the same name is
+    *not* an injection vector there — but accepting on read/delete a name that
+    write rejects is a confusing inconsistency (an item could never have been
+    written under it). Apply the identical check everywhere so a given name is
+    either valid for all operations or none. Valid accounts/services never contain
+    a control character. Raises :class:`KeychainError`.
+    """
+    if any(ord(ch) < 0x20 for ch in value):
+        raise KeychainError(
+            "keychain account/service name contains an illegal control character"
+        )
+
+
 def _quote(value: str) -> str:
     """Quote a value for a ``security -i`` stdin command line.
 
@@ -122,13 +142,11 @@ def _quote(value: str) -> str:
     Quoting cannot contain a newline: ``security -i`` splits stdin on line
     boundaries *before* tokenising, so an embedded ``\\n``/``\\r`` would end the
     command early and run the value's tail as a separate ``security`` subcommand
-    (command injection). Reject any control character outright rather than emit a
-    multi-line payload — valid accounts/services never contain one.
+    (command injection). Reject any control character outright (via
+    :func:`_validate_name`) rather than emit a multi-line payload — valid
+    accounts/services never contain one.
     """
-    if any(ch in value for ch in "\n\r") or any(ord(ch) < 0x20 for ch in value):
-        raise KeychainError(
-            "keychain account/service name contains an illegal control character"
-        )
+    _validate_name(value)
     escaped = value.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
@@ -139,7 +157,17 @@ def get_password(service: str, account: str) -> str | None:
     Raises :class:`KeychainError` on any other non-zero exit (locked / denied /
     unavailable) or a timeout, so a genuine miss is not confused with a transient
     failure.
+
+    Reads search the default keychain *list* rather than naming a keychain (unlike
+    ``set_password``, which names login.keychain to dodge ``errSecNoDefaultKeychain``
+    on an *add* in a launchd/GUI session — see ``_login_keychain_path``). This is
+    safe: the login keychain is normally in the search list, so a value written
+    there is found by a list-searching read, and search needs no *default*
+    keychain set, so the launchd-context failure mode that motivated the explicit
+    write target does not apply to reads.
     """
+    _validate_name(account)
+    _validate_name(service)
     try:
         result = subprocess.run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
@@ -172,7 +200,18 @@ def item_exists(service: str, account: str) -> bool:
     missing binary all return ``False``. Deliberately **non-raising**: callers use
     it for cleanup verification, not access decisions, so it must never feed the
     capability cache (a timeout here means "couldn't tell", not "Keychain works").
+
+    A name with a control character is also "not found": ``set_password`` rejects
+    such names, so no item can exist under one. Returning ``False`` (rather than
+    raising, as ``get_password``/``delete_password`` do) keeps this method
+    non-raising while staying consistent with the rest of the wrapper.
+
+    Like ``get_password``, this searches the default keychain list rather than
+    naming a keychain — safe for the same reason (login.keychain is normally in
+    the list, and search needs no *default* keychain set).
     """
+    if any(ord(ch) < 0x20 for ch in account) or any(ord(ch) < 0x20 for ch in service):
+        return False
     try:
         result = subprocess.run(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
@@ -246,7 +285,14 @@ def delete_password(service: str, account: str) -> None:
     """Delete a generic-password item. rc 44 (already absent) counts as success.
 
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
+
+    Searches the default keychain list rather than naming a keychain (matching
+    ``get_password``); safe because login.keychain is normally in the list and
+    search needs no *default* keychain set, so the launchd-context failure mode
+    that makes ``set_password`` name the keychain explicitly does not apply here.
     """
+    _validate_name(account)
+    _validate_name(service)
     try:
         result = subprocess.run(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],

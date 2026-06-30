@@ -19,6 +19,7 @@ from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
     AccountNotFoundError,
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     SessionError,
@@ -446,6 +447,43 @@ class ClaudeAccountSwitcher:
             config_file.unlink()
         self._delete_session_profile(account_num, email)
 
+    def _displace_account_files(self, account_num: str, email: str) -> None:
+        """Remove an occupant's backups when a slot is being reused (add/displace).
+
+        Wraps ``_delete_account_files`` and ESCALATES the visibility of a failed
+        Keychain backup delete (R2F4): the store's delete is best-effort and only
+        logs at WARNING, but a lingering ``(slot, old_email)`` Keychain item could
+        shadow the slot once it is reused with a new identity. On macOS, re-check
+        the backup item after the delete and emit a user-visible warning (plus a
+        log line) when it survives, so the residue can't fail silently. The .enc
+        delete already raises-then-logs in the store, so only the Keychain axis
+        needs escalation here.
+        """
+        self._delete_account_files(account_num, email)
+        if self.platform != Platform.MACOS:
+            return
+        # The store keeps a legacy ``account-None-{email}`` alias too; probe both.
+        nums = [account_num]
+        if str(account_num) != "None":
+            nums.append("None")
+        for num in nums:
+            username = self._store._backup_username(num, email)
+            try:
+                still_there = macos_keychain.item_exists(SECURITY_SERVICE, username)
+            except Exception:
+                # If we can't even probe, assume the worst and warn.
+                still_there = True
+            if still_there:
+                msg = (
+                    f"Could not remove displaced account's Keychain backup "
+                    f"({username}); a lingering item may shadow slot {account_num} "
+                    f"if it is reused. Remove it with: "
+                    f"security delete-generic-password -s {SECURITY_SERVICE} "
+                    f"-a {username}"
+                )
+                warning(msg)
+                self._logger.warning(msg)
+
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
@@ -697,6 +735,90 @@ class ClaudeAccountSwitcher:
         if not data:
             return False
         return self._find_account_slot(data, email, organization_uuid) is not None
+
+    def _reconcile_orphaned_backups(self) -> None:
+        """Reconcile on-disk backups against ``sequence.json`` (best-effort).
+
+        A crash midway through an add/displace mutation can leave a backup
+        ``.creds-<N>-<email>.enc`` / ``.claude-config-<N>-<email>.json`` on disk
+        with no matching ``(N, email)`` record in ``sequence.json`` — an orphan
+        that could later shadow a reused slot (a stale ``.enc`` masking a freshly
+        re-added account). This scans both backup dirs and removes any such
+        orphan, logging each removal. The inverse case — a sequence record whose
+        backups are missing — is only *logged*, never deleted: a legitimate
+        in-progress add briefly has a record before its files, and tearing out
+        live records here would be far more destructive than a logged warning.
+
+        Wired CONSERVATIVELY: called under the lock at the START of an add
+        mutation (after re-reading the sequence, before allocating/reusing a
+        slot), so a crashed prior add's orphan is swept before its slot is
+        reused — NOT on every construction (which would race a legitimate
+        in-progress add's brief record-before-files window). Never raises: a
+        reconciliation hiccup must not break the mutation it precedes.
+        """
+        try:
+            data = self._get_sequence_data() or {}
+            accounts = data.get("accounts", {})
+            # Set of valid (N, email) identities, with the legacy "None" alias
+            # so a backup written under account-None-{email} isn't mistaken for
+            # an orphan.
+            valid: set[tuple[str, str]] = set()
+            for num, record in accounts.items():
+                email = record.get("email", "")
+                valid.add((str(num), email))
+                valid.add(("None", email))
+
+            specs = [
+                (self.credentials_dir, r"^\.creds-(.+?)-(.+)\.enc$"),
+                (self.configs_dir, r"^\.claude-config-(.+?)-(.+)\.json$"),
+            ]
+            for directory, pattern in specs:
+                if not directory.is_dir():
+                    continue
+                regex = re.compile(pattern)
+                for path in directory.iterdir():
+                    if not path.is_file():
+                        continue
+                    m = regex.match(path.name)
+                    if not m:
+                        continue
+                    num, email = m.group(1), m.group(2)
+                    if (num, email) in valid:
+                        continue
+                    try:
+                        path.unlink()
+                        self._logger.warning(
+                            f"Removed orphaned backup with no sequence record: "
+                            f"{path.name}"
+                        )
+                    except OSError as e:
+                        self._logger.warning(
+                            f"Failed to remove orphaned backup {path.name}: {e}"
+                        )
+
+            # Log (don't delete) records whose backups are missing on disk.
+            for num, record in accounts.items():
+                email = record.get("email", "")
+                enc = self.credentials_dir / f".creds-{num}-{email}.enc"
+                none_enc = self.credentials_dir / f".creds-None-{email}.enc"
+                cfg = self.configs_dir / f".claude-config-{num}-{email}.json"
+                none_cfg = self.configs_dir / f".claude-config-None-{email}.json"
+                # On macOS credentials may live in the Keychain (no .enc), so
+                # only flag a record as missing-backup when BOTH its credential
+                # backup AND its config backup are absent on disk.
+                has_cred = enc.exists() or none_enc.exists()
+                if self.platform == Platform.MACOS:
+                    has_cred = has_cred or bool(
+                        self._read_account_credentials(str(num), email)
+                    )
+                has_cfg = cfg.exists() or none_cfg.exists()
+                if not has_cred and not has_cfg:
+                    self._logger.warning(
+                        f"Sequence record for slot {num} ({email}) has no backup "
+                        f"files on disk."
+                    )
+        except Exception as e:  # never break the surrounding mutation
+            self._logger.warning(f"Orphaned-backup reconciliation failed: {e}")
 
     def _account_kind(self, account_num: str | None) -> str:
         """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
@@ -1126,6 +1248,15 @@ class ClaudeAccountSwitcher:
         """
         import getpass
 
+        # An occupied explicit slot needs an interactive overwrite confirmation.
+        # When the token itself was read from stdin ('-'), stdin is already
+        # consumed, so there is NO way to read an answer — that case is a hard
+        # non-interactive context and the overwrite prompt must not be attempted
+        # at all. (A non-TTY stdin with no answer is detected at prompt time when
+        # ``input`` raises; both paths raise ConfigError instead of the old
+        # silent exit-0 cancel.) Capture this BEFORE ``token`` is reassigned.
+        token_from_stdin = token == "-"
+
         if token == "-":
             token = sys.stdin.readline().rstrip("\n")
         elif not token:
@@ -1154,6 +1285,7 @@ class ClaudeAccountSwitcher:
         if not email and slot is None:
             credentials = self._token_credentials_payload(token, is_api_key)
             with self._sequence_lock():
+                self._reconcile_orphaned_backups()
                 account_num = str(self._get_next_account_number())
                 email = f"{label}-{account_num}@token.local"
                 config = self._synthesized_token_config(email)
@@ -1210,6 +1342,7 @@ class ClaudeAccountSwitcher:
         # menu-bar auto-switch can't interleave a lost-update write.
         if slot is None and self._account_exists(email, ""):
             with self._sequence_lock():
+                self._reconcile_orphaned_backups()
                 seq = self._get_sequence_data()
                 account_num = self._find_account_slot(seq, email, "")
                 if account_num is None:
@@ -1246,6 +1379,18 @@ class ClaudeAccountSwitcher:
                     and existing.get("organizationUuid", "") == ""
                 )
                 if not is_same:
+                    occupied_msg = (
+                        f"Slot {slot} is already occupied by {existing_email}; "
+                        f"refusing to overwrite it in a non-interactive context. "
+                        f"Remove it first, or pass a free --slot."
+                    )
+                    # Token came from stdin ('-'): stdin is consumed, so the
+                    # overwrite prompt can't be answered. Treat an occupied slot
+                    # without an explicit overwrite as a HARD ERROR so a calling
+                    # script sees a non-zero exit rather than a silent exit-0
+                    # cancel — never attempt input() here.
+                    if token_from_stdin:
+                        raise ConfigError(occupied_msg)
                     existing_tag = self._get_display_tag(
                         existing_email,
                         existing.get("organizationName", ""),
@@ -1255,9 +1400,11 @@ class ClaudeAccountSwitcher:
                     print(f"{existing_email} {muted(f'[{existing_tag}]')}")
                     try:
                         answer = input(f"Overwrite slot {slot}? [y/N] ").strip().lower()
-                    except (EOFError, KeyboardInterrupt):
-                        print(f"\n{dimmed('Cancelled')}")
-                        return
+                    except (EOFError, KeyboardInterrupt, OSError):
+                        # No reader for the prompt (piped/non-TTY/closed stdin):
+                        # this is the non-interactive case F33 must surface — a
+                        # hard error, not a silent cancel.
+                        raise ConfigError(occupied_msg)
                     if answer not in ("y", "yes"):
                         print(dimmed("Cancelled"))
                         return
@@ -1269,6 +1416,9 @@ class ClaudeAccountSwitcher:
         # write. Re-read inside the lock; assign the auto slot here so two
         # concurrent adds can't collide.
         with self._sequence_lock():
+            # Sweep any crash-orphan backups before (re)using a slot, so a stale
+            # .enc from a prior interrupted add can't shadow this one.
+            self._reconcile_orphaned_backups()
             if account_num is None:
                 account_num = str(self._get_next_account_number())
 
@@ -1279,7 +1429,7 @@ class ClaudeAccountSwitcher:
                 existing = data.get("accounts", {}).get(d_num)
                 if existing is not None:
                     d_email = existing.get("email", "")
-                    self._delete_account_files(d_num, d_email)
+                    self._displace_account_files(d_num, d_email)
                     if int(d_num) in data["sequence"]:
                         data["sequence"].remove(int(d_num))
                     del data["accounts"][d_num]
@@ -1291,7 +1441,7 @@ class ClaudeAccountSwitcher:
                 old_num = self._find_account_slot(data, email, "")
                 if old_num and old_num != account_num:
                     old_email = data["accounts"][old_num].get("email", "")
-                    self._delete_account_files(old_num, old_email)
+                    self._displace_account_files(old_num, old_email)
                     if int(old_num) in data["sequence"]:
                         data["sequence"].remove(int(old_num))
                     del data["accounts"][old_num]
@@ -1389,6 +1539,10 @@ class ClaudeAccountSwitcher:
         # read-decide-write region runs inside the lock; re-read inside it and
         # assign the auto slot here so two concurrent adds can't collide.
         with self._sequence_lock():
+            # Sweep crash-orphan backups before (re)using a slot, so a stale .enc
+            # from a prior interrupted add can't shadow this one.
+            self._reconcile_orphaned_backups()
+
             # Update in place when this (email, org) account already exists.
             # (Skipped for the synthesize-in-lock case: a freshly-derived slot
             # email never matches an existing account.)
@@ -1410,6 +1564,48 @@ class ClaudeAccountSwitcher:
                 self._write_json(self.sequence_file, seq)
                 self._logger.info(f"Updated signed-in credentials for account {account_num}: {email}")
                 return account_num
+
+            # Explicit-slot handling mirrors add_account_from_token's lock body:
+            # this is a prompt-free, add-only programmatic path (browser login),
+            # so we always displace-or-migrate rather than prompt. A DIFFERENT
+            # (email,org) occupant of the pinned slot is displaced (its backups +
+            # sequence record removed) so it can't be orphaned; the SAME identity
+            # living in another slot is migrated into the pinned slot. Cross-kind
+            # collisions were already rejected above (_reject_cross_kind_collision).
+            if slot is not None:
+                if slot < 1:
+                    raise ConfigError("Slot number must be >= 1")
+                pinned = str(slot)
+                data = self._get_sequence_data()
+                existing = data.get("accounts", {}).get(pinned)
+                if existing is not None:
+                    is_same = (
+                        existing.get("email", "") == email
+                        and existing.get("organizationUuid", "") == org_uuid
+                    )
+                    if not is_same:
+                        d_email = existing.get("email", "")
+                        self._displace_account_files(pinned, d_email)
+                        if int(pinned) in data["sequence"]:
+                            data["sequence"].remove(int(pinned))
+                        del data["accounts"][pinned]
+                        self._write_json(self.sequence_file, data)
+
+                # The same identity may already live in a DIFFERENT slot —
+                # migrate it into the pinned slot rather than leaving a duplicate.
+                if self._account_exists(email, org_uuid):
+                    data = self._get_sequence_data()
+                    old_num = self._find_account_slot(data, email, org_uuid)
+                    if old_num and old_num != pinned:
+                        old_email = data["accounts"][old_num].get("email", "")
+                        self._displace_account_files(old_num, old_email)
+                        if int(old_num) in data["sequence"]:
+                            data["sequence"].remove(int(old_num))
+                        del data["accounts"][old_num]
+                        self._write_json(self.sequence_file, data)
+                        self._logger.info(
+                            f"Moved signed-in account from slot {old_num} to {slot}: {email}"
+                        )
 
             account_num = str(slot) if slot is not None else str(self._get_next_account_number())
             # Synthesize the placeholder email + config now that the slot is
@@ -3007,7 +3203,13 @@ class ClaudeAccountSwitcher:
         print(dimmed("Note: This does NOT affect your current Claude Code login."))
         print()
 
-        confirm = input("Are you sure you want to purge all data? [y/N] ")
+        # A piped / non-interactive / closed stdin makes ``input`` raise
+        # EOFError (and Ctrl-C raises KeyboardInterrupt); either must safe-cancel
+        # the destructive purge rather than crash with an uncaught traceback.
+        try:
+            confirm = input("Are you sure you want to purge all data? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            confirm = ""
         if confirm.lower() != "y":
             print(dimmed("Cancelled"))
             return
@@ -3063,14 +3265,24 @@ class ClaudeAccountSwitcher:
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
 
-        # Remove backup directory
+        # Remove backup directory. This runs AFTER the Keychain/.enc items have
+        # already been deleted above, so a raw OSError mid-rmtree would leave a
+        # half-purged tree and crash with a traceback. Sweep with
+        # ignore_errors=True, then re-check: if anything survives, report the
+        # partial state as a clean ClaudeSwitchError rather than a raw OSError.
         if self.backup_dir.exists():
             # Close log handlers before deleting (required on Windows)
             for handler in self._logger.handlers[:]:
                 handler.close()
                 self._logger.removeHandler(handler)
 
-            shutil.rmtree(self.backup_dir)
+            shutil.rmtree(self.backup_dir, ignore_errors=True)
+            if self.backup_dir.exists():
+                raise ClaudeSwitchError(
+                    f"Purge incomplete: stored credentials were removed, but the "
+                    f"backup directory could not be fully deleted and still exists "
+                    f"at {self.backup_dir}. Remove it manually to finish the purge."
+                )
             removed_items.append(f"Directory: {self.backup_dir}")
 
         # Also clean a stale legacy directory if it somehow still exists
