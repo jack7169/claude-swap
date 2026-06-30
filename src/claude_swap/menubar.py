@@ -182,6 +182,53 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     return " · ".join(parts) if parts else "usage unavailable"
 
 
+def auto_switch_menu_label(enabled: bool) -> str:
+    """Label for the auto-switch toggle, with explicit ON/OFF text.
+
+    macOS menu checkmarks are easy to miss (an unmarked item reads as a plain
+    line), so the on/off state is spelled out in the label rather than shown
+    only as a check.
+    """
+    return f"Auto-switch accounts: {'ON' if enabled else 'OFF'}"
+
+
+_STRATEGY_SHORT_LABELS = {"reactive": "Reactive", "consume-first": "Consume-first"}
+
+
+def auto_switch_strategy_label(strategy: str) -> str:
+    """Short, human-facing name for an auto-switch strategy (unknown -> as-is)."""
+    return _STRATEGY_SHORT_LABELS.get(strategy, strategy)
+
+
+def _fmt_mmss(seconds: float) -> str:
+    """Whole seconds as ``M:SS`` (negative clamps to ``0:00``)."""
+    s = max(0, int(seconds))
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def auto_switch_countdown_text(seconds_to_next: float, cadence: int) -> str:
+    """The live 'next check' line: countdown to the next eval plus its cadence."""
+    return f"Next check: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
+
+
+def auto_switch_header_lines(
+    enabled: bool, strategy: str, cadence: int, seconds_to_next: float
+) -> list[str]:
+    """Status-header rows for the top of the menu.
+
+    Enabled -> on/off, method, and a live countdown line (the only row the sync
+    tick re-titles each second). Disabled -> a single ``OFF`` line, since there
+    is no check to count down to.
+    """
+    if not enabled:
+        return ["Auto-swap: OFF"]
+    return [
+        "Auto-swap: ON",
+        f"Method: {auto_switch_strategy_label(strategy)}",
+        auto_switch_countdown_text(seconds_to_next, cadence),
+    ]
+
+
 def format_account_label(
     num: int, email: str, usage: dict | str | None, now: float | None = None
 ) -> str:
@@ -984,6 +1031,7 @@ def run(switcher) -> int:
             }
             self._dirty = False
             self._menu_sig = None  # signature of the last rendered menu (3.3)
+            self._countdown_item = None  # live "Next check:" header item, if any
             self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
@@ -1050,9 +1098,23 @@ def run(switcher) -> int:
             # (3.3) — avoids a full NSMenu teardown every refresh when nothing
             # the user sees has changed.
             _maybe_rebuild_on_dirty(self)
+            self._update_countdown()
             self._detect_active_change()
             if self.settings.auto_switch_enabled:
                 self._auto_tick()
+
+        def _update_countdown(self):
+            """Re-title the live 'next check' header line each tick (no rebuild).
+
+            Touches only the single countdown leaf item, so it stays cheap and
+            never tears down the NSMenu while the user has it open.
+            """
+            item = self._countdown_item
+            if item is None or not self.settings.auto_switch_enabled:
+                return
+            cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
+            seconds_to_next = max(0.0, (self._last_auto_eval + cadence) - time.time())
+            item.title = auto_switch_countdown_text(seconds_to_next, cadence)
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto-switcher)
@@ -1153,6 +1215,28 @@ def run(switcher) -> int:
             # menu items by title and silently drops a duplicate-titled item, so
             # those rows are added with explicit unique keys via `self.menu[k]=`.
             self.menu.clear()
+
+            # Auto-swap status header at the very top. The status/method lines
+            # change only with settings (covered by the rebuild signature); the
+            # countdown line is re-titled in place each second by the sync tick,
+            # so it stays OUT of the signature (else it'd force a full NSMenu
+            # rebuild every tick — defeating the 3.3 optimization).
+            cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
+            seconds_to_next = max(0.0, (self._last_auto_eval + cadence) - time.time())
+            header = auto_switch_header_lines(
+                self.settings.auto_switch_enabled,
+                self.settings.auto_switch_strategy,
+                cadence,
+                seconds_to_next,
+            )
+            self._countdown_item = None
+            for idx, line in enumerate(header):
+                item = rumps.MenuItem(line, callback=None)
+                self.menu.add(item)
+                if self.settings.auto_switch_enabled and idx == len(header) - 1:
+                    self._countdown_item = item  # the live "Next check:" line
+            self.menu.add(None)
+
             accounts = self.snapshot["accounts"]
             for num, email, is_active, usage in accounts:
                 item = rumps.MenuItem(
@@ -1233,8 +1317,10 @@ def run(switcher) -> int:
                 interval.add(choice)
             menu.add(interval)
 
-            auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
-            auto_item.state = 1 if self.settings.auto_switch_enabled else 0
+            auto_item = rumps.MenuItem(
+                auto_switch_menu_label(self.settings.auto_switch_enabled),
+                callback=self.on_toggle_autoswitch,
+            )
             menu.add(auto_item)
 
             strategy_menu = rumps.MenuItem("Auto-switch strategy")

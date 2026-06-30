@@ -93,6 +93,46 @@ def test_format_account_label():
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
+def test_auto_switch_menu_label_shows_on_when_enabled():
+    assert menubar.auto_switch_menu_label(True) == "Auto-switch accounts: ON"
+
+
+def test_auto_switch_menu_label_shows_off_when_disabled():
+    assert menubar.auto_switch_menu_label(False) == "Auto-switch accounts: OFF"
+
+
+def test_auto_switch_strategy_label_known():
+    assert menubar.auto_switch_strategy_label("reactive") == "Reactive"
+    assert menubar.auto_switch_strategy_label("consume-first") == "Consume-first"
+
+
+def test_auto_switch_strategy_label_unknown_passthrough():
+    assert menubar.auto_switch_strategy_label("mystery") == "mystery"
+
+
+def test_auto_switch_countdown_text_formats_mmss_and_cadence():
+    assert menubar.auto_switch_countdown_text(42, 30) == "Next check: 0:42 (every 30s)"
+    assert menubar.auto_switch_countdown_text(65, 60) == "Next check: 1:05 (every 60s)"
+
+
+def test_auto_switch_countdown_text_clamps_negative_to_zero():
+    assert menubar.auto_switch_countdown_text(-5, 30) == "Next check: 0:00 (every 30s)"
+
+
+def test_auto_switch_header_lines_enabled():
+    assert menubar.auto_switch_header_lines(True, "consume-first", 30, 42) == [
+        "Auto-swap: ON",
+        "Method: Consume-first",
+        "Next check: 0:42 (every 30s)",
+    ]
+
+
+def test_auto_switch_header_lines_disabled_is_single_off_line():
+    assert menubar.auto_switch_header_lines(False, "consume-first", 30, 42) == [
+        "Auto-swap: OFF"
+    ]
+
+
 def test_format_title_name_and_5h():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="5h")
     assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42%"

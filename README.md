@@ -98,12 +98,21 @@ This will update the stored credentials without creating a duplicate.
 
 Run a menu bar app that shows each account's usage and lets you switch with a click:
 
+The menu bar app needs the optional `menubar` extra (`rumps` + `pyobjc`). The
+published PyPI release does not include this extra yet, so install it from a
+clone of the repo:
+
 ```bash
-# Install with the optional menu bar extra
-uv tool install 'claude-swap[menubar]'   # or: pipx install 'claude-swap[menubar]'
+git clone https://github.com/realiti4/claude-swap.git
+cd claude-swap
+uv tool install '.[menubar]'   # quote the spec so the shell doesn't glob [menubar]
 
 cswap --menubar
 ```
+
+Once a release that bundles the extra is published, the one-liner
+`uv tool install 'claude-swap[menubar]'` (or `pipx install 'claude-swap[menubar]'`)
+will work directly.
 
 The dropdown lists every managed account with a one-line 5h / 7d / spend summary
 and, indented beneath each, its 5h and 7d detail — percentage, reset clock-time,
@@ -166,8 +175,11 @@ or suspend shouldn't own a GUI app.
 
 - **`ModuleNotFoundError: No module named 'rumps'`** (or *"Menu bar mode requires
   the 'menubar' extra"*) — the menu bar ships as an optional extra that a plain
-  install doesn't pull in. Reinstall with it:
-  `uv tool install 'claude-swap[menubar]'` (or `pipx install 'claude-swap[menubar]'`).
+  install doesn't pull in, and it isn't on the published PyPI release yet.
+  Reinstall it from a clone of the repo: `uv tool install '.[menubar]'` (see
+  [Menu bar (macOS)](#menu-bar-macos) above). A bare
+  `uv tool install 'claude-swap[menubar]'` against PyPI will warn that there is
+  no such extra and silently install without the menu bar.
 - **The icon is gone after you quit it (or it stopped).** A clean *Quit* stays
   quit by design. Start it again with `cswap --install-startup` (idempotent — it
   reloads and launches the app) or
