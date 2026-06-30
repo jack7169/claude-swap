@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -247,24 +248,56 @@ class ClaudeAccountSwitcher:
             return None
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
-        content = json.dumps(data, indent=2)
+        """Write a JSON file atomically with 0600 perms (no world-readable window).
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
+        Mirrors the mkstemp reference pattern in ``credentials.py``: ``mkstemp``
+        creates the temp fd at 0600 in ``path``'s directory (same filesystem, so
+        ``os.replace`` is atomic), the JSON bytes are written and the fd closed,
+        then ``os.replace`` swaps it onto ``path`` — the destination inheriting the
+        temp file's 0600. This closes the old "write_text at umask then chmod after
+        the move" window that briefly left ``~/.claude.json`` (which holds
+        ``oauthAccount``) world/group-readable. On ANY failure the temp file is
+        unlinked so a failed write never leaks bytes or corrupts an existing target.
 
-        # Validate written content
+        ``json.dumps`` already guarantees the serialized bytes are valid JSON, so the
+        old re-read validation is dropped; a serialization failure still raises
+        ``ConfigError`` (preserving the "Generated invalid JSON" guard semantics).
+        """
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
+            content = json.dumps(data, indent=2)
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"Generated invalid JSON: {e}")
+        self._atomic_write_text(path, content)
 
-        # Move to final location
-        shutil.move(str(temp_path), str(path))
-        if sys.platform != "win32":
-            os.chmod(path, 0o600)
+    def _atomic_write_text(self, path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` atomically at 0600 (no world-readable window).
+
+        The shared primitive behind ``_write_json``, ``_write_account_config`` and
+        the swap-rollback config restores. ``mkstemp`` creates the temp fd at 0600 in
+        ``path``'s own directory (same filesystem, so ``os.replace`` is atomic), the
+        bytes are written and the fd closed, then ``os.replace`` swaps it onto
+        ``path`` — the destination inheriting the temp's 0600, so the plaintext bytes
+        (credential identity metadata) are never momentarily world/group-readable.
+        On ANY failure the temp file is unlinked so a failed write never leaks bytes
+        or corrupts an existing target.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            os.write(fd, text.encode("utf-8"))
+            os.close(fd)
+            fd = -1
+            os.replace(tmp_path, str(path))
+            if sys.platform != "win32":
+                os.chmod(str(path), 0o600)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -432,11 +465,9 @@ class ClaudeAccountSwitcher:
     def _write_account_config(
         self, account_num: str, email: str, config: str
     ) -> None:
-        """Write account config to backup."""
+        """Write account config to backup (atomically, 0600 — no readable window)."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.write_text(config, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_file, 0o600)
+        self._atomic_write_text(config_file, config)
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
@@ -2679,11 +2710,9 @@ class ClaudeAccountSwitcher:
                     # old config/sequence.
                     if config_written and rollback_config_text is not None:
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
+                            self._atomic_write_text(
+                                config_path, rollback_config_text
                             )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"

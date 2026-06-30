@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -88,24 +88,45 @@ def _validate_imported_account(switcher: ClaudeAccountSwitcher, account: dict) -
 
 
 def _atomic_write_file(path: Path, content: str) -> None:
-    """Write text atomically with 0600 perms — same pattern as switcher._write_json."""
-    # Append (not with_suffix, which would replace the final dot-segment and
-    # mangle multi-dot destinations like ``my.backup.2026``).
-    temp_path = path.with_name(path.name + f".{os.getpid()}.tmp")
+    """Write text atomically with 0600 perms — the mkstemp pattern from
+    credentials._write_active_credentials_file.
+
+    The export holds plaintext OAuth tokens / API keys, so the bytes must never
+    touch disk under umask perms. ``mkstemp`` creates a randomly-named temp file
+    (no predictable ``{path}.{pid}.tmp`` to symlink-clobber) at 0600 atomically
+    via ``O_CREAT|O_EXCL``, so the plaintext is never world/group-readable;
+    ``os.replace`` then promotes it, and the destination inherits 0600. The temp
+    is unlinked on any failure so a mid-write error leaks nothing.
+    """
+    parent = path.parent
     try:
-        temp_path.write_text(content, encoding="utf-8")
-    except FileNotFoundError:
-        # A nonexistent parent directory surfaces here as a raw OSError that
-        # the CLI's ClaudeSwitchError handler wouldn't catch — turn it into a
-        # clean TransferError, mirroring the import-side missing-file guard.
-        raise TransferError(
-            f"export destination directory does not exist: {path.parent}"
+        # Random name + 0600 from birth. Prefix/suffix keep it recognizable as a
+        # transient ``.<name>.…tmp`` sibling without re-deriving a guessable name.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(parent), prefix="." + path.name + ".", suffix=".tmp"
         )
-    if sys.platform != "win32":
-        os.chmod(temp_path, 0o600)
-    shutil.move(str(temp_path), str(path))
-    if sys.platform != "win32":
-        os.chmod(path, 0o600)
+    except FileNotFoundError:
+        # A nonexistent parent directory surfaces as a raw OSError that the CLI's
+        # ClaudeSwitchError handler wouldn't catch — turn it into a clean
+        # TransferError, mirroring the import-side missing-file guard.
+        raise TransferError(
+            f"export destination directory does not exist: {parent}"
+        )
+    try:
+        os.write(fd, content.encode("utf-8"))
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_path, str(path))
+        if sys.platform != "win32":
+            os.chmod(str(path), 0o600)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _slim_config(config_obj: dict, label: str) -> dict:

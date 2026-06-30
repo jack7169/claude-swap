@@ -374,10 +374,11 @@ class SessionManager:
         if sys.platform != "win32":
             os.chmod(session_dir, 0o700)
 
+        # Plaintext credential bytes must never touch disk at umask perms.
+        # Write 0600-from-birth (mkstemp + os.replace) so there's no
+        # world/group-readable window — matching credentials.py's writer.
         creds_path = session_dir / ".credentials.json"
-        creds_path.write_text(creds, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(creds_path, 0o600)
+        self._atomic_write_0600(creds_path, creds)
 
         # Merge the identity seed into any existing .claude.json so a
         # re-bootstrap preserves the profile's own projects/history. The
@@ -393,13 +394,37 @@ class SessionManager:
         existing["oauthAccount"] = oauth_account
         existing["hasCompletedOnboarding"] = True
         existing.setdefault("theme", config_data.get("theme") or "dark")
-        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_path, 0o600)
+        self._atomic_write_0600(config_path, json.dumps(existing, indent=2))
 
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
         )
+
+    @staticmethod
+    def _atomic_write_0600(path: Path, data: str) -> None:
+        """Atomically write plaintext at 0600 from birth (no readable window).
+
+        Mirrors ``credentials._write_active_credentials_file``: ``mkstemp``
+        creates the temp fd at 0600, so the bytes are never world/group-readable;
+        ``os.replace`` makes the destination inherit those perms (the final chmod
+        is belt-and-suspenders). On any failure the temp file is unlinked.
+        """
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            os.write(fd, data.encode("utf-8"))
+            os.close(fd)
+            fd = -1
+            os.replace(tmp, str(path))
+            if sys.platform != "win32":
+                os.chmod(str(path), 0o600)
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _has_refresh_token(creds: str) -> bool:

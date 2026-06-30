@@ -577,7 +577,12 @@ class CredentialStore:
 
     def _write_backup_enc(self, account_num: str, email: str, credentials: str) -> None:
         """Atomically write a per-account backup ``.enc`` (base64) file."""
-        self._host.credentials_dir.mkdir(parents=True, exist_ok=True)
+        # The .enc filenames embed account emails, so the holding dir must be
+        # owner-only. mkdir's mode is umask-masked, so chmod 0700 explicitly
+        # (mirrors _setup_directories) to make the guarantee reliable.
+        self._host.credentials_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(str(self._host.credentials_dir), 0o700)
         enc_file = self._backup_enc_path(account_num, email)
         encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
         import tempfile

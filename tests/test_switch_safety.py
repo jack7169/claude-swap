@@ -403,20 +403,23 @@ class TestSwitchTransactionRollbackUnit:
                 order.append("sequence_updated")
             return original_write_json(path, data)
 
-        # Wrap Path.write_text on the config to detect the config restore.
-        original_write_text = type(config_path).write_text
+        # The config restore now routes through switcher._atomic_write_text
+        # (atomic 0600 write); wrap it to detect the config restore. The
+        # sequence restore also goes through _atomic_write_text (via _write_json),
+        # but with a different path, so it won't be miscounted as config_written.
+        original_atomic = switcher._atomic_write_text
 
-        def record_write_text(self, *args, **kwargs):
-            if self == config_path:
+        def record_atomic(path, text):
+            if path == config_path:
                 order.append("config_written")
-            return original_write_text(self, *args, **kwargs)
+            return original_atomic(path, text)
 
         with patch.object(
             switcher, "_write_credentials", side_effect=record_creds,
         ), patch.object(
             switcher, "_write_json", side_effect=record_json,
         ), patch.object(
-            type(config_path), "write_text", record_write_text,
+            switcher, "_atomic_write_text", side_effect=record_atomic,
         ):
             transaction.rollback(switcher)
 

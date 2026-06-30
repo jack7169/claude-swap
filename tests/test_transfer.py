@@ -1351,24 +1351,25 @@ class TestAtomicWriteDestination:
         assert not list(temp_home.glob("*.tmp"))
 
     def test_temp_name_appends_rather_than_replaces_suffix(self, temp_home: Path):
-        """_atomic_write_file must append the .<pid>.tmp marker, keeping the
-        full original filename (including any dotted segments) intact."""
+        """_atomic_write_file must keep the full original filename (including any
+        dotted segments) intact in the staged temp name, so a multi-dot
+        destination like ``my.backup.2026`` is never mangled."""
         from claude_swap.transfer import _atomic_write_file
 
         captured: dict[str, Path] = {}
-        orig_write_text = Path.write_text
+        orig_replace = os.replace
 
-        def _spy_write_text(self_path, *args, **kwargs):
-            captured["temp"] = Path(self_path)
-            return orig_write_text(self_path, *args, **kwargs)
+        def _spy_replace(src, dst):
+            captured["temp"] = Path(src)
+            return orig_replace(src, dst)
 
         dest = temp_home / "my.backup.2026"
-        with patch.object(Path, "write_text", _spy_write_text):
+        with patch.object(os, "replace", _spy_replace):
             _atomic_write_file(dest, "data\n")
 
         # The temp filename must contain the full original name, not a version
         # with the final dot-segment ("2026") dropped.
-        assert captured["temp"].name.startswith("my.backup.2026.")
+        assert "my.backup.2026" in captured["temp"].name
         assert dest.read_text() == "data\n"
 
     def test_export_to_nonexistent_parent_dir_raises_transfer_error(

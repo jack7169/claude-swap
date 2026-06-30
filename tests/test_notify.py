@@ -61,7 +61,7 @@ def test_notify_runs_osascript_on_darwin(monkeypatch):
     notify.notify("claude-swap", "hi")
     assert len(calls) == 1
     argv = calls[0][0][0]
-    assert argv[0] == "osascript"
+    assert argv[0] == "/usr/bin/osascript"  # absolute path, PATH-injection-proof
     assert argv[1] == "-e"
     assert argv[2] == notify._build_notification_script("claude-swap", "hi")
     assert calls[0][1].get("timeout") == 5

@@ -122,11 +122,9 @@ class SwitchTransaction:
                 if step == "credentials_written":
                     switcher._write_credentials(self.original_credentials)
                 elif step == "config_written":
-                    self.config_path.write_text(
-                        self.original_config, encoding="utf-8"
+                    switcher._atomic_write_text(
+                        self.config_path, self.original_config
                     )
-                    if sys.platform != "win32":
-                        os.chmod(self.config_path, 0o600)
                 elif step == "sequence_updated":
                     data = switcher._get_sequence_data()
                     if data:

@@ -15,6 +15,10 @@ import sys
 
 _logger = logging.getLogger("claude-swap")
 
+# Pin the absolute path (mirrors macos_keychain._SECURITY) so a PATH-injected
+# ``osascript`` can't intercept the notification call.
+_OSASCRIPT = "/usr/bin/osascript"
+
 
 def _sanitize(value: str) -> str:
     """Collapse all whitespace runs (newlines, tabs, CRs) to single spaces.
@@ -50,7 +54,7 @@ def notify(title: str, message: str) -> None:
         return
     try:
         subprocess.run(
-            ["osascript", "-e", _build_notification_script(title, message)],
+            [_OSASCRIPT, "-e", _build_notification_script(title, message)],
             capture_output=True,
             timeout=5,
         )

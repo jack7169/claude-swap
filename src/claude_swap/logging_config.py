@@ -1,6 +1,8 @@
 """Logging configuration for Claude Swap."""
 
 import logging
+import os
+import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -16,8 +18,17 @@ class _LazyDirRotatingFileHandler(RotatingFileHandler):
     """
 
     def _open(self):  # type: ignore[override]
-        Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
-        return super()._open()
+        # The log can carry debug detail, so keep it owner-only. mkdir's mode is
+        # umask-masked, so chmod 0700 explicitly to make the guarantee reliable;
+        # chmod the log file 0600 after super()._open() opens it.
+        parent = Path(self.baseFilename).parent
+        parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if sys.platform != "win32":
+            os.chmod(str(parent), 0o700)
+        stream = super()._open()
+        if sys.platform != "win32":
+            os.chmod(self.baseFilename, 0o600)
+        return stream
 
 
 def setup_logging(log_dir: Path, debug: bool = False) -> logging.Logger:
