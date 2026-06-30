@@ -115,12 +115,13 @@ def test_format_title_7d_only():
 
 def test_format_title_both_windows():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 42% · 18%"
+    # "both" labels each percentage so the two windows are distinguishable.
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ 5h 42% · 7d 18%"
 
 
 def test_format_title_both_windows_with_name():
     s = menubar.MenuBarSettings(show_account_name=True, title_pct="both")
-    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 42% · 18%"
+    assert menubar.format_title("loc@papaya.asia", _USAGE, s) == "⇄ loc · 5h 42% · 7d 18%"
 
 
 def test_format_title_icon_only_when_off():
@@ -146,8 +147,9 @@ def test_format_title_both_drops_unavailable_windows():
 
 def test_format_title_both_keeps_available_window():
     s = menubar.MenuBarSettings(show_account_name=False, title_pct="both")
-    # only 5h present -> 7d dropped, no trailing separator
-    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 9%"
+    # only 5h present -> 7d dropped, no trailing separator; the kept window is
+    # still labeled in "both" mode.
+    assert menubar.format_title("loc@x.com", {"five_hour": {"pct": 9.0}}, s) == "⇄ 5h 9%"
 
 
 def test_settings_auto_switch_defaults(tmp_path: Path):
@@ -298,7 +300,7 @@ def test_snapshot_full_fetches_all(monkeypatch):
         def _build_accounts_info(self):
             creds = ""
             return [(1, "a@x", "", "", True, creds), (2, "b@x", "", "", False, creds)]
-        def _collect_usage(self, info, only=None):
+        def _collect_usage(self, info, only=None, force=False):
             seen["only"] = only
             return [None, None]
     menubar._snapshot(_SW(), full=True)
@@ -311,7 +313,7 @@ def test_snapshot_incremental_fetches_active_only():
         _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
         def _build_accounts_info(self):
             return [(1, "a@x", "", "", False, ""), (2, "b@x", "", "", True, "")]
-        def _collect_usage(self, info, only=None):
+        def _collect_usage(self, info, only=None, force=False):
             seen["only"] = only
             return [None, None]
     menubar._snapshot(_SW(), full=False)
@@ -991,7 +993,7 @@ class _SnapSW:
     def _build_accounts_info(self):
         return [(1, "a@x", "", "", True, "")]
 
-    def _collect_usage(self, info, only=None):
+    def _collect_usage(self, info, only=None, force=False):
         return [None]
 
 

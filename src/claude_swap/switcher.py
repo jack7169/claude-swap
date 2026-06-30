@@ -1648,6 +1648,7 @@ class ClaudeAccountSwitcher:
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str]],
         only: set[str] | None = None,
+        force: bool = False,
     ) -> list[dict | str | None]:
         """Fetch usage per account (cache-first), with per-IP 429 backoff.
 
@@ -1657,6 +1658,11 @@ class ClaudeAccountSwitcher:
         last-known-good cache is returned. ``only`` (a set of account-number
         strings) restricts which accounts hit the network this call; the rest
         come from cache. ``only=None`` fetches all (the CLI behavior).
+
+        ``force=True`` skips the <15s fresh-cache shortcut so an explicit user
+        refresh always re-fetches over the network (the menu-bar "Refresh now"
+        bug). It deliberately does NOT bypass the per-IP 429 backoff above — a
+        forced refresh must never hammer a rate-limited endpoint.
         """
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         account_keys = [str(info[0]) for info in accounts_info]
@@ -1701,7 +1707,8 @@ class ClaudeAccountSwitcher:
             )
 
         # Fresh-cache shortcut (CLI path only): reuse if <15s old and same keys.
-        if only is None:
+        # Skipped when force=True so an explicit user refresh always re-fetches.
+        if only is None and not force:
             cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
             if (cached is not MISSING and isinstance(cached, dict)
                     and set(cached.keys()) == set(account_keys)):

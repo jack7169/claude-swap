@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import notify, oauth
@@ -283,14 +283,18 @@ def format_title(
     segments: list[str] = []
     if settings.show_account_name:
         segments.append(_local_part(active_email))
+    # In "both" mode the two percentages are otherwise indistinguishable, so
+    # prefix each with a short window label ("5h"/"7d"). In single-window modes
+    # the menu item already names the window, so the bare percentage is clear.
+    both = settings.title_pct == "both"
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"5h {p:.0f}%" if both else f"{p:.0f}%")
     if settings.title_pct in ("7d", "both"):
         p = _window_pct(active_usage, "seven_day")
         if p is not None:
-            segments.append(f"{p:.0f}%")
+            segments.append(f"7d {p:.0f}%" if both else f"{p:.0f}%")
     if not segments:
         return ICON
     return f"{ICON} " + " · ".join(segments)
@@ -344,13 +348,25 @@ def next_blocked(
 
 
 def _resets_at_ts(window: dict | str | None) -> float:
-    """POSIX timestamp of a usage window's ``resets_at``; inf if missing/bad."""
+    """POSIX timestamp of a usage window's ``resets_at``; inf if missing/bad.
+
+    Total — never raises. A far-future/past ``resets_at`` can make
+    ``.timestamp()`` raise ``OverflowError``/``OSError`` on some platforms, and
+    an unparseable string raises ``ValueError``; all fall through to ``inf`` so
+    a bad value ranks last (never auto-selected). A timezone-naive timestamp is
+    normalized to UTC before conversion so it orders consistently against
+    UTC-aware peers (treating it as *local* time would reorder the consume-first
+    ranking depending on the host's offset).
+    """
     if isinstance(window, dict):
         ra = window.get("resets_at")
         if isinstance(ra, str):
             try:
-                return datetime.fromisoformat(ra).timestamp()
-            except ValueError:
+                dt = datetime.fromisoformat(ra)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except (ValueError, OverflowError, OSError):
                 pass
     return float("inf")
 
@@ -517,7 +533,7 @@ def plan_auto_switch(
     return ("noop", None)
 
 
-def _snapshot(switcher, full: bool = True) -> dict:
+def _snapshot(switcher, full: bool = True, force: bool = False) -> dict:
     """Fetch accounts + usage off the main thread. Returns a render snapshot.
 
     Shape: ``{"accounts": [(num, email, is_active, usage), ...],
@@ -525,7 +541,10 @@ def _snapshot(switcher, full: bool = True) -> dict:
     "instances": [(label, folder, session_count, has_ide), ...]}``.
     ``full=False`` fetches only the active account over the network (backups come
     from cache) to stay under the usage endpoint's per-IP rate limit; ``full=True``
-    fetches all. Never raises — failures degrade to empty/unknown.
+    fetches all. ``force=True`` bypasses ``_collect_usage``'s 15s fresh-cache
+    shortcut so an explicit user refresh always re-fetches (the per-IP 429
+    backoff still applies). The running-instance list is computed exactly once
+    per refresh and reused. Never raises — failures degrade to empty/unknown.
     """
     instances = _snapshot_instances(switcher)
     try:
@@ -534,7 +553,7 @@ def _snapshot(switcher, full: bool = True) -> dict:
         if not full:
             active = next((str(info[0]) for info in accounts_info if info[4]), None)
             only = {active} if active else None
-        usages = switcher._collect_usage(accounts_info, only=only)
+        usages = switcher._collect_usage(accounts_info, only=only, force=force)
     except Exception:
         switcher._logger.debug("menubar snapshot failed", exc_info=True)
         return {
@@ -570,6 +589,155 @@ def _snapshot_instances(switcher) -> list[tuple[str, str, int, bool]]:
     except Exception:
         switcher._logger.debug("menubar instance detection failed", exc_info=True)
         return []
+
+
+def _snapshot_signature(snapshot: dict, settings: "MenuBarSettings") -> tuple:
+    """A cheap, hashable signature of everything ``rebuild_menu`` renders.
+
+    Comparing this between refreshes lets the sync tick skip rebuilding the
+    whole NSMenu when nothing the user would see changed. It covers the title
+    inputs (active email/usage + the settings that drive the title and menu
+    rows), the per-account rows, and the running-instance rows — the same data
+    ``rebuild_menu`` reads. Import-safe (no rumps) so it can be unit-tested.
+    """
+    accounts = tuple(
+        (num, email, is_active, _usage_signature(usage))
+        for (num, email, is_active, usage) in snapshot.get("accounts", [])
+    )
+    instances = tuple(tuple(group) for group in (snapshot.get("instances") or []))
+    settings_sig = (
+        settings.show_account_name,
+        settings.title_pct,
+        settings.auto_switch_enabled,
+        settings.auto_switch_strategy,
+        settings.auto_switch_threshold,
+        settings.auto_switch_cooldown,
+        settings.auto_switch_interval,
+        settings.refresh_interval,
+    )
+    return (
+        snapshot.get("active_email"),
+        _usage_signature(snapshot.get("active_usage")),
+        accounts,
+        instances,
+        settings_sig,
+    )
+
+
+def _usage_signature(usage: dict | str | None):
+    """Hashable projection of a usage value for the rebuild diff.
+
+    A usage dict is rendered by ``format_account_label`` / ``account_detail_lines``
+    via its per-window ``pct`` and ``resets_at``; project just those (plus any
+    string sentinel / None) so equal renders compare equal without depending on
+    dict ordering or unhashable nested values.
+    """
+    if isinstance(usage, dict):
+        return tuple(
+            (
+                key,
+                window.get("pct") if isinstance(window, dict) else None,
+                window.get("resets_at") if isinstance(window, dict) else None,
+            )
+            for key, window in sorted(usage.items())
+        )
+    return usage  # str sentinel ("no credentials" / "rate limited") or None
+
+
+def _maybe_rebuild_on_dirty(app) -> bool:
+    """Rebuild the menu only when the rendered-state signature actually changed.
+
+    Consumes ``app._dirty`` (set by a worker after it stores a new snapshot) and
+    rebuilds via ``app.rebuild_menu()`` only if the signature differs from the
+    last rendered one, avoiding a full NSMenu teardown/rebuild every refresh when
+    nothing visible changed. Returns True if a rebuild happened. Import-safe so
+    the diff logic is unit-testable without rumps.
+    """
+    if not app._dirty:
+        return False
+    app._dirty = False
+    sig = _snapshot_signature(app.snapshot, app.settings)
+    if sig == getattr(app, "_menu_sig", None):
+        return False
+    app._menu_sig = sig
+    app.rebuild_menu()
+    return True
+
+
+def _refresh_async_impl(app, full: bool = False, force: bool = False) -> bool:
+    """Start a background refresh worker, honoring the in-flight guard.
+
+    Compare-and-set under the guard's lock so at most one worker runs at a time.
+    A burst of callers (refresh timer, sync tick, manual "Refresh now") can't
+    each pass the check and spawn a duplicate worker. When ``force=True`` loses
+    the slot to an in-flight worker, the guard records a pending forced refresh
+    so the running worker launches a follow-up — the click is queued, never
+    dropped. Returns True if this call started a worker. Import-safe: spawning
+    goes through ``app._spawn`` so tests can drive it without rumps.
+    """
+    if not app._refresh_guard.try_begin(force=force):
+        return False
+    app._spawn(_worker_impl, (app, full, force))
+    return True
+
+
+def _worker_impl(app, full: bool, force: bool = False) -> None:
+    """Background-refresh worker body (runs off the Cocoa main thread).
+
+    Rebinds plain attributes (atomic in CPython) that the main-thread sync tick
+    reads. At most one worker runs at a time (see ``_refresh_async_impl``). On
+    completion, if a forced refresh was queued while this worker ran, it starts
+    the follow-up forced refresh so a "Refresh now" click never gets dropped.
+    Import-safe so the force-threading and follow-up logic are unit-testable.
+    """
+    try:
+        now = time.time()
+        if now - app._last_full_fetch >= _FULL_REFRESH_EVERY:
+            full = True
+        # Re-arm Keychain probing each cycle (a one-off `security` timeout flips
+        # the store to file mode and sticks for the process); confine the
+        # capability-cache mutation under the guard's exclusive lock so a
+        # concurrent main-thread read can't observe a torn state.
+        with app._refresh_guard.run_exclusive():
+            app.switcher.recheck_keychain()
+            snap = _snapshot(app.switcher, full=full, force=force)
+        app.snapshot = snap
+        app._snapshot_at = time.time()
+        if full:
+            app._last_full_fetch = app._snapshot_at
+        app._dirty = True  # picked up by on_sync_tick on the main thread
+    finally:
+        # Release the slot and atomically learn whether a forced refresh was
+        # queued meanwhile; if so, run it now (exactly one worker still active
+        # at a time, since the follow-up re-claims the freed slot).
+        if app._refresh_guard.finish_and_take_pending():
+            _refresh_async_impl(app, full=True, force=True)
+
+
+def _offload_action(app_guard, work, on_done=None) -> bool:
+    """Run a blocking switcher action off the Cocoa main thread.
+
+    Auto-switch and the menu switch/add/remove callbacks do keychain-subprocess
+    and ``FileLock`` work that would freeze the UI if run on the main thread.
+    This mirrors the refresh worker offload: claim the in-flight slot (so a
+    second click can't spawn an overlapping worker), run ``work`` on a daemon
+    thread, then release the slot and invoke ``on_done`` (used to mark the app
+    dirty so the main-thread sync tick re-renders). Returns True if a worker was
+    started, False if one was already in flight. Import-safe and unit-testable.
+    """
+    if not app_guard.try_begin():
+        return False
+
+    def runner():
+        try:
+            work()
+        finally:
+            app_guard.finish()
+            if on_done is not None:
+                on_done()
+
+    threading.Thread(target=runner, daemon=True).start()
+    return True
 
 
 LAUNCH_AGENT_LABEL = "com.claude-swap.menubar"
@@ -718,22 +886,32 @@ class _RefreshGuard:
         self._flag_lock = threading.Lock()
         self._cap_lock = threading.Lock()
         self._in_flight = False
+        self._pending_force = False
 
     @property
     def in_flight(self) -> bool:
         with self._flag_lock:
             return self._in_flight
 
-    def try_begin(self) -> bool:
+    def try_begin(self, force: bool = False) -> bool:
         """Atomically claim the single worker slot.
 
         Returns True if the caller won the right to start a worker (no worker
         was in flight), False if one is already running. The check-and-flip is
         done under the lock so concurrent callers serialize and exactly one
         wins.
+
+        When a worker is already in flight and ``force=True``, the request is
+        rejected (False) but a pending-forced-refresh flag is recorded so the
+        running worker can launch a follow-up forced refresh on completion —
+        i.e. a user "Refresh now" click is queued, never silently dropped. A
+        non-forced request that loses the slot is dropped as before (the next
+        timer tick will refresh anyway).
         """
         with self._flag_lock:
             if self._in_flight:
+                if force:
+                    self._pending_force = True
                 return False
             self._in_flight = True
             return True
@@ -742,6 +920,21 @@ class _RefreshGuard:
         """Release the worker slot. Safe to call when already idle."""
         with self._flag_lock:
             self._in_flight = False
+
+    def finish_and_take_pending(self) -> bool:
+        """Release the slot and atomically consume any queued forced refresh.
+
+        Returns True if a forced refresh was queued while this worker ran (the
+        caller should then start a follow-up forced refresh), False otherwise.
+        Clearing the slot and reading-and-clearing the pending flag happen under
+        the same lock so a forced request arriving in this instant is never lost
+        nor double-counted.
+        """
+        with self._flag_lock:
+            self._in_flight = False
+            pending = self._pending_force
+            self._pending_force = False
+            return pending
 
     def run_exclusive(self):
         """Context manager serializing its body against other callers."""
@@ -790,6 +983,7 @@ def run(switcher) -> int:
                 "instances": [],
             }
             self._dirty = False
+            self._menu_sig = None  # signature of the last rendered menu (3.3)
             self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
@@ -798,6 +992,9 @@ def run(switcher) -> int:
             # most one worker, plus the lock that confines the keychain-
             # capability-cache mutation to one thread at a time.
             self._refresh_guard = _RefreshGuard()
+            # Separate guard for blocking switch/add/remove actions so a click
+            # can't spawn an overlapping action worker (3.2).
+            self._action_guard = _RefreshGuard()
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
             self.rebuild_menu()
@@ -810,54 +1007,49 @@ def run(switcher) -> int:
             self.refresh_async(full=True)  # first fetch is a full one
 
         # ---- refresh plumbing -------------------------------------------------
-        def refresh_async(self, full=False):
-            # Compare-and-set under a lock: at most one worker runs at a time.
-            # Done atomically so a burst of concurrent callers (refresh timer,
-            # sync tick, manual "Refresh now") can't each pass the check and
-            # spawn a duplicate worker.
-            if not self._refresh_guard.try_begin():
-                return
-            threading.Thread(target=self._worker, args=(full,), daemon=True).start()
+        def _spawn(self, target, args):
+            """Start a daemon worker thread (indirection so the import-safe
+            ``_refresh_async_impl`` can spawn without referencing rumps)."""
+            threading.Thread(target=target, args=args, daemon=True).start()
 
-        def _worker(self, full):
+        def refresh_async(self, full=False, force=False):
+            # Compare-and-set under a lock: at most one worker runs at a time.
+            # A forced refresh (manual "Refresh now") that loses the slot is
+            # queued (not dropped); a non-forced tick is dropped as before. See
+            # _refresh_async_impl / _RefreshGuard.
+            return _refresh_async_impl(self, full=full, force=force)
+
+        def _worker(self, full, force=False):
             # Handoff: the worker rebinds plain attributes (atomic in CPython);
-            # the main-thread sync tick reads them. Worst case is acting one tick
-            # late on a slightly stale snapshot, which the staleness gate in
-            # _auto_tick already guards against. At most one worker runs at a
-            # time (see refresh_async), so these rebinds have no competing writer.
-            try:
-                now = time.time()
-                if now - self._last_full_fetch >= _FULL_REFRESH_EVERY:
-                    full = True
-                # Re-arm Keychain probing each cycle. A one-off `security`
-                # timeout flips the credential store to file mode and sticks for
-                # the process; with no plaintext fallback that freezes the active
-                # account's usage. Treating each refresh as its own invocation
-                # lets a transient failure self-heal on the next tick.
-                #
-                # recheck_keychain() rebinds the switcher's shared capability
-                # cache and the snapshot's keychain reads re-learn it. Confine
-                # that mutation under the guard's exclusive lock so a concurrent
-                # main-thread read (e.g. _detect_active_change) can't observe a
-                # torn state.
-                with self._refresh_guard.run_exclusive():
-                    self.switcher.recheck_keychain()
-                    snap = _snapshot(self.switcher, full=full)
-                self.snapshot = snap
-                self._snapshot_at = time.time()
-                if full:
-                    self._last_full_fetch = self._snapshot_at
-                self._dirty = True  # picked up by on_sync_tick on the main thread
-            finally:
-                self._refresh_guard.finish()
+            # the main-thread sync tick reads them. recheck_keychain() re-arms
+            # Keychain probing each cycle so a transient `security` timeout
+            # self-heals; the capability-cache mutation is confined under the
+            # guard's exclusive lock. force threads through to bypass the 15s
+            # cache TTL; a queued forced refresh runs as a follow-up on finish.
+            _worker_impl(self, full, force=force)
+
+        def _offload(self, work):
+            """Run a blocking switcher action off the Cocoa main thread (3.2).
+
+            Auto-switch and the menu switch/add/remove callbacks do keychain-
+            subprocess + FileLock work that would freeze the UI on the main
+            thread. Offload it onto a daemon worker, guarded so a click can't
+            spawn an overlapping action; on completion mark the app dirty so the
+            sync tick re-renders. Returns True if a worker was started.
+            """
+            return _offload_action(
+                self._action_guard, work,
+                on_done=lambda: setattr(self, "_dirty", True),
+            )
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
-            if self._dirty:
-                self._dirty = False
-                self.rebuild_menu()
+            # Rebuild the menu only when the rendered-state signature changed
+            # (3.3) — avoids a full NSMenu teardown every refresh when nothing
+            # the user sees has changed.
+            _maybe_rebuild_on_dirty(self)
             self._detect_active_change()
             if self.settings.auto_switch_enabled:
                 self._auto_tick()
@@ -913,21 +1105,28 @@ def run(switcher) -> int:
             decision = evaluate_strategy(strategy, accounts, threshold, frozenset(self.state.blocked))
             action, num = plan_auto_switch(decision, self.state, self.settings, now)
             if action == "switch":
-                try:
-                    self.switcher.switch_to(str(num))
-                except ClaudeSwitchError as e:
-                    self.switcher._logger.warning("auto-switch failed: %s", e)
-                    # notify.notify (osascript) works from this non-bundled
-                    # LaunchAgent process; rumps.notification would raise here.
-                    notify.notify("claude-swap", f"Auto-switch failed: {e}")
-                    return
+                # Record the switch timestamp up front so the cooldown holds even
+                # if the (offloaded) switch is slow; the keychain + FileLock work
+                # runs off the Cocoa main thread so the UI never freezes (3.2).
                 self.state.last_switch_at = now
                 self.state.save(state_path)
-                # No rumps.notification here: the swap notification is posted by
-                # the unified notifier (switch_to -> _perform_switch ->
-                # _announce_switch -> notify.notify), wired in cli.main. Posting
-                # one here too would double-notify.
-                self.refresh_async(full=True)
+
+                def do_switch(num=num):
+                    try:
+                        self.switcher.switch_to(str(num))
+                    except ClaudeSwitchError as e:
+                        self.switcher._logger.warning("auto-switch failed: %s", e)
+                        # notify.notify (osascript) works from this non-bundled
+                        # LaunchAgent process; rumps.notification would raise here.
+                        notify.notify("claude-swap", f"Auto-switch failed: {e}")
+                        return
+                    # No rumps.notification here: the swap notification is posted
+                    # by the unified notifier (switch_to -> _perform_switch ->
+                    # _announce_switch -> notify.notify), wired in cli.main.
+                    # Posting one here too would double-notify.
+                    self.refresh_async(full=True)
+
+                self._offload(do_switch)
             elif action == "notify_noswap":
                 # Post first, then record the rate-limit timestamp only after the
                 # alert is dispatched — otherwise a failed notification would burn
@@ -1078,14 +1277,30 @@ def run(switcher) -> int:
             self.settings.save(settings_path)
             self.rebuild_menu()
 
-        def _guard(self, fn):
-            """Run a switcher action, surfacing ClaudeSwitchError via an alert."""
-            try:
-                fn()
-                return True
-            except ClaudeSwitchError as e:
-                rumps.alert(title="claude-swap", message=str(e))
-                return False
+        def _offload_switch(self, fn, *, record_switch=False):
+            """Offload a blocking switcher mutation (switch/add/remove) (3.2).
+
+            The keychain-subprocess + FileLock work runs on a daemon worker so
+            the Cocoa main thread (and the menu) never freezes. Errors are
+            surfaced via notify.notify — rumps.alert can't be shown from a
+            worker thread. On success a full refresh is queued (the swap
+            notification itself is posted by the unified notifier wired in
+            cli.main). ``record_switch`` stamps the cooldown timestamp.
+            """
+            def work():
+                try:
+                    fn()
+                except ClaudeSwitchError as e:
+                    # notify.notify (osascript) works from this non-bundled
+                    # process and never raises; rumps.alert would need the main
+                    # thread and isn't safe here.
+                    notify.notify("claude-swap", str(e))
+                    return
+                if record_switch:
+                    self.state.last_switch_at = time.time()
+                    self.state.save(state_path)
+                self.refresh_async(full=True)
+            self._offload(work)
 
         # Swap notifications are posted by the unified notifier wired in
         # cli.main (switch/switch_to -> _perform_switch -> _announce_switch ->
@@ -1093,35 +1308,35 @@ def run(switcher) -> int:
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
-                    self.state.last_switch_at = time.time()
-                    self.state.save(state_path)
-                    self.refresh_async(full=True)
+                self._offload_switch(
+                    lambda: self.switcher.switch_to(str(num)), record_switch=True
+                )
             return cb
 
         def _switch(self, strategy):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
-                    self.state.last_switch_at = time.time()
-                    self.state.save(state_path)
-                    self.refresh_async(full=True)
+                self._offload_switch(
+                    lambda: self.switcher.switch(strategy=strategy), record_switch=True
+                )
             return cb
 
         def _make_remove(self, num):
             def cb(_sender):
+                # The confirmation dialog stays on the main thread (it's UI);
+                # only the blocking removal is offloaded.
                 if rumps.alert(
                     title="Remove account",
                     message=f"Remove account {num}?",
                     ok="Remove",
                     cancel="Cancel",
                 ) == 1:  # 1 == OK
-                    if self._guard(lambda: self.switcher.remove_account(str(num), force=True)):
-                        self.refresh_async(full=True)
+                    self._offload_switch(
+                        lambda: self.switcher.remove_account(str(num), force=True)
+                    )
             return cb
 
         def on_add_login(self, _sender):
-            if self._guard(self.switcher.add_account):
-                self.refresh_async(full=True)
+            self._offload_switch(self.switcher.add_account)
 
         def on_add_token(self, _sender):
             # A menu-bar (accessory) app isn't the active app, so a modal
@@ -1145,10 +1360,13 @@ def run(switcher) -> int:
             token_resp = token_win.run()
             if token_resp.clicked != 1 or not token_resp.text.strip():
                 return
-            if self._guard(lambda: self.switcher.add_account_from_token(
-                token=token_resp.text.strip(), email=email_resp.text.strip(), slot=None,
-            )):
-                self.refresh_async(full=True)
+            # Dialogs ran on the main thread; offload the blocking add (keychain
+            # + FileLock) so the UI doesn't freeze (3.2).
+            token = token_resp.text.strip()
+            email = email_resp.text.strip()
+            self._offload_switch(lambda: self.switcher.add_account_from_token(
+                token=token, email=email, slot=None,
+            ))
 
         def on_add_browser_login(self, _sender):
             # Bring the accessory app forward so any future dialogs render, then run the
@@ -1204,26 +1422,36 @@ def run(switcher) -> int:
                 rumps.alert(title="claude-swap",
                             message="No active Claude Code login detected. Log in first.")
                 return
-            try:
-                self.switcher.add_account(slot=None)
-            except CredentialReadError:
-                # Almost always a launchd/login-agent Keychain block: the active
-                # credential lives in the macOS Keychain, which a background agent
-                # can't read (the security call times out). Point at the fix.
-                rumps.alert(
-                    title="claude-swap",
-                    message="Couldn't read the active credential. If the menu bar is running "
-                            "as a background/login agent, macOS blocks its Keychain access — "
-                            "quit and relaunch it from a Terminal with: cswap --menubar",
-                )
-                return
-            except ClaudeSwitchError as e:
-                rumps.alert(title="claude-swap", message=str(e))
-                return
-            self.refresh_async(full=True)
+
+            # Offload the blocking add (keychain read + FileLock) so the menu
+            # doesn't freeze (3.2). Errors are surfaced via notify.notify — a
+            # worker thread can't safely show a rumps.alert.
+            def work():
+                try:
+                    self.switcher.add_account(slot=None)
+                except CredentialReadError:
+                    # Almost always a launchd/login-agent Keychain block: the
+                    # active credential lives in the macOS Keychain, which a
+                    # background agent can't read (the security call times out).
+                    notify.notify(
+                        "claude-swap",
+                        "Couldn't read the active credential. If the menu bar is "
+                        "running as a background/login agent, macOS blocks its "
+                        "Keychain access — quit and relaunch it from a Terminal "
+                        "with: cswap --menubar",
+                    )
+                    return
+                except ClaudeSwitchError as e:
+                    notify.notify("claude-swap", str(e))
+                    return
+                self.refresh_async(full=True)
+
+            self._offload(work)
 
         def on_refresh_now(self, _sender):
-            self.refresh_async(full=True)
+            # Force past the 15s usage-cache TTL so the click fetches fresh data
+            # immediately; if a worker is mid-fetch the force is queued (3.1).
+            self.refresh_async(full=True, force=True)
 
         def on_toggle_name(self, _sender):
             self.settings.show_account_name = not self.settings.show_account_name
