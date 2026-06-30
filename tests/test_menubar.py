@@ -93,14 +93,6 @@ def test_format_account_label():
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
-def test_auto_switch_menu_label_shows_on_when_enabled():
-    assert menubar.auto_switch_menu_label(True) == "Auto-switch accounts: ON"
-
-
-def test_auto_switch_menu_label_shows_off_when_disabled():
-    assert menubar.auto_switch_menu_label(False) == "Auto-switch accounts: OFF"
-
-
 def test_auto_switch_strategy_label_known():
     assert menubar.auto_switch_strategy_label("reactive") == "Reactive"
     assert menubar.auto_switch_strategy_label("consume-first") == "Consume-first"

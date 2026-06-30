@@ -182,16 +182,6 @@ def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     return " · ".join(parts) if parts else "usage unavailable"
 
 
-def auto_switch_menu_label(enabled: bool) -> str:
-    """Label for the auto-switch toggle, with explicit ON/OFF text.
-
-    macOS menu checkmarks are easy to miss (an unmarked item reads as a plain
-    line), so the on/off state is spelled out in the label rather than shown
-    only as a check.
-    """
-    return f"Auto-switch accounts: {'ON' if enabled else 'OFF'}"
-
-
 _STRATEGY_SHORT_LABELS = {"reactive": "Reactive", "consume-first": "Consume-first"}
 
 
@@ -1156,13 +1146,15 @@ def run(switcher) -> int:
                 self._auto_tick()
 
         def _update_countdown(self):
-            """Re-title the live 'next check' header line each tick (no rebuild).
+            """Re-title the live 'next check' header line each tick.
 
-            Touches only the single countdown leaf item, so it stays cheap and
-            never tears down the NSMenu while the user has it open.
+            Skipped while the menu is open: mutating any item (even a title) in
+            a menu the user has dropped down makes AppKit reflow the parent and
+            momentarily dismiss an open child submenu — the residual flicker.
+            The countdown resumes on the next tick after the menu closes.
             """
             item = self._countdown_item
-            if item is None or not self.settings.auto_switch_enabled:
+            if item is None or self._menu_open or not self.settings.auto_switch_enabled:
                 return
             cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
             seconds_to_next = max(0.0, (self._last_auto_eval + cadence) - time.time())
@@ -1274,11 +1266,12 @@ def run(switcher) -> int:
             # those rows are added with explicit unique keys via `self.menu[k]=`.
             self.menu.clear()
 
-            # Auto-swap status header at the very top. The status/method lines
-            # change only with settings (covered by the rebuild signature); the
-            # countdown line is re-titled in place each second by the sync tick,
-            # so it stays OUT of the signature (else it'd force a full NSMenu
-            # rebuild every tick — defeating the 3.3 optimization).
+            # Auto-swap status header at the very top. Line 0 ("Auto-swap:
+            # ON/OFF") is the clickable enable toggle — moved here from Settings
+            # so it's a one-click control on the main page. The remaining lines
+            # (method, countdown) are non-clickable status; the countdown is
+            # re-titled in place each second and stays OUT of the rebuild
+            # signature (else it'd force a full NSMenu rebuild every tick).
             cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
             seconds_to_next = max(0.0, (self._last_auto_eval + cadence) - time.time())
             header = auto_switch_header_lines(
@@ -1289,7 +1282,8 @@ def run(switcher) -> int:
             )
             self._countdown_item = None
             for idx, line in enumerate(header):
-                item = rumps.MenuItem(line, callback=None)
+                cb = self.on_toggle_autoswitch if idx == 0 else None
+                item = rumps.MenuItem(line, callback=cb)
                 self.menu.add(item)
                 if self.settings.auto_switch_enabled and idx == len(header) - 1:
                     self._countdown_item = item  # the live "Next check:" line
@@ -1375,12 +1369,9 @@ def run(switcher) -> int:
                 interval.add(choice)
             menu.add(interval)
 
-            auto_item = rumps.MenuItem(
-                auto_switch_menu_label(self.settings.auto_switch_enabled),
-                callback=self.on_toggle_autoswitch,
-            )
-            menu.add(auto_item)
-
+            # The auto-switch ON/OFF toggle lives on the main menu (the header's
+            # "Auto-swap: ON/OFF" line), not here. Settings keeps only the
+            # auto-switch *tuning* (strategy / threshold / cooldown / check).
             strategy_menu = rumps.MenuItem("Auto-switch strategy")
             st_labels = {"reactive": "Reactive (threshold)",
                          "consume-first": "Consume-first (soonest reset)"}
