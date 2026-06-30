@@ -436,3 +436,37 @@ def test_offload_marshals_dirty_back_for_sync_tick():
     while not app._dirty and time.time() < deadline:
         time.sleep(0.01)
     assert app._dirty is True
+
+
+# --- auto-tick cadence: evaluate on a fresh FULL fetch, like "Refresh now" ----
+# The auto-switcher must not decide on the routine active-only snapshot; a recent
+# partial display refresh kept _snapshot_at fresh and masked stale backups, so a
+# switch only fired after a manual full+forced "Refresh now". plan_auto_tick gates
+# the pre-eval refresh on the last *full* fetch instead.
+
+def test_plan_auto_tick_waits_within_cadence():
+    assert menubar.plan_auto_tick(
+        now=10.0, last_eval=5.0, last_full_fetch=5.0, cadence=30, in_flight=False
+    ) == "wait"
+
+
+def test_plan_auto_tick_refreshes_when_full_fetch_is_stale():
+    # Eval is due (last_eval old) and the last FULL fetch is older than cadence,
+    # even though a partial refresh may have updated the snapshot recently.
+    assert menubar.plan_auto_tick(
+        now=100.0, last_eval=0.0, last_full_fetch=0.0, cadence=30, in_flight=False
+    ) == "refresh"
+
+
+def test_plan_auto_tick_waits_instead_of_evaluating_on_stale_while_in_flight():
+    # A full fetch is needed but a worker holds the slot: wait for it rather than
+    # evaluate on stale/partial data.
+    assert menubar.plan_auto_tick(
+        now=100.0, last_eval=0.0, last_full_fetch=0.0, cadence=30, in_flight=True
+    ) == "wait"
+
+
+def test_plan_auto_tick_evaluates_when_full_fetch_is_fresh():
+    assert menubar.plan_auto_tick(
+        now=100.0, last_eval=0.0, last_full_fetch=90.0, cadence=30, in_flight=False
+    ) == "evaluate"

@@ -26,7 +26,7 @@ from claude_swap.printer import abbreviate_path, entrypoint_label, ide_short_nam
 from claude_swap.process_detection import get_running_instances
 
 ICON = "⇄"
-REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
+REFRESH_CHOICES: tuple[int, ...] = (15, 30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
 AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
@@ -555,6 +555,30 @@ def evaluate_strategy(
     if strategy == "consume-first":
         return decide_consume_first(accounts, threshold, blocked)
     return decide_auto_switch(accounts, threshold, blocked)
+
+
+def plan_auto_tick(
+    *, now: float, last_eval: float, last_full_fetch: float, cadence: int, in_flight: bool
+) -> str:
+    """Decide the auto-switch tick's next move: ``wait`` / ``refresh`` / ``evaluate``.
+
+    The auto-switcher must decide on a *full* snapshot (every account's usage
+    freshly fetched) no older than the cadence — the same data "Refresh now"
+    produces. The routine display refresh is ``full=False`` (active account only;
+    backups from cache), and it keeps the overall snapshot timestamp fresh, so
+    gating the pre-eval fetch on snapshot age let the auto path decide on stale
+    backup usage and silently no-op until a manual full+forced refresh. Gate on
+    the last *full* fetch instead; the caller forces that fetch past the 15s
+    usage cache so it always re-fetches over the network.
+
+    ``refresh`` is only returned when no worker holds the slot; if one does we
+    ``wait`` for it rather than evaluate on stale/partial data.
+    """
+    if now - last_eval < cadence:
+        return "wait"
+    if now - last_full_fetch > cadence:
+        return "wait" if in_flight else "refresh"
+    return "evaluate"
 
 
 def plan_auto_switch(
@@ -1141,16 +1165,22 @@ def run(switcher) -> int:
         def _auto_tick(self):
             now = time.time()
             cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
-            if now - self._last_auto_eval < cadence:
+            action = plan_auto_tick(
+                now=now,
+                last_eval=self._last_auto_eval,
+                last_full_fetch=self._last_full_fetch,
+                cadence=cadence,
+                in_flight=self._refresh_guard.in_flight,
+            )
+            if action == "wait":
                 return
-            # If the snapshot is staler than the cadence (always true in mode B
-            # with a sub-refresh interval; possible in either mode), fetch fresh
-            # and evaluate on a later tick so we never act on stale usage.
-            if now - self._snapshot_at > cadence and not self._refresh_guard.in_flight:
-                # consume-first forces a full fetch here; between these it may rank
-                # backups up to _FULL_REFRESH_EVERY old — fine, since it ranks by
-                # weekly reset time (days-scale), not by minute-to-minute usage.
-                self.refresh_async(full=(self.settings.auto_switch_strategy == "consume-first"))
+            if action == "refresh":
+                # Fetch fresh usage for ALL accounts before deciding, and force
+                # past the 15s usage cache — i.e. exactly what "Refresh now" does.
+                # The routine display refresh is active-only, so without this the
+                # auto path decided on stale backups and never switched until a
+                # manual refresh. Evaluate on a later tick once the snapshot lands.
+                self.refresh_async(full=True, force=True)
                 return
             self._last_auto_eval = now
             self._maybe_auto_switch(now)
@@ -1310,7 +1340,7 @@ def run(switcher) -> int:
                 title_pct.add(ch)
             menu.add(title_pct)
             interval = rumps.MenuItem("Refresh interval")
-            labels = {30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
+            labels = {15: "15 seconds", 30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
                 choice = rumps.MenuItem(labels[secs], callback=self._make_interval(secs))
                 choice.state = 1 if self.settings.refresh_interval == secs else 0
