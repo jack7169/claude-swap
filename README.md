@@ -92,6 +92,17 @@ Once a release that bundles the extra is published, the one-liner
 `uv tool install 'claude-swap[menubar]'` (or `pipx install 'claude-swap[menubar]'`)
 will work directly.
 
+**Updating the menu-bar install.** Pull the latest source and reinstall, then
+restart the running app so it picks up the new code (a running process keeps the
+old code in memory until it's restarted):
+
+```bash
+cd claude-swap && git pull
+uv tool install --reinstall '.[menubar]'
+launchctl kickstart -k gui/$(id -u)/com.claude-swap.menubar   # if running as a login item
+# otherwise just relaunch: cswap --menubar
+```
+
 The dropdown lists every managed account with a one-line 5h / 7d / spend summary
 and, indented beneath each, its 5h and 7d detail — percentage, reset clock-time,
 and live countdown, matching `cswap --list`. Below the accounts, a **Running
