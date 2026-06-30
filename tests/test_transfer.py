@@ -1233,16 +1233,19 @@ class TestImportHoldsLock:
         out = temp_home / "x.cswap"
         export_accounts(s, str(out), account="1")
 
-        # Import into a fresh home and spy on the FileLock the transfer module
-        # uses. On the unlocked (buggy) code, transfer never references
-        # FileLock at all, so this spy is never invoked.
+        # Import into a fresh home and spy on the FileLock the import path
+        # ultimately takes. transfer now serializes through
+        # ``switcher._sequence_lock()`` (a per-thread reentrant wrapper that
+        # acquires the module-level ``switcher.FileLock`` on the outermost
+        # entry), so spy on that. On the unlocked (buggy) code, the import never
+        # acquires the lock at all, so this spy is never invoked.
         dst_home = temp_home.parent / "dst"
         dst_home.mkdir()
         seen_lock_paths: list[Path] = []
 
-        import claude_swap.transfer as transfer_mod
+        import claude_swap.switcher as switcher_mod
 
-        real_file_lock = transfer_mod.FileLock
+        real_file_lock = switcher_mod.FileLock
 
         class _SpyLock(real_file_lock):  # type: ignore[misc, valid-type]
             def __enter__(self_inner):
@@ -1252,7 +1255,7 @@ class TestImportHoldsLock:
         with patch("pathlib.Path.home", return_value=dst_home):
             with patch.dict(os.environ, {"HOME": str(dst_home)}):
                 dst = _linux_switcher(dst_home)
-                with patch.object(transfer_mod, "FileLock", _SpyLock):
+                with patch.object(switcher_mod, "FileLock", _SpyLock):
                     import_accounts(dst, str(out))
 
                 # The lock that was held must be the switcher's lock_file —

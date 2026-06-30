@@ -362,7 +362,9 @@ class TestMigrationsUnderLock:
             held_during_migration.append(_RecordingLock.is_held(str(sw.lock_file)))
             return False  # not applicable → nothing recorded
 
-        with patch.object(migrations_mod, "FileLock", _RecordingLock), \
+        # run_migrations now takes the lock via switcher._sequence_lock(), which
+        # constructs the real lock through switcher_mod.FileLock — patch there.
+        with patch.object(switcher_mod, "FileLock", _RecordingLock), \
              patch.object(
                  migrations_mod, "MIGRATIONS", [("fake_mig", fake_migration)]
              ):
@@ -392,7 +394,7 @@ class TestMigrationsUnderLock:
         def fake_migration(sw) -> bool:
             return False
 
-        with patch.object(migrations_mod, "FileLock", _FailingLock), \
+        with patch.object(switcher_mod, "FileLock", _FailingLock), \
              patch.object(
                  migrations_mod, "MIGRATIONS", [("fake_mig", fake_migration)]
              ):

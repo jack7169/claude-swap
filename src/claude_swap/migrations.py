@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, Callable
 
 from claude_swap import macos_keychain
 from claude_swap.exceptions import LockError, MigrationIncomplete
-from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp
 from claude_swap.switcher import KEYRING_SERVICE, SECURITY_SERVICE
 
@@ -514,10 +513,12 @@ def run_migrations(switcher: "ClaudeAccountSwitcher") -> None:
     must never abort switcher construction.
 
     Migrations read-modify-write credential backends, so the pass runs under the
-    cross-process ``FileLock`` — two concurrent first-run processes would
-    otherwise race. The lock is only taken when there is pending work (the
-    backup dir exists and at least one migration is unapplied), and a failure to
-    acquire it is logged and swallowed: this is invoked from
+    cross-process lock — two concurrent first-run processes would otherwise race.
+    It goes through ``switcher._sequence_lock()`` (the per-thread reentrant
+    wrapper) rather than a raw ``FileLock`` so a migration that ever reaches a
+    lock-taking helper can't self-deadlock. The lock is only taken when there is
+    pending work (the backup dir exists and at least one migration is unapplied),
+    and a failure to acquire it is logged and swallowed: this is invoked from
     ``ClaudeAccountSwitcher.__init__`` and must never break construction.
     """
     if not switcher.backup_dir.exists():
@@ -529,8 +530,7 @@ def run_migrations(switcher: "ClaudeAccountSwitcher") -> None:
         return  # nothing to do — don't even take the lock
 
     try:
-        lock = FileLock(switcher.lock_file)
-        with lock:
+        with switcher._sequence_lock():
             # Re-check inside the lock: another process may have applied the
             # pending migrations while we waited for the lock.
             applied = _load_applied(switcher)

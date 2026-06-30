@@ -42,7 +42,6 @@ from typing import TYPE_CHECKING, NoReturn
 from claude_swap import macos_keychain
 from claude_swap.exceptions import SessionError
 from claude_swap.macos_keychain import KeychainError
-from claude_swap.locking import FileLock
 from claude_swap.models import Platform
 from claude_swap.oauth import refresh_oauth_credentials
 from claude_swap.printer import accent, dimmed, muted, warning
@@ -301,7 +300,7 @@ class SessionManager:
             self._sync_sharing(session_dir, share)
             return session_dir, account_num, email
 
-        with FileLock(self.switcher.lock_file, timeout=_BOOTSTRAP_LOCK_TIMEOUT):
+        with self.switcher._sequence_lock(timeout=_BOOTSTRAP_LOCK_TIMEOUT):
             # Re-evaluate the marker under the lock, then re-check validity:
             # another `cswap run` may have bootstrapped while we waited.
             if (session_dir / STALE_MARKER).exists() and not live_sessions_for(

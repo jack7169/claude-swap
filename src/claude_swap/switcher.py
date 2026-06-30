@@ -8,8 +8,10 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 
 from claude_swap import macos_keychain
@@ -152,6 +154,10 @@ class ClaudeAccountSwitcher:
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
+        # Per-thread reentrancy state for ``_sequence_lock`` (see its docstring).
+        # ``FileLock`` is non-reentrant, so we track a per-thread held-depth and
+        # only touch the underlying ``FileLock`` on the outermost entry.
+        self._lock_state = threading.local()
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
         # Optional swap notifier (cli.main wires this on macOS). Invoked from the
@@ -552,6 +558,52 @@ class ClaudeAccountSwitcher:
             }
             self._write_json(self.sequence_file, init_data)
 
+    @contextmanager
+    def _sequence_lock(self, timeout=None):
+        """Per-thread REENTRANT wrapper around the cross-process ``FileLock``.
+
+        ``FileLock`` (locking.py) is a non-reentrant advisory lock, yet several
+        read-modify-write helpers that take it are reachable from *inside* an
+        already-held locked region — most importantly ``_migrate_org_fields``
+        via ``_get_sequence_data_migrated``, which ``transfer.import_accounts``
+        triggers while it holds the lock. Acquiring a fresh ``FileLock`` there
+        would deadlock (or, on POSIX where the lock is tied to the open file
+        description, silently no-op). This context manager makes nesting safe:
+
+        * The reentrancy depth is tracked per thread via ``threading.local`` so
+          the menu-bar's single shared switcher stays correct across its worker
+          and main threads — each thread keeps its own depth.
+        * The FIRST (outermost) entry on a thread acquires the real
+          ``FileLock``; nested entries on the same thread just bump the depth
+          and reuse the already-held lock (no second ``FileLock``).
+        * Cross-thread acquisitions still serialize through the underlying
+          ``FileLock`` exactly as before — only same-thread re-entry is reused.
+        """
+        depth = getattr(self._lock_state, "depth", 0)
+        if depth > 0:
+            # Already holding the lock on this thread — reuse it.
+            self._lock_state.depth = depth + 1
+            try:
+                yield
+            finally:
+                self._lock_state.depth -= 1
+        else:
+            # Outermost entry: take the real cross-process lock. Pass the
+            # caller's timeout (if any) to the FileLock constructor so its
+            # __enter__ honors it.
+            if timeout is not None:
+                lock = FileLock(self.lock_file, timeout=timeout)
+            else:
+                lock = FileLock(self.lock_file)
+            with lock:
+                self._lock_state.depth = 1
+                try:
+                    yield
+                finally:
+                    # Reset depth INSIDE the ``with FileLock`` so the real lock
+                    # releases only after we've dropped to depth 0.
+                    self._lock_state.depth = 0
+
     def _get_sequence_data(self) -> dict | None:
         """Get sequence data."""
         return self._read_json(self.sequence_file)
@@ -718,12 +770,18 @@ class ClaudeAccountSwitcher:
         For the currently active account, reads org info from the live config
         (which is authoritative). For inactive accounts, falls back to backup
         configs. Writes updated fields back to sequence.json.
-        """
-        data = self._get_sequence_data()
-        if not data:
-            return
 
-        # Read live config for the currently active account
+        The read-modify-write of sequence.json runs under ``_sequence_lock`` and
+        RE-READS the data inside the lock, so this one-time org-field backfill
+        can't clobber a concurrent mutation (the residual unlocked-write race).
+        Because ``_sequence_lock`` is reentrant per thread, this stays safe even
+        when reached from inside a held region — e.g. ``transfer.import_accounts``
+        triggers it via ``_get_sequence_data_migrated`` while holding the lock;
+        the nested entry simply reuses that thread's already-held FileLock.
+        """
+        # Read live config for the currently active account. This is a local
+        # file read with no sequence.json mutation, so do it before taking the
+        # lock to keep the locked region tight.
         live_email = ""
         live_org_uuid = ""
         live_org_name = ""
@@ -739,39 +797,46 @@ class ClaudeAccountSwitcher:
             except Exception:
                 pass
 
-        updated = False
-        for num, account in data.get("accounts", {}).items():
-            if "organizationUuid" in account:
-                continue  # Already migrated
+        with self._sequence_lock():
+            # Re-read inside the lock so the backfill merges onto the latest
+            # state (a concurrent add/remove/switch may have just written).
+            data = self._get_sequence_data()
+            if not data:
+                return
 
-            email = account.get("email", "")
+            updated = False
+            for num, account in data.get("accounts", {}).items():
+                if "organizationUuid" in account:
+                    continue  # Already migrated
 
-            # For the active account, prefer live config (backup may lack org fields)
-            if email == live_email and live_email:
-                account["organizationUuid"] = live_org_uuid
-                account["organizationName"] = live_org_name
-                updated = True
-                continue
+                email = account.get("email", "")
 
-            # For inactive accounts, fall back to backup config
-            config_text = self._read_account_config(num, email)
-            if config_text:
-                try:
-                    config_data = json.loads(config_text)
-                    oauth = config_data.get("oauthAccount", {})
-                    account["organizationUuid"] = oauth.get("organizationUuid", "") or ""
-                    account["organizationName"] = oauth.get("organizationName", "") or ""
-                except (json.JSONDecodeError, AttributeError):
+                # For the active account, prefer live config (backup may lack org fields)
+                if email == live_email and live_email:
+                    account["organizationUuid"] = live_org_uuid
+                    account["organizationName"] = live_org_name
+                    updated = True
+                    continue
+
+                # For inactive accounts, fall back to backup config
+                config_text = self._read_account_config(num, email)
+                if config_text:
+                    try:
+                        config_data = json.loads(config_text)
+                        oauth = config_data.get("oauthAccount", {})
+                        account["organizationUuid"] = oauth.get("organizationUuid", "") or ""
+                        account["organizationName"] = oauth.get("organizationName", "") or ""
+                    except (json.JSONDecodeError, AttributeError):
+                        account["organizationUuid"] = ""
+                        account["organizationName"] = ""
+                else:
                     account["organizationUuid"] = ""
                     account["organizationName"] = ""
-            else:
-                account["organizationUuid"] = ""
-                account["organizationName"] = ""
-            updated = True
+                updated = True
 
-        if updated:
-            data["lastUpdated"] = get_timestamp()
-            self._write_json(self.sequence_file, data)
+            if updated:
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
 
     def add_account(self, slot: int | None = None) -> None:
         """Add current account to managed accounts.
@@ -826,7 +891,7 @@ class ClaudeAccountSwitcher:
 
             # Re-read and write sequence.json under the lock so a concurrent
             # switch/menu-bar auto-switch can't interleave a lost-update write.
-            with FileLock(self.lock_file):
+            with self._sequence_lock():
                 seq = self._get_sequence_data()
                 account_num = self._find_account_slot(seq, current_email, current_org_uuid)
                 # account_num is None only if the slot was removed between the
@@ -918,7 +983,7 @@ class ClaudeAccountSwitcher:
         # and the sequence.json read-modify-write so a concurrent switch/menu-bar
         # auto-switch can't interleave a lost-update write. Re-read inside the
         # lock; assign the auto slot here so two concurrent adds can't collide.
-        with FileLock(self.lock_file):
+        with self._sequence_lock():
             if account_num is None:
                 account_num = str(self._get_next_account_number())
 
@@ -977,6 +1042,28 @@ class ClaudeAccountSwitcher:
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
         print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
 
+    def _token_credentials_payload(self, token: str, is_api_key: bool) -> str:
+        """Credential payload for a token add: managed keys raw, tokens wrapped."""
+        if is_api_key:
+            return token
+        return json.dumps({
+            "claudeAiOauth": {
+                "accessToken": token,
+                "scopes": list(SETUP_TOKEN_SCOPES),
+            }
+        })
+
+    def _synthesized_token_config(self, email: str) -> str:
+        """Minimal config for a token add (no real org metadata)."""
+        return json.dumps({
+            "oauthAccount": {
+                "emailAddress": email,
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
+
     def add_account_from_token(
         self, token: str, email: str | None = None, slot: int | None = None
     ) -> None:
@@ -1017,13 +1104,54 @@ class ClaudeAccountSwitcher:
         self._init_sequence_file()
         self._migrate_org_fields()
 
-        # Synthesize a placeholder email when one isn't provided. These tokens
-        # have no real email metadata, so requiring users to invent one is
-        # noise; the slot number gives every default account a unique key.
+        label = "api-key" if is_api_key else "setup-token"
+
+        # When NO email AND NO slot are given, the placeholder email is derived
+        # from the auto-assigned slot number. Picking that slot (and synthesizing
+        # the email) must happen INSIDE the lock so two concurrent headless adds
+        # can't pick the same slot and clobber each other. This case is
+        # non-interactive (no prompt), so it lives entirely inside the lock.
+        if not email and slot is None:
+            credentials = self._token_credentials_payload(token, is_api_key)
+            with self._sequence_lock():
+                account_num = str(self._get_next_account_number())
+                email = f"{label}-{account_num}@token.local"
+                config = self._synthesized_token_config(email)
+                # A brand-new auto slot's synthesized email can't already exist
+                # (same-kind in-place refresh / cross-kind collision only apply
+                # to user-supplied emails), so this is always a fresh add.
+                self._write_account_credentials(account_num, email, credentials)
+                self._write_account_config(account_num, email, config)
+
+                data = self._get_sequence_data()
+                record = {
+                    "email": email,
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": get_timestamp(),
+                }
+                if is_api_key:
+                    record["kind"] = "api_key"
+                data["accounts"][account_num] = record
+                if int(account_num) not in data["sequence"]:
+                    data["sequence"].append(int(account_num))
+                    data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+
+            source_label = "API key" if is_api_key else "token"
+            self._logger.info(f"Added account {account_num} from {source_label}: {email}")
+            print(
+                f"{accent('Added')} Account {account_num}: {email} "
+                f"{muted('[personal]')} {muted(f'(from {source_label})')}"
+            )
+            return
+
+        # Synthesize a placeholder email when one isn't provided but an explicit
+        # slot is. The slot is already pinned by the caller, so the slot pick
+        # below is not racy and the email can be derived here.
         if not email:
-            if slot is None:
-                slot = self._get_next_account_number()
-            label = "api-key" if is_api_key else "setup-token"
             email = f"{label}-{slot}@token.local"
 
         # Don't silently overwrite/convert an existing account of the other kind:
@@ -1034,29 +1162,14 @@ class ClaudeAccountSwitcher:
         # Build the credential payload by kind: a managed key is stored raw; an
         # OAuth setup-token is wrapped in Claude Code's credential JSON. The
         # synthesized config is identical for both (no real org metadata).
-        if is_api_key:
-            credentials = token
-        else:
-            credentials = json.dumps({
-                "claudeAiOauth": {
-                    "accessToken": token,
-                    "scopes": list(SETUP_TOKEN_SCOPES),
-                }
-            })
-        config = json.dumps({
-            "oauthAccount": {
-                "emailAddress": email,
-                "accountUuid": "",
-                "organizationUuid": None,
-                "organizationName": None,
-            }
-        })
+        credentials = self._token_credentials_payload(token, is_api_key)
+        config = self._synthesized_token_config(email)
 
         # If the account already exists (same email, personal), refresh in place.
         # Re-read/write sequence.json under the lock so a concurrent switch/
         # menu-bar auto-switch can't interleave a lost-update write.
         if slot is None and self._account_exists(email, ""):
-            with FileLock(self.lock_file):
+            with self._sequence_lock():
                 seq = self._get_sequence_data()
                 account_num = self._find_account_slot(seq, email, "")
                 if account_num is None:
@@ -1115,7 +1228,7 @@ class ClaudeAccountSwitcher:
         # Take the lock for the destructive cleanup + sequence.json read-modify-
         # write. Re-read inside the lock; assign the auto slot here so two
         # concurrent adds can't collide.
-        with FileLock(self.lock_file):
+        with self._sequence_lock():
             if account_num is None:
                 account_num = str(self._get_next_account_number())
 
@@ -1204,30 +1317,42 @@ class ClaudeAccountSwitcher:
 
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
-        if not email:
-            if slot is None:
-                slot = self._get_next_account_number()
+        # When NO email AND NO slot are given, the placeholder email is derived
+        # from the auto-assigned slot number. Defer both the slot pick and the
+        # email synthesis until INSIDE the lock so two concurrent headless adds
+        # can't pick the same slot and clobber each other.
+        synthesize_in_lock = not email and slot is None
+        if not email and slot is not None:
+            # Explicit slot pins the placeholder email; not racy.
             email = f"signed-in-{slot}@token.local"
 
-        self._reject_cross_kind_collision(email, is_api_key=False)
+        # Cross-kind collision can only apply to a real, user-supplied email; a
+        # brand-new auto slot's synthesized email is guaranteed unique.
+        if not synthesize_in_lock:
+            self._reject_cross_kind_collision(email, is_api_key=False)
 
-        config = json.dumps({
-            "oauthAccount": {
-                "emailAddress": email,
-                "accountUuid": account_uuid,
-                "organizationUuid": org_uuid or None,
-                "organizationName": org_name or None,
-            }
-        })
+        def _build_config(addr: str) -> str:
+            return json.dumps({
+                "oauthAccount": {
+                    "emailAddress": addr,
+                    "accountUuid": account_uuid,
+                    "organizationUuid": org_uuid or None,
+                    "organizationName": org_name or None,
+                }
+            })
+
+        config = _build_config(email) if not synthesize_in_lock else None
 
         # Take the lock around the sequence.json read-modify-write so a
         # concurrent switch/menu-bar auto-switch can't interleave a lost-update
         # write. This call is non-interactive (no prompts), so the whole
         # read-decide-write region runs inside the lock; re-read inside it and
         # assign the auto slot here so two concurrent adds can't collide.
-        with FileLock(self.lock_file):
+        with self._sequence_lock():
             # Update in place when this (email, org) account already exists.
-            if slot is None and self._account_exists(email, org_uuid):
+            # (Skipped for the synthesize-in-lock case: a freshly-derived slot
+            # email never matches an existing account.)
+            if not synthesize_in_lock and slot is None and self._account_exists(email, org_uuid):
                 seq = self._get_sequence_data()
                 account_num = self._find_account_slot(seq, email, org_uuid)
                 if account_num is None:
@@ -1247,6 +1372,11 @@ class ClaudeAccountSwitcher:
                 return account_num
 
             account_num = str(slot) if slot is not None else str(self._get_next_account_number())
+            # Synthesize the placeholder email + config now that the slot is
+            # pinned under the lock.
+            if synthesize_in_lock:
+                email = f"signed-in-{account_num}@token.local"
+                config = _build_config(email)
             self._write_account_credentials(account_num, email, credentials)
             self._write_account_config(account_num, email, config)
 
@@ -1341,7 +1471,7 @@ class ClaudeAccountSwitcher:
         # concurrent switch/menu-bar auto-switch can't interleave a lost-update
         # write (the confirmation prompt above ran outside the lock). Re-read
         # inside the lock so the deletion validates against current state.
-        with FileLock(self.lock_file):
+        with self._sequence_lock():
             data = self._get_sequence_data()
             if not data or account_num not in data.get("accounts", {}):
                 # Removed by a concurrent mutation between the prompt and the
@@ -1460,7 +1590,7 @@ class ClaudeAccountSwitcher:
 
         def persist_active(num: str, acct_email: str, new_creds: str) -> None:
             nonlocal persist_skipped
-            with FileLock(self.lock_file):
+            with self._sequence_lock():
                 live = self._read_credentials() or ""
                 live_oauth = oauth.extract_oauth_data(live) if live else None
                 live_refresh = live_oauth.get("refreshToken") if live_oauth else None
@@ -1560,7 +1690,7 @@ class ClaudeAccountSwitcher:
                 return self._fetch_active_usage(str(num), email, creds)
 
             def persist(acct_num: str, acct_email: str, new_creds: str) -> None:
-                with FileLock(self.lock_file):
+                with self._sequence_lock():
                     self._write_account_credentials(acct_num, acct_email, new_creds)
 
             has_live_session = bool(self._live_session_pids(str(num), email))
@@ -1823,7 +1953,7 @@ class ClaudeAccountSwitcher:
         # Serialize the cache read-merge-write under the lock so a concurrent
         # writer (e.g. _collect_usage / another active-usage fetch) can't clobber
         # this slot's entry. Re-read inside the lock so we merge onto the latest.
-        with FileLock(self.lock_file):
+        with self._sequence_lock():
             latest = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
             existing = latest if (latest is not MISSING and isinstance(latest, dict)) else {}
             existing[account_num] = usage
@@ -2441,7 +2571,7 @@ class ClaudeAccountSwitcher:
                 else:
                     warnings_out.append(msg)
 
-        with FileLock(self.lock_file):
+        with self._sequence_lock():
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None

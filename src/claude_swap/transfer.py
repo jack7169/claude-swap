@@ -21,7 +21,6 @@ from claude_swap.exceptions import (
     CredentialReadError,
     TransferError,
 )
-from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp
 
 if TYPE_CHECKING:
@@ -397,7 +396,7 @@ def import_accounts(
     # sequence.json updates, so a concurrent switch or the menu-bar refresh
     # cannot interleave a write between our read-modify-write of sequence.json
     # and silently drop a just-imported account (lost-update race).
-    with FileLock(switcher.lock_file):
+    with switcher._sequence_lock():
         for entry in normalized:
             is_envelope_active = (
                 envelope_active_str is not None
