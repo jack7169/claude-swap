@@ -167,7 +167,6 @@ def _do_refresh(stdscr, switcher: ClaudeAccountSwitcher) -> None:
             is_error=True,
         )
         return
-    email, _org = identity
     _shell_out(stdscr, lambda: switcher.add_account(slot=None))
 
 

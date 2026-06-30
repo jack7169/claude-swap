@@ -160,6 +160,24 @@ class ClaudeAccountSwitcher:
         # ``FileLock`` is non-reentrant, so we track a per-thread held-depth and
         # only touch the underlying ``FileLock`` on the outermost entry.
         self._lock_state = threading.local()
+        # Per-instance memo for the one-time org-fields migration scan (F81).
+        # ``_get_sequence_data_migrated`` is on the status/list/switch/remove hot
+        # path and re-scanned EVERY account for a missing ``organizationUuid`` on
+        # every call. Once the migration has run (or been determined unnecessary)
+        # for this switcher, the scan is skipped: every in-process mutator
+        # (add_account, add_account_from_token/oauth, transfer.import_accounts)
+        # writes ``organizationUuid``, so the flag stays valid for the instance.
+        # It is NOT persisted, so a fresh process re-evaluates a restored
+        # old-format sequence.json (the "still triggers migration" property).
+        self._org_fields_migrated = False
+        # Per-switch backup read-dedup cache (F78/F79). ``None`` outside a switch's
+        # candidate-selection phase: reads pass straight through to the store. When
+        # set (via ``_dedup_backup_reads``) the usage-aware switch strategies read
+        # each account's backup creds/config at most once instead of re-reading them
+        # in both the switchability check and the usage computation. Scoped to the
+        # read-only selection phase only — never active across ``_perform_switch``,
+        # which captures fresh live state and writes.
+        self._backup_read_cache: dict[tuple[str, str, str], str] | None = None
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
         # Optional swap notifier (cli.main wires this on macOS). Invoked from the
@@ -400,6 +418,12 @@ class ClaudeAccountSwitcher:
             self._invalidate_session_credentials(account_num, email)
 
     def _read_account_credentials(self, account_num: str, email: str) -> str:
+        cache = self._backup_read_cache
+        if cache is not None:
+            key = ("creds", str(account_num), email)
+            if key not in cache:
+                cache[key] = self._store._read_account_credentials(account_num, email)
+            return cache[key]
         return self._store._read_account_credentials(account_num, email)
 
     def _write_account_credentials(
@@ -412,6 +436,7 @@ class ClaudeAccountSwitcher:
         once and only after a successful write.
         """
         self._store._write_account_credentials(account_num, email, credentials)
+        self._invalidate_backup_read_cache("creds", account_num, email)
         self._post_backup_write(account_num, email)
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
@@ -486,6 +511,15 @@ class ClaudeAccountSwitcher:
 
     def _read_account_config(self, account_num: str, email: str) -> str:
         """Read account config from backup."""
+        cache = self._backup_read_cache
+        if cache is not None:
+            key = ("config", str(account_num), email)
+            if key not in cache:
+                cache[key] = self._read_account_config_uncached(account_num, email)
+            return cache[key]
+        return self._read_account_config_uncached(account_num, email)
+
+    def _read_account_config_uncached(self, account_num: str, email: str) -> str:
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         if config_file.exists():
             return config_file.read_text(encoding="utf-8")
@@ -515,6 +549,7 @@ class ClaudeAccountSwitcher:
         """Write account config to backup (atomically, 0600 — no readable window)."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
         self._atomic_write_text(config_file, config)
+        self._invalidate_backup_read_cache("config", account_num, email)
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
@@ -682,6 +717,46 @@ class ClaudeAccountSwitcher:
                     # releases only after we've dropped to depth 0.
                     self._lock_state.depth = 0
 
+    @contextmanager
+    def _dedup_backup_reads(self):
+        """Read each account's backup creds/config at most once in this scope (F78/F79).
+
+        The usage-aware switch strategies otherwise re-read every account's backup
+        twice per switch: ``next-available`` re-reads creds/config in the candidate
+        loop after ``_usage_by_account`` already read them, and ``best``
+        (``_select_best_switchable``) reads all backups once to build the ``others``
+        list and again inside ``_usage_by_account``. While this context is active,
+        ``_read_account_credentials`` / ``_read_account_config`` memoize their result
+        per ``(account, email)`` so the second read is served from memory.
+
+        The cache stays transparent: a write to a slot during the window
+        (``_write_account_credentials`` / ``_write_account_config`` — e.g. a usage
+        refresh persisting a rotated token) drops that slot's cached entry, so a
+        later read sees the fresh value exactly as the un-deduped code would. The
+        context is scoped to the READ-ONLY selection phase and never wraps
+        ``_perform_switch`` (which captures fresh live state and writes). Nestable:
+        the prior cache is restored on exit, so an outer scope's dedup is preserved.
+        """
+        prior = self._backup_read_cache
+        if prior is not None:
+            # Already inside a dedup scope (e.g. _select_best_switchable called
+            # from switch()'s scope) — reuse the existing cache.
+            yield
+            return
+        self._backup_read_cache = {}
+        try:
+            yield
+        finally:
+            self._backup_read_cache = prior
+
+    def _invalidate_backup_read_cache(
+        self, kind: str, account_num: str, email: str
+    ) -> None:
+        """Drop a slot's memoized backup read so the next read re-fetches it."""
+        cache = self._backup_read_cache
+        if cache is not None:
+            cache.pop((kind, str(account_num), email), None)
+
     def _get_sequence_data(self) -> dict | None:
         """Get sequence data."""
         return self._read_json(self.sequence_file)
@@ -710,12 +785,12 @@ class ClaudeAccountSwitcher:
         if not data:
             return None
 
-        oauth = data.get("oauthAccount", {})
-        email = oauth.get("emailAddress", "")
+        oauth_data = data.get("oauthAccount", {})
+        email = oauth_data.get("emailAddress", "")
         if not email:
             return None
 
-        organization_uuid = oauth.get("organizationUuid", "") or ""
+        organization_uuid = oauth_data.get("organizationUuid", "") or ""
         return (email, organization_uuid)
 
     @staticmethod
@@ -913,9 +988,23 @@ class ClaudeAccountSwitcher:
         )
 
     def _get_sequence_data_migrated(self) -> dict | None:
-        """Get sequence data, ensuring org-field migration has run."""
+        """Get sequence data, ensuring org-field migration has run.
+
+        The org-fields scan is memoized per instance (F81): once it has run for
+        this switcher — confirming every account carries ``organizationUuid``,
+        whether already present or freshly backfilled — subsequent calls skip the
+        per-account scan entirely. The memo is set ONLY after the data has been
+        scanned/migrated (never speculatively), and is per-instance and unpersisted
+        so a fresh process re-evaluates a restored old-format ``sequence.json``.
+        All in-process mutators write ``organizationUuid``, so the flag stays
+        valid once set.
+        """
         data = self._get_sequence_data()
         if not data:
+            # Don't memoize on a missing/unreadable file: a later read may pick
+            # up a real (possibly old-format) sequence that still needs scanning.
+            return data
+        if self._org_fields_migrated:
             return data
         needs_migration = any(
             "organizationUuid" not in acc
@@ -924,6 +1013,7 @@ class ClaudeAccountSwitcher:
         if needs_migration:
             self._migrate_org_fields()
             data = self._get_sequence_data()  # Re-read after migration
+        self._org_fields_migrated = True
         return data
 
     def _migrate_org_fields(self) -> None:
@@ -952,10 +1042,10 @@ class ClaudeAccountSwitcher:
             try:
                 config_data = self._read_json(config_path)
                 if config_data:
-                    oauth = config_data.get("oauthAccount", {})
-                    live_email = oauth.get("emailAddress", "")
-                    live_org_uuid = oauth.get("organizationUuid", "") or ""
-                    live_org_name = oauth.get("organizationName", "") or ""
+                    oauth_data = config_data.get("oauthAccount", {})
+                    live_email = oauth_data.get("emailAddress", "")
+                    live_org_uuid = oauth_data.get("organizationUuid", "") or ""
+                    live_org_name = oauth_data.get("organizationName", "") or ""
             except Exception:
                 pass
 
@@ -985,9 +1075,9 @@ class ClaudeAccountSwitcher:
                 if config_text:
                     try:
                         config_data = json.loads(config_text)
-                        oauth = config_data.get("oauthAccount", {})
-                        account["organizationUuid"] = oauth.get("organizationUuid", "") or ""
-                        account["organizationName"] = oauth.get("organizationName", "") or ""
+                        oauth_data = config_data.get("oauthAccount", {})
+                        account["organizationUuid"] = oauth_data.get("organizationUuid", "") or ""
+                        account["organizationName"] = oauth_data.get("organizationName", "") or ""
                     except (json.JSONDecodeError, AttributeError):
                         account["organizationUuid"] = ""
                         account["organizationName"] = ""
@@ -2030,39 +2120,43 @@ class ClaudeAccountSwitcher:
         Ties (including current-vs-other) resolve in favour of staying put.
         Never raises on network failure.
         """
-        data = self._get_sequence_data() or {}
-        others = [
-            str(n) for n in data.get("sequence", [])
-            if str(n) != str(current_num) and self._account_is_switchable(str(n))
-        ]
-        if not others:
-            return None, "none"
+        # Read each account's backup creds/config once: the ``others`` switchability
+        # check and ``_usage_by_account`` below would otherwise re-read every
+        # backup (F79). Scoped to this read-only selection — never to a switch write.
+        with self._dedup_backup_reads():
+            data = self._get_sequence_data() or {}
+            others = [
+                str(n) for n in data.get("sequence", [])
+                if str(n) != str(current_num) and self._account_is_switchable(str(n))
+            ]
+            if not others:
+                return None, "none"
 
-        usage = self._usage_by_account()
-        current_headroom = oauth.account_headroom(usage.get(str(current_num)))
-        if current_headroom is None:
-            # Can't measure where the user is → can't prove any target is
-            # better. Stay rather than risk moving onto a worse account.
-            return None, "current-unavailable"
+            usage = self._usage_by_account()
+            current_headroom = oauth.account_headroom(usage.get(str(current_num)))
+            if current_headroom is None:
+                # Can't measure where the user is → can't prove any target is
+                # better. Stay rather than risk moving onto a worse account.
+                return None, "current-unavailable"
 
-        scored = [(oauth.account_headroom(usage.get(num)), num) for num in others]
-        known = [(h, num) for h, num in scored if h is not None]
-        if not known:
-            return None, "no-comparison"
+            scored = [(oauth.account_headroom(usage.get(num)), num) for num in others]
+            known = [(h, num) for h, num in scored if h is not None]
+            if not known:
+                return None, "no-comparison"
 
-        # max() keeps the first maximal element; `known` preserves rotation
-        # order, so ties resolve to the earliest slot.
-        best_headroom, best_num = max(known, key=lambda t: t[0])
-        if best_headroom > current_headroom:
-            return best_num, ""
+            # max() keeps the first maximal element; `known` preserves rotation
+            # order, so ties resolve to the earliest slot.
+            best_headroom, best_num = max(known, key=lambda t: t[0])
+            if best_headroom > current_headroom:
+                return best_num, ""
 
-        # Current is at least as good as every account we can measure. Stay —
-        # but only claim "all exhausted" when every candidate's usage is known.
-        if any(h is None for h, _ in scored):
-            return None, "incomplete-comparison"
-        if current_headroom <= 0:
-            return None, "exhausted"
-        return None, "stay"
+            # Current is at least as good as every account we can measure. Stay —
+            # but only claim "all exhausted" when every candidate's usage is known.
+            if any(h is None for h, _ in scored):
+                return None, "incomplete-comparison"
+            if current_headroom <= 0:
+                return None, "exhausted"
+            return None, "stay"
 
     def _build_list_payload(
         self,
@@ -2608,39 +2702,45 @@ class ClaudeAccountSwitcher:
             except (TypeError, ValueError):
                 current_index = 0
 
-        # Only fetch usage when needed; an empty map means the headroom check
-        # below is always None (skipped), preserving the non-usage-aware path.
-        usage = self._usage_by_account() if strategy == "next-available" else {}
-
+        # Read each account's backup creds/config once across the usage fetch and
+        # the candidate switchability checks (F78): ``next-available`` otherwise
+        # re-reads every candidate's backup in this loop after ``_usage_by_account``
+        # already read it. Scoped to this read-only selection — ``_perform_switch``
+        # below runs outside it and captures fresh live state.
         next_account: str | None = None
         skipped_exhausted: list[str] = []
-        for offset in range(1, len(sequence)):
-            candidate = str(sequence[(current_index + offset) % len(sequence)])
-            if not self._account_is_switchable(candidate):
-                if json_output:
-                    warnings.append(
-                        f"Skipped Account-{candidate} (no stored credentials/config)"
-                    )
-                else:
-                    print(
-                        f"{accent('Skipping')} Account-{candidate} "
-                        f"(no stored credentials/config, re-add with "
-                        f"cswap --add-account --slot {candidate})"
-                    )
-                continue
-            if strategy == "next-available":
-                headroom = oauth.account_headroom(usage.get(candidate))
-                if headroom is not None and headroom <= 0:
-                    skipped_exhausted.append(candidate)
+        with self._dedup_backup_reads():
+            # Only fetch usage when needed; an empty map means the headroom check
+            # below is always None (skipped), preserving the non-usage-aware path.
+            usage = self._usage_by_account() if strategy == "next-available" else {}
+
+            for offset in range(1, len(sequence)):
+                candidate = str(sequence[(current_index + offset) % len(sequence)])
+                if not self._account_is_switchable(candidate):
                     if json_output:
                         warnings.append(
-                            f"Skipped Account-{candidate} (at 5h/7d limit)"
+                            f"Skipped Account-{candidate} (no stored credentials/config)"
                         )
                     else:
-                        print(f"{accent('Skipping')} Account-{candidate} (at 5h/7d limit)")
+                        print(
+                            f"{accent('Skipping')} Account-{candidate} "
+                            f"(no stored credentials/config, re-add with "
+                            f"cswap --add-account --slot {candidate})"
+                        )
                     continue
-            next_account = candidate
-            break
+                if strategy == "next-available":
+                    headroom = oauth.account_headroom(usage.get(candidate))
+                    if headroom is not None and headroom <= 0:
+                        skipped_exhausted.append(candidate)
+                        if json_output:
+                            warnings.append(
+                                f"Skipped Account-{candidate} (at 5h/7d limit)"
+                            )
+                        else:
+                            print(f"{accent('Skipping')} Account-{candidate} (at 5h/7d limit)")
+                        continue
+                next_account = candidate
+                break
 
         # Every rotation target is at its limit. Switching onto an exhausted
         # account would not help, so stay on the current one instead.

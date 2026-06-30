@@ -152,15 +152,34 @@ def ide_short_name(ide_name: str) -> str:
 
 
 def abbreviate_path(path: str) -> str:
-    """Replace the user's home directory prefix with ~."""
+    """Replace the user's home directory prefix with ~.
+
+    Only abbreviates when ``path`` is the home directory itself or a true child
+    of it (home followed by a path separator). A sibling directory that merely
+    shares the home string as a textual prefix -- e.g. ``/Users/jones`` when
+    home is ``/Users/jo`` -- is left untouched (not mangled to ``~nes``).
+    """
     home = str(Path.home())
-    if path.startswith(home):
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
         return "~" + path[len(home):]
     return path
 
 
 def format_age(started_at_ms: int) -> str:
-    """Format a millisecond epoch timestamp as a human-readable age."""
+    """Format a millisecond epoch timestamp as a human-readable age.
+
+    Returns ``"unknown"`` when the timestamp is missing, zero, negative, or
+    otherwise unparseable, rather than rendering a nonsensical duration from a
+    bogus epoch.
+    """
+    try:
+        started_at_ms = int(started_at_ms)
+    except (TypeError, ValueError):
+        return "unknown"
+    if started_at_ms <= 0:
+        return "unknown"
     elapsed = int(time.time()) - (started_at_ms // 1000)
     if elapsed < 60:
         return "just now"
