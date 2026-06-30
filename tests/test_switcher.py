@@ -3187,7 +3187,7 @@ class TestUsageAwareSwitch:
              patch.object(s, "list_accounts"):
             s.switch(strategy="best")
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "All accounts are at their 5h/7d limit" in out
         assert "staying on Account-1" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 1  # unchanged
@@ -3304,7 +3304,7 @@ class TestUsageAwareSwitch:
              patch.object(s, "list_accounts") as mock_list:
             s.switch(strategy="next-available")
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "staying on Account-1" in out
         # No switch onto an exhausted account; stays on the current one.
         assert s._get_sequence_data()["activeAccountNumber"] == 1

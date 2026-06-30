@@ -114,8 +114,12 @@ def error(msg: str) -> None:
 
 
 def warning(msg: str) -> None:
-    """Print a warning message (yellow)."""
-    print(_style(msg, _YELLOW))
+    """Print a warning message (yellow) to stderr.
+
+    Warnings are diagnostics, not data -- routing them to stderr keeps the
+    --json machine-readable contract on stdout clean.
+    """
+    print(_style(msg, _YELLOW), file=sys.stderr)
 
 
 # --- Display helpers for process detection ---

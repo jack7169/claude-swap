@@ -280,7 +280,9 @@ Examples:
     if args.token_status and not args.list:
         parser.error("--token-status can only be used with --list")
 
-    if args.json and not (args.list or args.status or args.switch or args.switch_to):
+    if args.json and not (
+        args.list or args.status or args.switch or args.switch_to is not None
+    ):
         parser.error(
             "--json can only be used with --list, --status, --switch, or --switch-to"
         )
@@ -307,6 +309,19 @@ Examples:
 
     if args.full and args.export is None:
         parser.error("--full can only be used with --export")
+
+    # An inline ``--add-token <secret>`` puts the raw OAuth/API token in this
+    # process's argv, where any local user/process can read it (ps, /proc). Warn
+    # on stderr (never stdout, so --json stdout stays pure) and point at the safe
+    # forms. Token handling itself is unchanged: the empty-string ('' → prompt)
+    # and stdin ('-') sentinels don't expose anything, so they don't warn.
+    if args.add_token is not None and args.add_token not in ("", "-"):
+        print(
+            "WARNING: passing the token inline exposes it in this process's argv "
+            "to other local processes; prefer '--add-token -' (read from stdin) "
+            "or '--add-token' with no value (secure interactive prompt).",
+            file=sys.stderr,
+        )
 
     # Self-upgrade runs before switcher init so we don't touch config/keychain
     # just to upgrade the tool itself.

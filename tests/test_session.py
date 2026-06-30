@@ -294,7 +294,7 @@ class TestBootstrap:
         monkeypatch.setattr(session_mod, "refresh_oauth_credentials", lambda c: None)
         session_dir, _, _ = manager.setup_session("2", share=False)
         assert (session_dir / ".credentials.json").read_text() == CREDS
-        assert "Could not refresh" in capsys.readouterr().out
+        assert "Could not refresh" in capsys.readouterr().err
 
     def test_setup_token_account_skips_refresh_silently(
         self, manager, seeded_switcher, auth_status_tracks_seed, monkeypatch, capsys
@@ -703,7 +703,7 @@ class TestRun:
             manager.switcher.backup_dir, ACCOUNT_NUM, ACCOUNT_EMAIL
         )
         assert exc.value.env["CLAUDE_CONFIG_DIR"] == str(session_dir)
-        assert "overriding it for this launch" in capsys.readouterr().out
+        assert "overriding it for this launch" in capsys.readouterr().err
 
     def test_auth_override_vars_scrubbed_from_session_env(
         self,
@@ -722,7 +722,7 @@ class TestRun:
 
         # Warned, and the overrides are scrubbed from the launched env —
         # `cswap run 2` means account 2, not whatever the API key resolves to.
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "Ignoring ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN" in out
         assert "ANTHROPIC_API_KEY" not in exc.value.env
         assert "ANTHROPIC_AUTH_TOKEN" not in exc.value.env
@@ -830,7 +830,7 @@ class TestGuards:
 
         seeded_switcher._perform_switch(ACCOUNT_NUM)
 
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "live session-mode" in out
         data = seeded_switcher._get_sequence_data()
         assert data["activeAccountNumber"] == int(ACCOUNT_NUM)

@@ -649,8 +649,8 @@ class TestFetchUsageForAccount:
         assert "1" in msg
         assert "test@example.com" in msg
 
-        # Also verify the user-visible printed warning
-        output = capsys.readouterr().out
+        # Also verify the user-visible printed warning (warnings go to stderr)
+        output = capsys.readouterr().err
         assert "failed to save refreshed token" in output
         assert "cswap --add-account" in output
 

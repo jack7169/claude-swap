@@ -126,15 +126,16 @@ class TestLinePrinters:
         captured = capsys.readouterr()
         assert "\033[31m" in captured.err
 
-    def test_warning_prints_to_stdout(self, monkeypatch, capsys):
+    def test_warning_prints_to_stderr(self, monkeypatch, capsys):
         monkeypatch.setenv("NO_COLOR", "1")
         printer.warning("be careful")
         captured = capsys.readouterr()
-        assert "be careful" in captured.out
+        assert captured.out == ""
+        assert "be careful" in captured.err
 
     def test_warning_with_color(self, monkeypatch, capsys):
         monkeypatch.delenv("NO_COLOR", raising=False)
         monkeypatch.setenv("FORCE_COLOR", "1")
         printer.warning("be careful")
         captured = capsys.readouterr()
-        assert "\033[33m" in captured.out
+        assert "\033[33m" in captured.err
