@@ -233,16 +233,31 @@ def _select_from(
         rows, cols = stdscr.getmaxyx()
         _draw_header(stdscr, title, subtitle, cols)
 
-        for i, (label, _val) in enumerate(items):
-            y = 4 + i
-            if y >= rows - 2:
-                break
+        # Menu items occupy rows 4 .. rows-3 (rows-2 is reserved for an
+        # optional "... more" indicator, rows-1 for the footer). Scroll a
+        # window of ``visible_count`` items so the selection stays in view.
+        first_row = 4
+        last_row = rows - 3  # inclusive; rows-2 may hold the indicator
+        visible_count = max(1, last_row - first_row + 1)
+        total = len(items)
+
+        offset = _scroll_offset(idx, total, visible_count)
+        window = items[offset : offset + visible_count]
+        for j, (label, _val) in enumerate(window):
+            i = offset + j
+            y = first_row + j
             line = label[: cols - 6]
             if i == idx:
                 stdscr.addstr(y, 2, "> ", curses.A_BOLD)
                 stdscr.addstr(y, 4, line, curses.A_REVERSE)
             else:
                 stdscr.addstr(y, 4, line)
+
+        if total > visible_count:
+            below = max(0, total - (offset + len(window)))
+            above = offset
+            indicator = f"... more ({above} above, {below} below)"
+            stdscr.addstr(rows - 2, 2, indicator[: cols - 4], curses.A_DIM)
 
         footer = "[↑/↓] move  [Enter] select  [Esc/q] cancel"
         stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
@@ -259,6 +274,27 @@ def _select_from(
             return None
 
 
+def _scroll_offset(idx: int, total: int, visible_count: int) -> int:
+    """Pick the first-visible index so ``idx`` stays inside the window.
+
+    Keeps the selection on screen by sliding a ``visible_count``-tall window:
+    the offset is clamped so the window never starts before 0 nor extends past
+    the end of the list. When everything fits, the offset is always 0.
+    """
+    if total <= visible_count:
+        return 0
+    # Center-ish: keep the selection in view, biased so it isn't pinned to an
+    # edge unless we're near the start/end of the list.
+    offset = idx - visible_count // 2
+    offset = max(0, min(offset, total - visible_count))
+    # Defensive guarantee: selection must be within [offset, offset+count).
+    if idx < offset:
+        offset = idx
+    elif idx >= offset + visible_count:
+        offset = idx - visible_count + 1
+    return offset
+
+
 def _prompt_text(stdscr, label: str, password: bool = False) -> str | None:
     """Single-line text prompt. Returns string or ``None`` on Esc.
 
@@ -269,14 +305,22 @@ def _prompt_text(stdscr, label: str, password: bool = False) -> str | None:
         stdscr.erase()
         rows, cols = stdscr.getmaxyx()
         _draw_header(stdscr, "claude-swap", "", cols)
-        stdscr.addstr(4, 2, label)
+        # The label itself may overflow a very narrow window; clamp it so the
+        # initial draw never writes outside the window.
+        stdscr.addstr(4, 2, label[: cols - 2])
         footer = "[Enter] confirm  [Esc] cancel"
         stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
 
+        # Where the typed text begins, and the last usable column. We keep one
+        # cell of slack (``cols - 2``) so the blinking cursor can sit just past
+        # the final character without leaving the window.
+        cursor_x = min(2 + len(label), cols - 2)
+        max_col = cols - 2
+        field_width = max(1, max_col - cursor_x)
+
         buf: list[str] = []
-        cursor_x = 2 + len(label)
         while True:
-            stdscr.move(4, cursor_x + len(buf))
+            _redraw_field(stdscr, cursor_x, field_width, buf, password)
             stdscr.refresh()
             key = stdscr.getch()
             if key == 27:  # Esc
@@ -286,20 +330,48 @@ def _prompt_text(stdscr, label: str, password: bool = False) -> str | None:
             if key in (curses.KEY_BACKSPACE, 127, 8):
                 if buf:
                     buf.pop()
-                    if password:
-                        # nothing to erase visually (we never echoed)
-                        pass
-                    else:
-                        x = cursor_x + len(buf)
-                        stdscr.addstr(4, x, " ")
-                        stdscr.move(4, x)
                 continue
             if 32 <= key < 127:  # printable ASCII
                 buf.append(chr(key))
-                if not password:
-                    stdscr.addstr(4, cursor_x + len(buf) - 1, chr(key))
     finally:
         curses.curs_set(0)
+
+
+def _redraw_field(
+    stdscr,
+    cursor_x: int,
+    field_width: int,
+    buf: list[str],
+    password: bool,
+) -> None:
+    """Render the editable text field as a width-clamped, tail-scrolled view.
+
+    ``buf`` always holds the *full* typed string. We only ever draw the last
+    ``field_width`` characters (the part that fits) so the echo and the visible
+    cursor never exceed the window. Every curses call is wrapped in
+    ``try/except curses.error`` so a draw that still slips out of bounds (e.g.
+    a terminal resized to nothing) never crashes mid-entry — the keystroke is
+    already captured in ``buf`` either way.
+    """
+    n = len(buf)
+    # The visible cursor sits one cell past the last visible character, but
+    # never beyond the field. The visible window shows the tail of ``buf``.
+    visible_len = min(n, field_width)
+    visible = "".join(buf[n - visible_len:])
+    try:
+        # Clear the field first so shrinking (backspace) leaves no stale chars.
+        stdscr.addstr(4, cursor_x, " " * field_width)
+    except curses.error:
+        pass
+    if not password and visible:
+        try:
+            stdscr.addstr(4, cursor_x, visible)
+        except curses.error:
+            pass
+    try:
+        stdscr.move(4, cursor_x + visible_len)
+    except curses.error:
+        pass
 
 
 def _confirm(stdscr, prompt: str) -> bool:
@@ -318,7 +390,8 @@ def _show_message(stdscr, msg: str, is_error: bool = False) -> None:
         if 4 + i >= rows - 2:
             break
         stdscr.addstr(4 + i, 2, line[: cols - 4], attr)
-    stdscr.addstr(rows - 1, 2, "[Press any key to continue]", curses.A_DIM)
+    footer = "[Press any key to continue]"
+    stdscr.addstr(rows - 1, 2, footer[: cols - 4], curses.A_DIM)
     stdscr.refresh()
     stdscr.getch()
 
