@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Protocol
 
@@ -74,6 +75,39 @@ def approved_form(api_key: str) -> str:
     check miss and re-prompt the user to approve the key.
     """
     return api_key.strip()[-20:]
+
+
+# Windows-only retry budget for the atomic ``os.replace`` swap. On Windows the
+# rename fails with ``PermissionError`` (WinError 5/32) when the target file is
+# still held open by another process — Claude Code reads ``.credentials.json`` /
+# ``~/.claude.json`` and can briefly hold the destination open during a switch,
+# so a single ``os.replace`` would spuriously fail. A few short retries clear the
+# transient lock; POSIX renames over an open file fine and never retries.
+_WINDOWS_REPLACE_RETRIES = 5
+_WINDOWS_REPLACE_BACKOFF = 0.05  # seconds between attempts (~50ms)
+
+
+def _replace_atomic(src: str, dst: str) -> None:
+    """``os.replace(src, dst)`` with a small bounded retry on Windows only.
+
+    POSIX: a single ``os.replace`` (no behavior change) — a rename over a file
+    another process holds open succeeds, so any error is real and propagates at
+    once. Windows: retry up to ``_WINDOWS_REPLACE_RETRIES`` times with a short
+    ``time.sleep`` backoff when ``os.replace`` raises ``PermissionError`` (the
+    target is transiently locked by Claude Code), re-raising the last error if
+    every attempt fails. Caller is responsible for cleaning up ``src`` on failure.
+    """
+    if sys.platform != "win32":
+        os.replace(src, dst)
+        return
+    for attempt in range(_WINDOWS_REPLACE_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _WINDOWS_REPLACE_RETRIES - 1:
+                raise
+            time.sleep(_WINDOWS_REPLACE_BACKOFF)
 
 
 class _StoreHost(Protocol):
@@ -248,7 +282,7 @@ class CredentialStore:
             os.write(fd, json.dumps(data, indent=2).encode("utf-8"))
             os.close(fd)
             fd = -1
-            os.replace(tmp_path, str(path))
+            _replace_atomic(tmp_path, str(path))
             if sys.platform != "win32":
                 os.chmod(str(path), 0o600)
         except BaseException:
@@ -271,7 +305,7 @@ class CredentialStore:
             os.write(fd, credentials.encode("utf-8"))
             os.close(fd)
             fd = -1
-            os.replace(tmp_path, str(cred_file))
+            _replace_atomic(tmp_path, str(cred_file))
             if sys.platform != "win32":
                 os.chmod(str(cred_file), 0o600)
         except BaseException:

@@ -218,7 +218,11 @@ def run_login_flow(
     state = gen_state()
     server = make_server()
     try:
-        redirect_uri = f"http://localhost:{server.port}{CALLBACK_PATH}"
+        # Literal 127.0.0.1 (not "localhost") to match the IPv4 bind in
+        # LoopbackServer.__init__. On an IPv6-preferring host "localhost" can
+        # resolve to ::1, where nothing is listening, and the sign-in silently
+        # times out. Claude's OAuth allows loopback redirect hosts.
+        redirect_uri = f"http://127.0.0.1:{server.port}{CALLBACK_PATH}"
         url = build_authorize_url(
             redirect_uri=redirect_uri, state=state, code_challenge=challenge
         )

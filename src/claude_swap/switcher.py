@@ -183,7 +183,16 @@ class ClaudeAccountSwitcher:
         run_migrations(self)
 
     def _is_running_in_container(self) -> bool:
-        """Check if running inside a container."""
+        """Check if running inside a container.
+
+        Reached on every non-Windows platform. The Docker/cgroup markers below
+        are Linux-container artifacts: ``/.dockerenv`` and the ``/proc`` files
+        don't exist on macOS, so ``Path.exists()`` is ``False`` there and the
+        probe degrades cleanly to ``False`` — it never misfires off Linux. The
+        ``/proc`` reads are still guarded against ``OSError`` (not just
+        ``PermissionError``) so a path that claims to exist but can't be read on
+        a non-Linux kernel can't raise out of here.
+        """
         # Check environment variables (works on all platforms)
         if os.environ.get("CONTAINER") or os.environ.get("container"):
             return True
@@ -192,11 +201,11 @@ class ClaudeAccountSwitcher:
         if self.platform == Platform.WINDOWS:
             return False
 
-        # Check for Docker environment file (Linux/macOS)
+        # Check for Docker environment file (Linux containers; absent on macOS)
         if Path("/.dockerenv").exists():
             return True
 
-        # Check cgroup for container indicators (Linux)
+        # Check cgroup for container indicators (Linux; /proc absent on macOS)
         cgroup_path = Path("/proc/1/cgroup")
         if cgroup_path.exists():
             try:
@@ -206,17 +215,17 @@ class ClaudeAccountSwitcher:
                     for x in ["docker", "lxc", "containerd", "kubepods"]
                 ):
                     return True
-            except PermissionError:
+            except OSError:
                 pass
 
-        # Check mount info (Linux)
+        # Check mount info (Linux; /proc absent on macOS)
         mountinfo_path = Path("/proc/self/mountinfo")
         if mountinfo_path.exists():
             try:
                 content = mountinfo_path.read_text()
                 if any(x in content for x in ["docker", "overlay"]):
                     return True
-            except PermissionError:
+            except OSError:
                 pass
 
         return False

@@ -110,8 +110,15 @@ def get_process_start_time(pid: int) -> float | None:
             capture_output=True,
             text=True,
             check=False,
+            # Force a stable C locale so lstart's weekday/month names are always
+            # English and the strptime parse below works regardless of the
+            # caller's LC_TIME; without this a non-English locale silently
+            # disables PID-reuse detection.
+            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            # Bound a wedged ps so this hot path can't hang.
+            timeout=2,
         )
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         logger.debug("Could not read start time for pid %s: %s", pid, exc)
         return None
     raw = proc.stdout.strip()

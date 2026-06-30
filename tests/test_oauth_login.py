@@ -194,11 +194,11 @@ def test_run_login_flow_happy_path_wires_state_and_returns_credentials():
     # browser opened to an authorize URL carrying our state + challenge + the loopback redirect
     assert "state=STATE123" in opened["url"]
     assert "code_challenge=CHALLENGE" in opened["url"]
-    assert "redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback" in opened["url"]
+    assert "redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Fcallback" in opened["url"]
     # exchange got the captured code + verifier + matching redirect/state
     assert captured["code"] == "AUTHCODE"
     assert captured["verifier"] == "VERIFIER"
-    assert captured["redirect_uri"] == "http://localhost:54321/callback"
+    assert captured["redirect_uri"] == "http://127.0.0.1:54321/callback"
     assert captured["state"] == "STATE123"
     # tokens flowed into credentials; server torn down
     assert json.loads(result.credentials)["claudeAiOauth"]["accessToken"] == "sk-at"

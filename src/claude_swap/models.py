@@ -15,6 +15,30 @@ if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
 
 
+def _is_wsl_kernel() -> bool:
+    """Return True if the running Linux kernel identifies as WSL.
+
+    Under WSL, the kernel reports a "microsoft"/"WSL" marker in both
+    /proc/sys/kernel/osrelease and /proc/version. This is the standard robust
+    WSL signal and works even when WSL_DISTRO_NAME is unset. Any read error
+    (missing or unreadable /proc on a non-WSL or unusual system) is treated as
+    "not WSL" so detection degrades to plain Linux rather than crashing.
+
+    Callers must only invoke this on the Linux branch; it performs Linux-only
+    /proc reads.
+    """
+    for proc_path in ("/proc/sys/kernel/osrelease", "/proc/version"):
+        try:
+            with open(proc_path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+        except OSError:
+            continue
+        lowered = content.lower()
+        if "microsoft" in lowered or "wsl" in lowered:
+            return True
+    return False
+
+
 class Platform(Enum):
     """Supported platforms."""
 
@@ -37,7 +61,10 @@ class Platform(Enum):
         elif sys.platform == "win32":
             return cls.WINDOWS
         elif sys.platform.startswith("linux"):
-            if os.environ.get("WSL_DISTRO_NAME"):
+            # WSL_DISTRO_NAME is the cheapest signal, but it is frequently
+            # unset (non-login shells, services, some terminals), so fall back
+            # to the kernel-identity probe before concluding plain Linux.
+            if os.environ.get("WSL_DISTRO_NAME") or _is_wsl_kernel():
                 return cls.WSL
             return cls.LINUX
         return cls.UNKNOWN
