@@ -148,7 +148,12 @@ def credentials_from_token_response(data: dict, *, now_ms: int) -> tuple[str, "I
     account = data.get("account") or {}
     organization = data.get("organization") or {}
     expires_in = data.get("expires_in")
-    expires_at = now_ms + int(expires_in) * 1000 if expires_in is not None else None
+    # A malformed (non-numeric) expires_in must not fail an otherwise-valid login:
+    # degrade to expires_at=None (token still usable; expiry unknown).
+    try:
+        expires_at = now_ms + int(expires_in) * 1000 if expires_in is not None else None
+    except (TypeError, ValueError):
+        expires_at = None
     oauth = {
         "accessToken": data.get("access_token"),
         "refreshToken": data.get("refresh_token"),

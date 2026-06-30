@@ -1757,7 +1757,12 @@ class ClaudeAccountSwitcher:
                     executor.map(fetch, to_fetch),
                 ))
 
-        # Merge: a fresh usage dict wins; otherwise retain the prior good dict;
+        # Merge: a fresh usage dict wins; a DEFINITIVE failure this round
+        # (USAGE_TOKEN_EXPIRED / USAGE_NO_CREDENTIALS — the credential just
+        # failed) overrides any stale cached dict so account_headroom resolves
+        # to None ("unknown" → never auto-selected by best/next-available);
+        # TRANSIENT/ambiguous results (a bare None network blip, or
+        # USAGE_RATE_LIMITED) retain the prior good dict for display resilience;
         # otherwise store the sentinel/None. Accounts not fetched this round take
         # their prior cached value.
         rate_limited = False
@@ -1768,6 +1773,10 @@ class ClaudeAccountSwitcher:
                 if val == USAGE_RATE_LIMITED:
                     rate_limited = True
                 if isinstance(val, dict):
+                    result_map[k] = val
+                elif val in (USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS):
+                    # Definitive failure: do NOT mask it with a stale dict —
+                    # the decision path must see "unknown", not fake headroom.
                     result_map[k] = val
                 elif isinstance(prior.get(k), dict):
                     result_map[k] = prior[k]
@@ -2378,11 +2387,14 @@ class ClaudeAccountSwitcher:
         # live state into a fresh backup before swapping, so the active
         # slot's stored backup may be stale or absent without blocking us.
         #
-        # Usage-aware rotation anchors on the live account (current_num) so it
-        # never lands a no-op on the slot you're already on when the live login
-        # has drifted from the recorded activeAccountNumber. Plain rotation keeps
-        # anchoring on active_account for byte-for-byte unchanged behavior.
-        anchor = current_num if strategy == "next-available" else active_account
+        # Rotation anchors on the LIVE account (current_num) so it rotates from
+        # the slot the user is actually on, never from a stale recorded
+        # activeAccountNumber that has drifted (e.g. the user switched via
+        # another mechanism). current_num already falls back to the recorded
+        # active_account when the live login can't be matched to a managed slot,
+        # and the except below falls back again if that anchor isn't in the
+        # sequence — so the common (in-agreement) case is unchanged.
+        anchor = current_num
         try:
             current_index = sequence.index(int(anchor))
         except (TypeError, ValueError):

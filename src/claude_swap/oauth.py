@@ -78,9 +78,19 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
         with urllib.request.urlopen(req, timeout=10) as resp:
             resp_data = json.loads(resp.read().decode())
 
+        # A 200 response missing access_token/expires_in must not half-update the
+        # local oauth dict — validate BEFORE mutating, then bail with None.
+        new_access = resp_data.get("access_token")
+        new_expires_in = resp_data.get("expires_in")
+        if not new_access or not isinstance(new_expires_in, (int, float)):
+            _logger.debug(
+                "OAuth refresh got a 200 with missing access_token/expires_in"
+            )
+            return None
+
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-        oauth["accessToken"] = resp_data["access_token"]
-        oauth["expiresAt"] = now_ms + resp_data["expires_in"] * 1000
+        oauth["accessToken"] = new_access
+        oauth["expiresAt"] = now_ms + int(new_expires_in) * 1000
         if resp_data.get("refresh_token"):
             oauth["refreshToken"] = resp_data["refresh_token"]
         if resp_data.get("scope"):
@@ -111,15 +121,25 @@ def build_token_status(credentials: str) -> str | None:
     if not isinstance(expires_at, (int, float)):
         return f"oauth: unknown expiry, refresh token {refresh_str}"
 
-    expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
-    state = "expired" if is_oauth_token_expired(expires_at) else "fresh"
-    countdown, clock = format_reset(expires_utc.isoformat())
+    try:
+        expires_utc = datetime.fromtimestamp(expires_at / 1000, tz=timezone.utc)
+        state = "expired" if is_oauth_token_expired(expires_at) else "fresh"
+        countdown, clock = format_reset(expires_utc.isoformat())
+    except (OverflowError, ValueError, OSError):
+        # An out-of-range expiresAt (fromtimestamp can raise OverflowError/OSError/
+        # ValueError) must not crash the token-status listing.
+        return f"oauth: unknown expiry, refresh token {refresh_str}"
     return f"oauth: {state}, refresh token {refresh_str}, expires {clock} in {countdown}"
 
 
 def format_reset(resets_at: str) -> tuple[str, str]:
     """Return (countdown, clock) for a reset time in local time."""
     reset_utc = datetime.fromisoformat(resets_at)
+    # A naive ISO string (no tzinfo) would raise TypeError when subtracted from
+    # the tz-aware ``now`` below, propagating out and voiding the whole account's
+    # usage. Treat a naive timestamp as UTC.
+    if reset_utc.tzinfo is None:
+        reset_utc = reset_utc.replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)
     remaining = reset_utc - now
     total_seconds = max(0, int(remaining.total_seconds()))
@@ -166,7 +186,9 @@ def build_usage_result(data: dict) -> dict | None:
     result = {}
 
     h5 = data.get("five_hour")
-    if h5:
+    # Skip a window whose utilization is missing rather than KeyErroring and
+    # voiding the whole account's usage (mirrors the nullable-spend handling).
+    if h5 and h5.get("utilization") is not None:
         h5_entry = {"pct": h5["utilization"]}
         if h5.get("resets_at"):
             h5_entry["resets_at"] = h5["resets_at"]
@@ -174,7 +196,7 @@ def build_usage_result(data: dict) -> dict | None:
         result["five_hour"] = h5_entry
 
     d7 = data.get("seven_day")
-    if d7:
+    if d7 and d7.get("utilization") is not None:
         d7_entry = {"pct": d7["utilization"]}
         if d7.get("resets_at"):
             d7_entry["resets_at"] = d7["resets_at"]
