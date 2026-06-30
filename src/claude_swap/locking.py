@@ -37,8 +37,30 @@ class FileLock:
         """
         if timeout is None:
             timeout = self.timeout
+        # If we already hold the lock on this instance, don't reopen — that
+        # would leak the prior handle and (on POSIX, where the lock is tied to
+        # the open file description) drop the lock we already hold.
+        if self._locked:
+            return True
+        # A stale handle from a previous failed/partial acquire would also leak
+        # if we blindly reopened; close it first.
+        if self._lock_file is not None:
+            try:
+                self._lock_file.close()
+            except OSError:
+                pass
+            self._lock_file = None
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_file = open(self.lock_path, "w")
+        # Open without truncating so a pre-existing file keeps its content
+        # ("a+" creates the file if missing). On Windows msvcrt.locking locks a
+        # 1-byte region, so ensure at least one byte exists.
+        self._lock_file = open(self.lock_path, "a+")
+        if sys.platform == "win32":
+            self._lock_file.seek(0, 2)
+            if self._lock_file.tell() == 0:
+                self._lock_file.write("\0")
+                self._lock_file.flush()
+            self._lock_file.seek(0)
 
         start = time.monotonic()
         while True:
@@ -61,18 +83,24 @@ class FileLock:
     def release(self) -> None:
         """Release the lock."""
         if self._lock_file and self._locked:
-            if sys.platform == "win32":
-                # Windows: unlock using msvcrt
-                try:
+            try:
+                if sys.platform == "win32":
+                    # Windows: unlock using msvcrt
                     msvcrt.locking(self._lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    # POSIX: unlock using fcntl
+                    fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass  # File may already be unlocked; still clean up below.
+            finally:
+                # Always close the fd and reset state, even if the unlock
+                # syscall raised, so we never leak the handle or get stuck.
+                try:
+                    self._lock_file.close()
                 except OSError:
-                    pass  # File may already be unlocked
-            else:
-                # POSIX: unlock using fcntl
-                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
-            self._lock_file.close()
-            self._lock_file = None
-            self._locked = False
+                    pass
+                self._lock_file = None
+                self._locked = False
 
     def __enter__(self) -> FileLock:
         if not self.acquire():

@@ -693,6 +693,61 @@ def uninstall_startup() -> bool:
     return existed
 
 
+class _RefreshGuard:
+    """Thread-safe in-flight guard for the menu bar's background refresh.
+
+    Import-safe (no rumps) so the cross-thread synchronization can be unit
+    tested in isolation. Two responsibilities, both backed by one lock:
+
+    * ``try_begin`` / ``finish`` — a compare-and-set admission control so at
+      most one worker runs at a time. The check ("is a worker already in
+      flight?") and the flip (mark one in flight) happen atomically under the
+      lock, so a burst of concurrent ``refresh_async`` calls can't each pass
+      the check and spawn a duplicate worker. ``finish`` clears the flag (idle
+      when there's nothing in flight is a safe no-op).
+    * ``run_exclusive`` — a serialized critical section used to confine the
+      keychain-capability-cache mutation. ``recheck_keychain`` rebinds the
+      switcher's shared cache and the snapshot's keychain reads re-learn it;
+      running that under this lock keeps the mutation single-threaded so a
+      concurrent reader can't observe a torn state. It uses a *separate* lock
+      from the admission flag (so it is independent of the in-flight slot and
+      can never deadlock against ``finish``/``try_begin``).
+    """
+
+    def __init__(self) -> None:
+        self._flag_lock = threading.Lock()
+        self._cap_lock = threading.Lock()
+        self._in_flight = False
+
+    @property
+    def in_flight(self) -> bool:
+        with self._flag_lock:
+            return self._in_flight
+
+    def try_begin(self) -> bool:
+        """Atomically claim the single worker slot.
+
+        Returns True if the caller won the right to start a worker (no worker
+        was in flight), False if one is already running. The check-and-flip is
+        done under the lock so concurrent callers serialize and exactly one
+        wins.
+        """
+        with self._flag_lock:
+            if self._in_flight:
+                return False
+            self._in_flight = True
+            return True
+
+    def finish(self) -> None:
+        """Release the worker slot. Safe to call when already idle."""
+        with self._flag_lock:
+            self._in_flight = False
+
+    def run_exclusive(self):
+        """Context manager serializing its body against other callers."""
+        return self._cap_lock
+
+
 def _guard_against_terminal_suspend() -> None:
     """Ignore SIGTSTP so Ctrl+Z in a controlling terminal can't suspend the app.
 
@@ -739,7 +794,10 @@ def run(switcher) -> int:
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
             self._last_full_fetch = 0.0
-            self._refreshing = False
+            # Thread-safe in-flight guard: the compare-and-set that admits at
+            # most one worker, plus the lock that confines the keychain-
+            # capability-cache mutation to one thread at a time.
+            self._refresh_guard = _RefreshGuard()
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
             self.rebuild_menu()
@@ -753,16 +811,20 @@ def run(switcher) -> int:
 
         # ---- refresh plumbing -------------------------------------------------
         def refresh_async(self, full=False):
-            if self._refreshing:
-                return  # in-flight guard: one worker at a time
-            self._refreshing = True
+            # Compare-and-set under a lock: at most one worker runs at a time.
+            # Done atomically so a burst of concurrent callers (refresh timer,
+            # sync tick, manual "Refresh now") can't each pass the check and
+            # spawn a duplicate worker.
+            if not self._refresh_guard.try_begin():
+                return
             threading.Thread(target=self._worker, args=(full,), daemon=True).start()
 
         def _worker(self, full):
-            # Lock-free handoff: worker only rebinds plain attributes (atomic in
-            # CPython); the main-thread sync tick reads them. Worst case is acting
-            # one tick late on a slightly stale snapshot, which the staleness gate
-            # in _auto_tick already guards against.
+            # Handoff: the worker rebinds plain attributes (atomic in CPython);
+            # the main-thread sync tick reads them. Worst case is acting one tick
+            # late on a slightly stale snapshot, which the staleness gate in
+            # _auto_tick already guards against. At most one worker runs at a
+            # time (see refresh_async), so these rebinds have no competing writer.
             try:
                 now = time.time()
                 if now - self._last_full_fetch >= _FULL_REFRESH_EVERY:
@@ -772,15 +834,22 @@ def run(switcher) -> int:
                 # the process; with no plaintext fallback that freezes the active
                 # account's usage. Treating each refresh as its own invocation
                 # lets a transient failure self-heal on the next tick.
-                self.switcher.recheck_keychain()
-                snap = _snapshot(self.switcher, full=full)
+                #
+                # recheck_keychain() rebinds the switcher's shared capability
+                # cache and the snapshot's keychain reads re-learn it. Confine
+                # that mutation under the guard's exclusive lock so a concurrent
+                # main-thread read (e.g. _detect_active_change) can't observe a
+                # torn state.
+                with self._refresh_guard.run_exclusive():
+                    self.switcher.recheck_keychain()
+                    snap = _snapshot(self.switcher, full=full)
                 self.snapshot = snap
                 self._snapshot_at = time.time()
                 if full:
                     self._last_full_fetch = self._snapshot_at
                 self._dirty = True  # picked up by on_sync_tick on the main thread
             finally:
-                self._refreshing = False
+                self._refresh_guard.finish()
 
         def on_refresh_tick(self, _timer):
             self.refresh_async()
@@ -801,7 +870,7 @@ def run(switcher) -> int:
             # stat) so a large config isn't parsed each second, and only kick a
             # refresh when the active email actually changed (Claude Code rewrites
             # this file often for unrelated reasons).
-            if self._refreshing:
+            if self._refresh_guard.in_flight:
                 return  # a worker is already in-flight; it refreshes the marker
             try:
                 mtime = self._config_path.stat().st_mtime
@@ -823,7 +892,7 @@ def run(switcher) -> int:
             # If the snapshot is staler than the cadence (always true in mode B
             # with a sub-refresh interval; possible in either mode), fetch fresh
             # and evaluate on a later tick so we never act on stale usage.
-            if now - self._snapshot_at > cadence and not self._refreshing:
+            if now - self._snapshot_at > cadence and not self._refresh_guard.in_flight:
                 # consume-first forces a full fetch here; between these it may rank
                 # backups up to _FULL_REFRESH_EVERY old — fine, since it ranks by
                 # weekly reset time (days-scale), not by minute-to-minute usage.

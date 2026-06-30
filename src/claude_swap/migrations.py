@@ -32,7 +32,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from claude_swap import macos_keychain
-from claude_swap.exceptions import MigrationIncomplete
+from claude_swap.exceptions import LockError, MigrationIncomplete
+from claude_swap.locking import FileLock
 from claude_swap.models import Platform, get_timestamp
 from claude_swap.switcher import KEYRING_SERVICE, SECURITY_SERVICE
 
@@ -511,26 +512,49 @@ def run_migrations(switcher: "ClaudeAccountSwitcher") -> None:
     lazy-dir invariant) and once the state file records every migration. A
     failing migration is logged and left unmarked so it retries next run; it
     must never abort switcher construction.
+
+    Migrations read-modify-write credential backends, so the pass runs under the
+    cross-process ``FileLock`` — two concurrent first-run processes would
+    otherwise race. The lock is only taken when there is pending work (the
+    backup dir exists and at least one migration is unapplied), and a failure to
+    acquire it is logged and swallowed: this is invoked from
+    ``ClaudeAccountSwitcher.__init__`` and must never break construction.
     """
     if not switcher.backup_dir.exists():
         return
 
     applied = _load_applied(switcher)
-    for migration_id, fn in MIGRATIONS:
-        if migration_id in applied:
-            continue
-        try:
-            completed = fn(switcher)
-        except Exception as e:  # noqa: BLE001 - migrations must never brick the tool
-            switcher._logger.warning(
-                f"Migration {migration_id} did not complete (will retry): {e}"
-            )
-            continue
-        if completed:
-            try:
-                _mark_applied(switcher, migration_id)
-            except Exception as e:  # noqa: BLE001
-                switcher._logger.warning(
-                    f"Migration {migration_id} ran but recording it failed "
-                    f"(will re-run next time): {e}"
-                )
+    pending = [(mid, fn) for mid, fn in MIGRATIONS if mid not in applied]
+    if not pending:
+        return  # nothing to do — don't even take the lock
+
+    try:
+        lock = FileLock(switcher.lock_file)
+        with lock:
+            # Re-check inside the lock: another process may have applied the
+            # pending migrations while we waited for the lock.
+            applied = _load_applied(switcher)
+            for migration_id, fn in pending:
+                if migration_id in applied:
+                    continue
+                try:
+                    completed = fn(switcher)
+                except Exception as e:  # noqa: BLE001 - migrations must never brick the tool
+                    switcher._logger.warning(
+                        f"Migration {migration_id} did not complete (will retry): {e}"
+                    )
+                    continue
+                if completed:
+                    try:
+                        _mark_applied(switcher, migration_id)
+                    except Exception as e:  # noqa: BLE001
+                        switcher._logger.warning(
+                            f"Migration {migration_id} ran but recording it failed "
+                            f"(will re-run next time): {e}"
+                        )
+    except LockError as e:
+        # Another process holds the lock (likely running migrations itself).
+        # Skip this run — the migrations are idempotent and retry next launch.
+        switcher._logger.warning(
+            f"Could not acquire lock to run migrations (will retry): {e}"
+        )
