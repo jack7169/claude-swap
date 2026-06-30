@@ -470,3 +470,74 @@ def test_plan_auto_tick_evaluates_when_full_fetch_is_fresh():
     assert menubar.plan_auto_tick(
         now=100.0, last_eval=0.0, last_full_fetch=90.0, cadence=30, in_flight=False
     ) == "evaluate"
+
+
+def test_rebuild_deferred_while_menu_open_then_runs_on_close():
+    """A rebuild requested while the menu is open is deferred (tearing down the
+    NSMenu under an open menu collapses it -> flicker) and runs on close."""
+    rebuilds = []
+
+    class _App:
+        def __init__(self):
+            self.snapshot = {
+                "accounts": [], "active_email": None, "active_usage": None,
+                "instances": [],
+            }
+            self.settings = menubar.MenuBarSettings()
+            self._dirty = False
+            self._menu_sig = None
+            self._menu_open = False
+
+        def rebuild_menu(self):
+            rebuilds.append(menubar._snapshot_signature(self.snapshot, self.settings))
+
+    app = _App()
+    app._dirty = True
+    menubar._maybe_rebuild_on_dirty(app)
+    assert len(rebuilds) == 1  # baseline render
+
+    # Visible state changes while the menu is open -> defer; keep _dirty pending.
+    app._menu_open = True
+    app.snapshot = {
+        "accounts": [(1, "a@x", True, None)], "active_email": "a@x",
+        "active_usage": None, "instances": [],
+    }
+    app._dirty = True
+    assert menubar._maybe_rebuild_on_dirty(app) is False
+    assert len(rebuilds) == 1
+    assert app._dirty is True  # still pending for the close handler
+
+    # Menu closes -> the deferred rebuild runs exactly once.
+    app._menu_open = False
+    assert menubar._maybe_rebuild_on_dirty(app) is True
+    assert len(rebuilds) == 2
+
+
+def test_unchanged_signature_consumes_dirty_even_while_open():
+    """If nothing visible changed, _dirty is consumed (no pending rebuild) even
+    while open, so closing the menu doesn't trigger a needless rebuild."""
+    rebuilds = []
+
+    class _App:
+        def __init__(self):
+            self.snapshot = {
+                "accounts": [], "active_email": None, "active_usage": None,
+                "instances": [],
+            }
+            self.settings = menubar.MenuBarSettings()
+            self._dirty = False
+            self._menu_sig = None
+            self._menu_open = False
+
+        def rebuild_menu(self):
+            rebuilds.append(1)
+
+    app = _App()
+    app._dirty = True
+    menubar._maybe_rebuild_on_dirty(app)  # baseline
+    assert len(rebuilds) == 1
+
+    app._menu_open = True
+    app._dirty = True  # dirty but snapshot/settings unchanged
+    assert menubar._maybe_rebuild_on_dirty(app) is False
+    assert app._dirty is False  # consumed; nothing pending

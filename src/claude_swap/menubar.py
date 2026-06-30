@@ -29,7 +29,7 @@ ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (15, 30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
 AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
-AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 60, 180, 300)  # 0 == with display refresh
+AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 15, 30, 60, 180, 300)  # 0 == with display refresh
 AUTO_STRATEGY_CHOICES: tuple[str, ...] = ("reactive", "consume-first")
 AUTO_HYSTERESIS = 5.0  # dead band (percent) that prevents auto-switch thrash
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
@@ -726,10 +726,17 @@ def _maybe_rebuild_on_dirty(app) -> bool:
     """
     if not app._dirty:
         return False
-    app._dirty = False
     sig = _snapshot_signature(app.snapshot, app.settings)
     if sig == getattr(app, "_menu_sig", None):
+        app._dirty = False  # nothing visible changed; consume and skip
         return False
+    # Never tear the NSMenu down underneath an open menu: removeAllItems +
+    # re-add collapses whatever the user has dropped down (including a hovered
+    # submenu), which reads as the menu flickering open/closed. Leave _dirty set
+    # so the close handler (menuDidClose:) runs the deferred rebuild.
+    if getattr(app, "_menu_open", False):
+        return False
+    app._dirty = False
     app._menu_sig = sig
     app.rebuild_menu()
     return True
@@ -1038,11 +1045,24 @@ def _guard_against_terminal_suspend() -> None:
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     import rumps  # lazy: optional dependency, imported only when launching
+    from Foundation import NSObject  # pyobjc (pulled in by rumps' Cocoa dep)
 
     _guard_against_terminal_suspend()
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     state_path = switcher.backup_dir / "menubar_state.json"
+
+    class _MenuObserver(NSObject):
+        """NSMenu delegate that tracks open/close so the sync tick can defer a
+        rebuild while the menu is dropped down (avoids the open/close flicker).
+        ``app`` is set by the owner right after ``alloc().init()``."""
+
+        def menuWillOpen_(self, _menu):
+            self.app._menu_open = True
+
+        def menuDidClose_(self, _menu):
+            self.app._menu_open = False
+            _maybe_rebuild_on_dirty(self.app)  # flush any deferred rebuild
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -1056,6 +1076,7 @@ def run(switcher) -> int:
             self._dirty = False
             self._menu_sig = None  # signature of the last rendered menu (3.3)
             self._countdown_item = None  # live "Next check:" header item, if any
+            self._menu_open = False  # set by the NSMenu delegate; gates rebuilds
             self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
@@ -1070,6 +1091,13 @@ def run(switcher) -> int:
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
             self.rebuild_menu()
+            # Observe the status-bar menu's open/close so background refreshes
+            # don't tear it down while the user has it dropped down (flicker).
+            # rumps leaves the NSMenu delegate free, and the NSMenu survives
+            # clear() (removeAllItems), so this delegate persists across rebuilds.
+            self._menu_observer = _MenuObserver.alloc().init()
+            self._menu_observer.app = self
+            self.menu._menu.setDelegate_(self._menu_observer)
             # Background refresh on the user's interval, plus a fast UI-sync tick
             # that applies snapshots produced by worker threads on the main thread.
             self.refresh_timer = rumps.Timer(self.on_refresh_tick, self.settings.refresh_interval)
@@ -1378,7 +1406,8 @@ def run(switcher) -> int:
             menu.add(cooldown_menu)
 
             check_menu = rumps.MenuItem("Auto-switch check")
-            ck_labels = {0: "With display refresh", 60: "Every 1 minute",
+            ck_labels = {0: "With display refresh", 15: "Every 15 seconds",
+                         30: "Every 30 seconds", 60: "Every 1 minute",
                          180: "Every 3 minutes", 300: "Every 5 minutes"}
             for secs in AUTO_CHECK_CHOICES:
                 ch = rumps.MenuItem(ck_labels[secs], callback=self._make_check(secs))
