@@ -1,38 +1,16 @@
 # claude-swap
 
-Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out. Works with both the Claude Code CLI and the VS Code extension.
+Multi-account switcher for Claude Code — switch between accounts without logging out. Works with the Claude Code CLI and the VS Code extension.
 
 ## Installation
 
-### Using uv (recommended)
-
 ```bash
-uv tool install claude-swap
+uv tool install claude-swap        # or: pipx install claude-swap
 ```
 
-### Using pipx
+This installs the CLI. For the macOS menu-bar app, see [Menu bar (macOS)](#menu-bar-macos) — it needs an optional extra that isn't on PyPI yet, so it installs from a clone of the repo.
 
-```bash
-pipx install claude-swap
-```
-
-### From source
-
-```bash
-git clone https://github.com/realiti4/claude-swap.git
-cd claude-swap
-uv sync
-uv run cswap --help
-```
-
-### Updating
-
-```bash
-cswap --upgrade        # uv/pipx installs on macOS/Linux: auto-detects and upgrades
-# or run your installer directly:
-uv tool upgrade claude-swap
-pipx upgrade claude-swap
-```
+Update with `cswap --upgrade` (or `uv tool upgrade claude-swap` / `pipx upgrade claude-swap`).
 
 ## Usage
 
