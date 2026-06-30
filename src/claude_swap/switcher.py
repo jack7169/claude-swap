@@ -368,6 +368,17 @@ class ClaudeAccountSwitcher:
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
         self._store._delete_account_credentials(account_num, email)
 
+    def _delete_account_config(self, account_num: str, email: str) -> None:
+        """Delete an account's config backup file (no-op if absent).
+
+        Companion to ``_delete_account_credentials`` for rollback cleanup; unlike
+        ``_delete_account_files`` it does not enforce the live-session guard or
+        touch the session profile — the caller is undoing a backup it just wrote.
+        """
+        config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
+        if config_file.exists():
+            config_file.unlink()
+
     def _delete_account_files(self, account_num: str, email: str) -> None:
         """Delete all backup files for an account (credentials + config).
 
@@ -2459,7 +2470,11 @@ class ClaudeAccountSwitcher:
                     data["activeAccountNumber"] = int(target_account)
                     data["lastUpdated"] = get_timestamp()
                     self._write_json(self.sequence_file, data)
-                except Exception:
+                except BaseException:
+                    # BaseException (not just Exception) so a Ctrl-C between the
+                    # credential write and the sequence write still restores the
+                    # snapshot rather than leaving the new creds live with the
+                    # old config/sequence.
                     if config_written and rollback_config_text is not None:
                         try:
                             config_path.write_text(
@@ -2522,6 +2537,24 @@ class ClaudeAccountSwitcher:
                 config_path=config_path,
             )
 
+            # Snapshot the current account's PRIOR backup before Step 1
+            # overwrites it with the freshly-read live state. A non-empty but
+            # wrong live read (stale Keychain value, partially-rotated token)
+            # would otherwise destroy the only good backup with no way back; the
+            # ``backup_written`` rollback step restores this snapshot (or removes
+            # the newly-written backup when none existed).
+            prior_backup_creds = self._read_account_credentials(
+                current_account, current_email
+            )
+            prior_backup_config = self._read_account_config(
+                current_account, current_email
+            )
+            transaction.prior_backup_credentials = prior_backup_creds
+            transaction.prior_backup_config = prior_backup_config
+            transaction.had_prior_backup = bool(
+                prior_backup_creds or prior_backup_config
+            )
+
             try:
                 # Step 1: Backup current account
                 self._write_account_credentials(
@@ -2530,6 +2563,7 @@ class ClaudeAccountSwitcher:
                 self._write_account_config(
                     current_account, current_email, original_config
                 )
+                transaction.record_step("backup_written")
                 self._logger.info(f"Backed up account {current_account}")
 
                 # Step 2: Retrieve target account
@@ -2562,6 +2596,11 @@ class ClaudeAccountSwitcher:
                     raise SwitchError("Invalid oauthAccount in backup")
 
                 current_config_data = self._read_json(config_path)
+                if current_config_data is None:
+                    raise ConfigError(
+                        "Live Claude config (~/.claude.json) is not valid JSON; "
+                        "cannot switch"
+                    )
                 current_config_data["oauthAccount"] = oauth_section
 
                 self._write_json(config_path, current_config_data)
@@ -2578,17 +2617,28 @@ class ClaudeAccountSwitcher:
                     f"Switched from account {current_account} to {target_account}"
                 )
 
-            except Exception as e:
+            except BaseException as e:
+                # BaseException (not just Exception) so a Ctrl-C
+                # (KeyboardInterrupt) or SystemExit between Step 3 (creds) and
+                # Step 5 still triggers the rollback — otherwise the new creds
+                # stay live while config/sequence point at the old account
+                # (identity mismatch).
                 self._logger.error(f"Switch failed: {e}, attempting rollback")
                 if transaction.completed_steps:
                     success = transaction.rollback(self)
                     if success:
                         self._logger.info("Rollback successful")
-                        raise SwitchError(
-                            f"Switch failed and was rolled back: {e}"
-                        )
                     else:
                         self._logger.error("Rollback failed!")
+                    # A KeyboardInterrupt / SystemExit must keep propagating as
+                    # itself (the user asked to abort); only wrap ordinary
+                    # Exceptions in a SwitchError so callers see the rollback
+                    # outcome.
+                    if isinstance(e, Exception):
+                        if success:
+                            raise SwitchError(
+                                f"Switch failed and was rolled back: {e}"
+                            )
                         raise SwitchError(
                             f"Switch failed and rollback also failed: {e}. "
                             f"Manual recovery may be needed."

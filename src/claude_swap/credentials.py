@@ -307,34 +307,54 @@ class CredentialStore:
         mirrors Claude Code's own ``saveApiKey``/``removeApiKey``: activating one axis
         clears the other so a stale credential can't shadow the switch.
 
-        - **OAuth** → write the OAuth credential (see ``_write_oauth_credentials``),
-          then clear any managed key (Keychain "Claude Code" + ``primaryApiKey``;
-          ``approved`` left intact, as ``removeApiKey`` does).
-        - **API key** → record ``key[-20:]`` in ``approved`` and store the key (macOS
-          Keychain "Claude Code" when usable, else ``~/.claude.json`` ``primaryApiKey``),
-          then clear the OAuth credential (Keychain item + ``.credentials.json``).
+        **Clear-the-old-axis FIRST, then write the new axis.** If we wrote the new
+        axis first and a crash/exception hit before the clear, *both* axes would be
+        live and Claude Code would silently honor the wrong one. Clearing first means
+        the worst residual mid-operation is "old account still active" (fail-safe).
+        The config-level clear is correctness-critical: it raises
+        ``CredentialWriteError`` on failure (the only Keychain DELETE stays
+        best-effort), which fails the switch loudly and triggers rollback rather than
+        leaving a dual-active window.
+
+        - **OAuth** → clear any managed key (Keychain "Claude Code" + ``primaryApiKey``;
+          ``approved`` left intact, as ``removeApiKey`` does), then write the OAuth
+          credential (see ``_write_oauth_credentials``).
+        - **API key** → clear the OAuth credential (Keychain item + ``.credentials.json``)
+          and record ``key[-20:]`` in ``approved`` + store the key (macOS Keychain
+          "Claude Code" when usable, else ``~/.claude.json`` ``primaryApiKey``).
 
         Raises:
-            CredentialWriteError: If writing credentials fails.
+            CredentialWriteError: If clearing the old axis or writing the new one fails.
         """
         if looks_like_api_key(credentials):
             self._write_managed_credentials(credentials.strip())
         else:
-            self._write_oauth_credentials(credentials)
             self._clear_managed_key()
+            self._write_oauth_credentials(credentials)
 
     def _write_managed_credentials(self, api_key: str) -> None:
-        """Activate a managed API key, then clear OAuth (mutual exclusion).
+        """Clear OAuth FIRST, then activate a managed API key (mutual exclusion).
 
-        Always records ``key[-20:]`` in ``customApiKeyResponses.approved`` (Claude
+        Clears the OAuth credential (Keychain item + ``.credentials.json``) *before*
+        committing the key, so a crash mid-operation can't leave both an OAuth
+        credential and a ``primaryApiKey`` live (Claude Code would honor the wrong
+        one). The file removal is correctness-critical — ``_clear_oauth_credential``
+        raises ``CredentialWriteError`` if it can't drop the file, failing the switch
+        loudly rather than committing the key over a still-present OAuth login.
+
+        Then always records ``key[-20:]`` in ``customApiKeyResponses.approved`` (Claude
         Code does this on every platform, even on Keychain success — otherwise it
-        re-prompts to approve the key). Stores the key in the macOS Keychain when
+        re-prompts to approve the key) and stores the key in the macOS Keychain when
         usable, else ``~/.claude.json`` ``primaryApiKey`` (matching ``saveApiKey``'s
-        keychain-then-config fallback). Finally clears the OAuth credential.
+        keychain-then-config fallback).
 
         Raises:
-            CredentialWriteError: If persisting the key fails.
+            CredentialWriteError: If clearing OAuth or persisting the key fails.
         """
+        # Mutual exclusion: drop the OAuth credential FIRST so it can't shadow the
+        # key, and so a failure here aborts before the key is committed.
+        self._clear_oauth_credential()
+
         wrote_to_keychain = False
         if self._use_keychain():
             try:
@@ -379,8 +399,6 @@ class CredentialStore:
         except Exception as e:
             raise CredentialWriteError(f"Failed to write managed API key: {e}")
 
-        # Mutual exclusion: drop the OAuth credential so it can't shadow the key.
-        self._clear_oauth_credential()
         self._last_active_credentials_backend = (
             "keychain" if wrote_to_keychain else "file"
         )
@@ -393,6 +411,17 @@ class CredentialStore:
         ``customApiKeyResponses.approved`` untouched — ``removeApiKey`` doesn't clear
         it either, and removing it would force recovering ``key[-20:]`` from the
         Keychain for no benefit. A no-op (no config rewrite) when no key is present.
+
+        The config-level ``primaryApiKey`` drop is correctness-critical: because we
+        clear the old axis *before* writing the new one, a failure here must abort the
+        switch (raise ``CredentialWriteError`` → rollback) rather than be swallowed —
+        otherwise the new OAuth credential would be written over a still-live managed
+        key, leaving both axes active. The Keychain DELETE stays best-effort: a
+        transient/locked Keychain is a tolerated degradation, and clear-first ordering
+        keeps the residual fail-safe (old account still active).
+
+        Raises:
+            CredentialWriteError: If dropping ``primaryApiKey`` from the config fails.
         """
         if self._host.platform == Platform.MACOS:
             try:
@@ -400,8 +429,11 @@ class CredentialStore:
                     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
                     macos_keychain.keychain_account_name(),
                 )
-            except Exception:
-                pass  # best-effort; a down Keychain can't be cleaned now
+            except Exception as e:
+                # best-effort; a down/locked Keychain can't be cleaned now.
+                self._host._logger.warning(
+                    f"Managed-key Keychain delete failed (left for next switch): {e}"
+                )
         cfg = self._read_global_config()
         if cfg is not None and cfg.get("primaryApiKey") is not None:
             def _drop(c: dict) -> None:
@@ -409,15 +441,24 @@ class CredentialStore:
 
             try:
                 self._update_global_config(_drop)
+            except CredentialWriteError:
+                raise
             except Exception as e:
-                self._host._logger.warning(f"Failed to clear primaryApiKey: {e}")
+                raise CredentialWriteError(f"Failed to clear primaryApiKey: {e}")
 
     def _clear_oauth_credential(self) -> None:
         """Clear the active OAuth credential — Keychain item and plaintext file.
 
-        Best-effort: a down Keychain or missing file is fine. Removing
-        ``.credentials.json`` stops Claude Code from falling back to a stale OAuth
-        login over the just-activated API key.
+        Removing ``.credentials.json`` is correctness-critical: it stops Claude Code
+        from falling back to a stale OAuth login over the just-activated API key.
+        Because the API-key arm clears OAuth *before* committing the key, a failure to
+        remove the file must abort the switch (raise ``CredentialWriteError`` →
+        rollback) rather than be swallowed — otherwise both axes would be live. The
+        Keychain DELETE stays best-effort (a down/locked Keychain is a tolerated
+        degradation; clear-first ordering keeps the residual fail-safe).
+
+        Raises:
+            CredentialWriteError: If the plaintext ``.credentials.json`` can't be removed.
         """
         self._delete_active_keychain_entry()
         cred_file = get_credentials_path()
@@ -425,7 +466,7 @@ class CredentialStore:
             if cred_file.exists():
                 cred_file.unlink()
         except OSError as e:
-            self._host._logger.warning(f"Failed to remove credentials file: {e}")
+            raise CredentialWriteError(f"Failed to remove credentials file: {e}")
 
     def _write_oauth_credentials(self, credentials: str) -> None:
         """Write Claude Code's active OAuth credentials.

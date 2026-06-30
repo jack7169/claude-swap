@@ -98,6 +98,13 @@ class SwitchTransaction:
     original_email: str
     config_path: Path
     completed_steps: list[str] = field(default_factory=list)
+    # Prior backup snapshot for the current account, captured BEFORE Step 1
+    # overwrites it with the freshly-read live state. ``had_prior_backup`` is
+    # False when no backup existed yet, in which case the ``backup_written``
+    # rollback removes the newly-written one instead of restoring an old copy.
+    prior_backup_credentials: str = ""
+    prior_backup_config: str = ""
+    had_prior_backup: bool = False
 
     def record_step(self, step: str) -> None:
         """Record a completed step."""
@@ -126,6 +133,30 @@ class SwitchTransaction:
                         data["activeAccountNumber"] = int(self.original_account_num)
                         data["lastUpdated"] = get_timestamp()
                         switcher._write_json(switcher.sequence_file, data)
+                elif step == "backup_written":
+                    # Step 1 overwrote the current account's backup with the
+                    # freshly-read live state. Restore the prior backup if one
+                    # existed; otherwise remove the just-written backup so a
+                    # possibly-wrong live snapshot can't masquerade as the
+                    # current account's good backup.
+                    if self.had_prior_backup:
+                        switcher._write_account_credentials(
+                            self.original_account_num,
+                            self.original_email,
+                            self.prior_backup_credentials,
+                        )
+                        switcher._write_account_config(
+                            self.original_account_num,
+                            self.original_email,
+                            self.prior_backup_config,
+                        )
+                    else:
+                        switcher._delete_account_credentials(
+                            self.original_account_num, self.original_email
+                        )
+                        switcher._delete_account_config(
+                            self.original_account_num, self.original_email
+                        )
                 switcher._logger.info(f"Rolled back step: {step}")
             except Exception as e:
                 switcher._logger.error(f"Failed to rollback step {step}: {e}")

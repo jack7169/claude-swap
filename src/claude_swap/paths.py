@@ -115,6 +115,29 @@ def _entry_names(path: Path) -> set[str]:
         return set()
 
 
+def _relative_paths(root: Path) -> set[str]:
+    """Return every entry's path under ``root`` relative to it (POSIX form).
+
+    Walks the WHOLE tree (files *and* directories), not just the top level, so
+    callers can compare two trees that share their top-level names but differ
+    only in nested entries. Directories are included as well as files so an
+    emptied-out directory still registers as present. Returns an empty set if
+    ``root`` is missing or is not a directory; unreadable subtrees are skipped
+    rather than raising.
+    """
+    rels: set[str] = set()
+    try:
+        entries = list(root.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return rels
+    for entry in entries:
+        rels.add(entry.relative_to(root).as_posix())
+        if entry.is_dir() and not entry.is_symlink():
+            for sub in _relative_paths(entry):
+                rels.add((entry.relative_to(root) / sub).as_posix())
+    return rels
+
+
 def _target_is_completed_copy(legacy: Path, target: Path) -> bool:
     """Heuristic: did a cross-FS move already finish, leaving target complete?
 
@@ -127,17 +150,22 @@ def _target_is_completed_copy(legacy: Path, target: Path) -> bool:
 
     We only divert to "keep target, drop legacy" on *positive* evidence of that
     post-copy state: ``target`` holds meaningful data and is a strict superset
-    of ``legacy`` (it contains every top-level entry legacy still has, plus at
-    least one more — the entries ``rmtree`` had already deleted from legacy).
-    Without that superset relationship we keep the original, safe assumption
-    that ``legacy`` is the authoritative source and ``target`` is a discardable
-    partial copy.
+    of ``legacy`` across the WHOLE tree — every relative path legacy still has
+    also exists in target, plus at least one more (the entries ``rmtree`` had
+    already deleted from legacy). The comparison is recursive on purpose: an
+    interrupting kill can land while ``rmtree`` is deleting a *nested* file,
+    leaving the top-level directory names identical between legacy and target
+    even though target is the authoritative superset. A top-level-only check
+    would miss that and trigger a destructive re-move that loses the nested
+    files. Without whole-tree superset evidence we keep the original, safe
+    assumption that ``legacy`` is the authoritative source and ``target`` is a
+    discardable partial copy.
     """
     if not _target_has_meaningful_data(target):
         return False
-    target_names = _entry_names(target)
-    legacy_names = _entry_names(legacy)
-    return legacy_names < target_names
+    target_paths = _relative_paths(target)
+    legacy_paths = _relative_paths(legacy)
+    return legacy_paths < target_paths
 
 
 def _wipe_throwaway_artifacts(target: Path) -> None:
@@ -206,9 +234,10 @@ def migrate_legacy_backup_dir(target: Path) -> bool:
             #
             # Only divert when there is positive evidence the copy already
             # finished (target is a strict superset of the partially-deleted
-            # legacy): keep the complete target and remove the leftover legacy
-            # remnant. Otherwise fall back to the original, safe assumption
-            # that legacy is authoritative and target is a discardable partial.
+            # legacy across the whole tree): keep the complete target and remove
+            # the leftover legacy remnant. Otherwise fall back to the original,
+            # safe assumption that legacy is authoritative and target is a
+            # discardable partial copy from an interrupted copytree.
             if _target_is_completed_copy(legacy, target):
                 shutil.rmtree(legacy)
                 flag.unlink(missing_ok=True)
