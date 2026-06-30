@@ -1148,13 +1148,18 @@ def run(switcher) -> int:
         def _update_countdown(self):
             """Re-title the live 'next check' header line each tick.
 
-            Skipped while the menu is open: mutating any item (even a title) in
-            a menu the user has dropped down makes AppKit reflow the parent and
-            momentarily dismiss an open child submenu — the residual flicker.
-            The countdown resumes on the next tick after the menu closes.
+            Updates live even while the menu is open (the user wants to watch it
+            count down) — EXCEPT while a child submenu is showing. The countdown
+            line is on the main menu; mutating it then makes AppKit reflow the
+            parent and dismiss the open submenu (the flicker). A submenu parent
+            stays highlighted while its submenu is up, so a highlighted item with
+            a submenu means "a submenu is open" — skip this tick.
             """
             item = self._countdown_item
-            if item is None or self._menu_open or not self.settings.auto_switch_enabled:
+            if item is None or not self.settings.auto_switch_enabled:
+                return
+            highlighted = self.menu._menu.highlightedItem()
+            if highlighted is not None and highlighted.hasSubmenu():
                 return
             cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
             seconds_to_next = max(0.0, (self._last_auto_eval + cadence) - time.time())
