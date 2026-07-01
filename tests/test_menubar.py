@@ -107,8 +107,11 @@ def test_auto_switch_countdown_text_formats_mmss_and_cadence():
     assert menubar.auto_switch_countdown_text(65, 60) == "Next check: 1:05 (every 60s)"
 
 
-def test_auto_switch_countdown_text_clamps_negative_to_zero():
-    assert menubar.auto_switch_countdown_text(-5, 30) == "Next check: 0:00 (every 30s)"
+def test_auto_switch_countdown_text_shows_checking_when_due():
+    # At/under zero the check is running (or about to) and _last_auto_eval hasn't
+    # advanced yet, so show an activity indicator instead of a frozen "0:00".
+    assert menubar.auto_switch_countdown_text(0, 30) == "Checking now… (every 30s)"
+    assert menubar.auto_switch_countdown_text(-5, 30) == "Checking now… (every 30s)"
 
 
 def test_auto_switch_header_lines_enabled():
@@ -436,20 +439,30 @@ def test_plan_silent_outcomes_are_noop():
     assert menubar.plan_auto_switch(("all_session_limited", None), st, s, 1e9) == ("noop", None)
 
 
-def _cf(num, pct5, pct7, reset7, active=False):
+def _cf(num, pct5, pct7, reset5, active=False):
+    # reset5 is the 5h (session) reset — the consume-first ranking axis.
+    # Eligibility still gates on the 7d (weekly) percentage being below cutoff.
     return (num, f"a{num}@x.com", active,
-            {"five_hour": {"pct": pct5},
-             "seven_day": {"pct": pct7, "resets_at": reset7}})
+            {"five_hour": {"pct": pct5, "resets_at": reset5},
+             "seven_day": {"pct": pct7}})
 
 _R_EARLY = "2026-06-24T07:00:00+00:00"
 _R_MID = "2026-06-25T07:00:00+00:00"
 _R_LATE = "2026-06-26T07:00:00+00:00"
 
 
-def test_consume_first_picks_soonest_weekly_reset():
-    # active #1 resets late; #2 resets early -> switch to #2 (consume it first).
+def test_consume_first_picks_soonest_session_reset():
+    # active #1's session resets late; #2's resets early -> switch to #2
+    # (consume the soonest-resetting session first).
     accts = [_cf(1, 10, 20, _R_LATE, active=True), _cf(2, 10, 20, _R_EARLY)]
     assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
+
+
+def test_consume_first_session_reset_gated_on_weekly_room():
+    # #2's session resets soonest, but its weekly is over the cutoff -> excluded;
+    # stay on the active, whose weekly still has room.
+    accts = [_cf(1, 10, 20, _R_LATE, active=True), _cf(2, 10, 98, _R_EARLY)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("none", None)
 
 
 def test_consume_first_stays_when_active_is_optimal():
@@ -859,7 +872,7 @@ def test_browser_signin_refreshes_before_success_notification():
 # --- Finding 6: consume-first must not switch off an equally-optimal active ----
 
 def test_consume_first_stays_on_tie_when_active_listed_after_peer():
-    # Active account ties a peer on BOTH the 7d reset time AND worst-pct, and the
+    # Active account ties a peer on BOTH the 5h reset time AND worst-pct, and the
     # active account is listed AFTER the equally-good peer. The active account is
     # already optimal -> stay, not a pointless switch to the peer.
     accts = [_cf(1, 10, 10, _R_EARLY), _cf(2, 10, 10, _R_EARLY, active=True)]
@@ -867,7 +880,7 @@ def test_consume_first_stays_on_tie_when_active_listed_after_peer():
 
 
 # --- Finding 7: consume-first must not churn off a healthy active account whose
-# 7d reset time is missing/unparseable (API omitted resets_at). ----------------
+# 5h reset time is missing/unparseable (API omitted resets_at). ----------------
 
 def _cf_no_reset(num, pct5, pct7, active=False):
     return (num, f"a{num}@x.com", active,
@@ -875,7 +888,7 @@ def _cf_no_reset(num, pct5, pct7, active=False):
 
 
 def test_consume_first_stays_when_active_reset_missing():
-    # Active #2 has a healthy 7d pct but no resets_at; peer #1 has a parseable
+    # Active #2 has a healthy 5h pct but no resets_at; peer #1 has a parseable
     # reset. The active must not be demoted below the peer (an unknown reset is
     # "no information", not "resets last").
     accts = [_cf(1, 10, 10, _R_EARLY), _cf_no_reset(2, 10, 10, active=True)]

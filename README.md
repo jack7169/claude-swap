@@ -140,9 +140,10 @@ enable it.
 
 - **Reactive** (default) — stays put until the active account crosses the
   threshold, then switches to the account with the most headroom.
-- **Consume-first** — proactively keeps you on the account whose **weekly window
-  resets soonest** (use-it-or-lose-it), switching as resets re-order the queue.
-  It polls all accounts each tick (needed to rank them).
+- **Consume-first** — proactively moves you to the account whose **session (5h)
+  window resets soonest** (use-it-or-lose-it), among accounts whose **weekly (7d)
+  usage is still below the cutoff**. It polls all accounts each tick (needed to
+  rank them).
 
 A small hysteresis dead band prevents switching back and forth when an account
 hovers at the threshold.

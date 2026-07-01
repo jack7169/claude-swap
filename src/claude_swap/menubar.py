@@ -197,7 +197,14 @@ def _fmt_mmss(seconds: float) -> str:
 
 
 def auto_switch_countdown_text(seconds_to_next: float, cadence: int) -> str:
-    """The live 'next check' line: countdown to the next eval plus its cadence."""
+    """The live 'next check' line: countdown to the next eval plus its cadence.
+
+    Once the countdown hits zero the (background) usage check is running and the
+    next-eval time hasn't advanced yet, so show a 'Checking now…' activity hint
+    rather than a frozen ``0:00``.
+    """
+    if seconds_to_next <= 0:
+        return f"Checking now… (every {cadence}s)"
     return f"Next check: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
 
 
@@ -457,18 +464,20 @@ def decide_consume_first(
     threshold: float,
     blocked=frozenset(),
 ) -> tuple[str, int | None]:
-    """Proactive 'consume the soonest-resetting account first' strategy.
+    """Proactive 'consume the soonest-resetting session first' strategy.
 
-    Eligible accounts have 5h not blocked (hysteresis) AND 7d below the threshold;
-    the eligible account whose 7d window resets soonest (then most headroom, then
-    rotation order) is optimal. The active account wins exact ties (it is already
-    optimal — never switch to an equally-good peer), and a missing/unparseable 7d
-    reset time on the active account never demotes it below peers (an unknown reset
-    means "no information", not "resets last"). Returns ``("switch", num)``,
-    ``("none", None)`` (already optimal), ``("unknown_active", None)``,
-    ``("no_candidate", None)`` (all weekly-exhausted -> notify),
-    ``("no_candidate_unverifiable", None)``, or ``("all_session_limited", None)``
-    (weekly room but all 5h-blocked -> silent). Total — never raises.
+    Eligible accounts have 5h not blocked (hysteresis) AND 7d (weekly) below the
+    threshold; the eligible account whose 5h (session) window resets soonest (then
+    most headroom, then rotation order) is optimal. The weekly-below-cutoff gate
+    means a weekly-exhausted account is never chosen even if its session resets
+    soon. The active account wins exact ties (it is already optimal — never switch
+    to an equally-good peer), and a missing/unparseable 5h reset time on the active
+    account never demotes it below peers (an unknown reset means "no information",
+    not "resets last"). Returns ``("switch", num)``, ``("none", None)`` (already
+    optimal), ``("unknown_active", None)``, ``("no_candidate", None)`` (all
+    weekly-exhausted -> notify), ``("no_candidate_unverifiable", None)``, or
+    ``("all_session_limited", None)`` (weekly room but all 5h-blocked -> silent).
+    Total — never raises.
     """
     active = next((a for a in accounts if a[2]), None)
     if active is None:
@@ -476,10 +485,10 @@ def decide_consume_first(
     if _window_pct(active[3], "five_hour") is None or _window_pct(active[3], "seven_day") is None:
         return ("unknown_active", None)
 
-    # The active account's known 7d reset; if it's missing/unparseable we treat it
-    # as "no information" rather than the worst case, so a peer never displaces a
-    # healthy active account just because the API omitted its resets_at.
-    active_reset = _resets_at_ts(active[3].get("seven_day"))
+    # The active account's known 5h (session) reset; if it's missing/unparseable
+    # we treat it as "no information" rather than the worst case, so a peer never
+    # displaces a healthy active account just because the API omitted its resets_at.
+    active_reset = _resets_at_ts(active[3].get("five_hour"))
 
     eligible: list[tuple[float, float, int, int, bool]] = []
     any_unverifiable = False
@@ -495,7 +504,7 @@ def decide_consume_first(
             any_weekly_room = True
         limit5 = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
         if five < limit5 and seven < threshold:
-            reset = _resets_at_ts(usage.get("seven_day"))
+            reset = _resets_at_ts(usage.get("five_hour"))
             # If the active account's reset is unknown, don't let a peer's known
             # (finite) reset rank ahead of it: raise the peer's reset to the
             # active's (inf) so only headroom/rotation can distinguish them.
@@ -508,7 +517,7 @@ def decide_consume_first(
         if any_weekly_room:
             return ("all_session_limited", None)
         return ("no_candidate", None)
-    # Tie-break order: soonest 7d reset, most headroom, then the active account
+    # Tie-break order: soonest 5h reset, most headroom, then the active account
     # (not is_active == False sorts first), then rotation index. The is_active
     # term makes an equally-optimal active account always win.
     eligible.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
@@ -1035,7 +1044,12 @@ def _guard_against_terminal_suspend() -> None:
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     import rumps  # lazy: optional dependency, imported only when launching
-    from Foundation import NSObject  # pyobjc (pulled in by rumps' Cocoa dep)
+    from Foundation import (  # pyobjc (pulled in by rumps' Cocoa dep)
+        NSObject,
+        NSRunLoop,
+        NSRunLoopCommonModes,
+        NSTimer,
+    )
 
     _guard_against_terminal_suspend()
 
@@ -1043,9 +1057,16 @@ def run(switcher) -> int:
     state_path = switcher.backup_dir / "menubar_state.json"
 
     class _MenuObserver(NSObject):
-        """NSMenu delegate that tracks open/close so the sync tick can defer a
+        """NSMenu delegate + countdown timer target. ``app`` is set by the owner
+        right after ``alloc().init()``.
+
+        As a menu delegate it tracks open/close so the sync tick can defer a
         rebuild while the menu is dropped down (avoids the open/close flicker).
-        ``app`` is set by the owner right after ``alloc().init()``."""
+        As a timer target it drives the live 'next check' countdown from a timer
+        registered in the run loop's *common* modes, so it keeps firing while a
+        menu is being tracked (default-mode timers like rumps.Timer are
+        suspended during menu tracking, which is why the countdown only moved on
+        open/close)."""
 
         def menuWillOpen_(self, _menu):
             self.app._menu_open = True
@@ -1053,6 +1074,12 @@ def run(switcher) -> int:
         def menuDidClose_(self, _menu):
             self.app._menu_open = False
             _maybe_rebuild_on_dirty(self.app)  # flush any deferred rebuild
+
+        def tick_(self, _timer):
+            app = self.app
+            if app.settings.auto_switch_enabled:
+                app._auto_tick()  # run the check in common modes (works while open)
+            app._update_live_rows()
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -1066,6 +1093,7 @@ def run(switcher) -> int:
             self._dirty = False
             self._menu_sig = None  # signature of the last rendered menu (3.3)
             self._countdown_item = None  # live "Next check:" header item, if any
+            self._account_rows = []  # [(num, label_item, [detail_items])] for live updates
             self._menu_open = False  # set by the NSMenu delegate; gates rebuilds
             self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
@@ -1088,6 +1116,21 @@ def run(switcher) -> int:
             self._menu_observer = _MenuObserver.alloc().init()
             self._menu_observer.app = self
             self.menu._menu.setDelegate_(self._menu_observer)
+            # Drive the live countdown from a common-modes timer so it keeps
+            # ticking while the menu is open (the rumps sync timer runs in the
+            # default mode, which macOS suspends during menu tracking). Sample
+            # several times a second (not once) so timer jitter can't make the
+            # truncated seconds display skip a number (e.g. 0:13 -> 0:11);
+            # change-detection in _update_live_rows keeps actual redraws to ~1/s.
+            self._countdown_nstimer = (
+                NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                    0.25, self._menu_observer, "tick:", None, True
+                )
+            )
+            self._countdown_nstimer.setTolerance_(0.05)
+            NSRunLoop.currentRunLoop().addTimer_forMode_(
+                self._countdown_nstimer, NSRunLoopCommonModes
+            )
             # Background refresh on the user's interval, plus a fast UI-sync tick
             # that applies snapshots produced by worker threads on the main thread.
             self.refresh_timer = rumps.Timer(self.on_refresh_tick, self.settings.refresh_interval)
@@ -1133,37 +1176,64 @@ def run(switcher) -> int:
             )
 
         def on_refresh_tick(self, _timer):
-            self.refresh_async()
+            # Full refresh so every account's usage % (not just the active one's)
+            # is re-fetched each cycle. Heavier on the usage API than an
+            # active-only refresh, but the per-IP 429 backoff still applies.
+            self.refresh_async(full=True)
 
         def on_sync_tick(self, _timer):
             # Rebuild the menu only when the rendered-state signature changed
             # (3.3) — avoids a full NSMenu teardown every refresh when nothing
             # the user sees has changed.
             _maybe_rebuild_on_dirty(self)
-            self._update_countdown()
             self._detect_active_change()
-            if self.settings.auto_switch_enabled:
-                self._auto_tick()
+            # Live row updates AND the auto-switch evaluation run on the
+            # common-modes timer (see _MenuObserver.tick_ / __init__) so they
+            # keep working while the menu is open — the default-mode sync timer
+            # is suspended during menu tracking.
 
-        def _update_countdown(self):
-            """Re-title the live 'next check' header line each tick.
+        def _update_live_rows(self):
+            """Live, in-place refresh of all time-/usage-derived menu text.
 
-            Updates live even while the menu is open (the user wants to watch it
-            count down) — EXCEPT while a child submenu is showing. The countdown
-            line is on the main menu; mutating it then makes AppKit reflow the
-            parent and dismiss the open submenu (the flicker). A submenu parent
-            stays highlighted while its submenu is up, so a highlighted item with
-            a submenu means "a submenu is open" — skip this tick.
+            Covers the auto-switch 'next check' countdown and every account
+            row's reset countdowns + usage %, re-titling in place (no structural
+            rebuild, which would flicker). Driven by the common-modes timer so it
+            ticks while the menu is open. Account text is read from the *current*
+            snapshot, so a refresh that lands while the menu is open is reflected
+            too. Skipped while a child submenu is showing (mutating the parent
+            dismisses it); only titles that actually changed are set, to avoid
+            needless redraws.
             """
-            item = self._countdown_item
-            if item is None or not self.settings.auto_switch_enabled:
-                return
             highlighted = self.menu._menu.highlightedItem()
             if highlighted is not None and highlighted.hasSubmenu():
                 return
-            cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
-            seconds_to_next = max(0.0, (self._last_auto_eval + cadence) - time.time())
-            item.title = auto_switch_countdown_text(seconds_to_next, cadence)
+            now = time.time()
+
+            item = self._countdown_item
+            if item is not None and self.settings.auto_switch_enabled:
+                cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
+                text = auto_switch_countdown_text(
+                    max(0.0, (self._last_auto_eval + cadence) - now), cadence
+                )
+                if item.title != text:
+                    item.title = text
+
+            by_num = {
+                num: (email, usage)
+                for (num, email, _active, usage) in self.snapshot["accounts"]
+            }
+            for num, label_item, detail_items in self._account_rows:
+                cur = by_num.get(num)
+                if cur is None:
+                    continue
+                email, usage = cur
+                new_label = format_account_label(num, email, usage, now)
+                if label_item.title != new_label:
+                    label_item.title = new_label
+                for ditem, line in zip(detail_items, account_detail_lines(usage)):
+                    text = f"    {line}"
+                    if ditem.title != text:
+                        ditem.title = text
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto-switcher)
@@ -1295,6 +1365,7 @@ def run(switcher) -> int:
             self.menu.add(None)
 
             accounts = self.snapshot["accounts"]
+            self._account_rows = []
             for num, email, is_active, usage in accounts:
                 item = rumps.MenuItem(
                     format_account_label(num, email, usage),
@@ -1302,10 +1373,14 @@ def run(switcher) -> int:
                 )
                 item.state = 1 if is_active else 0
                 self.menu.add(item)  # title carries the slot number -> unique
+                detail_items = []
                 for i, line in enumerate(account_detail_lines(usage)):
-                    self.menu[f"detail-{num}-{i}"] = rumps.MenuItem(
-                        f"    {line}", callback=None
-                    )
+                    d = rumps.MenuItem(f"    {line}", callback=None)
+                    self.menu[f"detail-{num}-{i}"] = d
+                    detail_items.append(d)
+                # Keep references so the common-modes timer can refresh each
+                # row's reset countdowns + usage % in place (no rebuild).
+                self._account_rows.append((num, item, detail_items))
             if not accounts:
                 self.menu.add(rumps.MenuItem("No managed accounts", callback=None))
 
