@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# macOS .app packaging (local/personal build artifacts)
+*.app
+packaging/*.iconset/
+packaging/claude-swap.icns

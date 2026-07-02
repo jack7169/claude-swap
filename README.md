@@ -167,6 +167,22 @@ The login item is the recommended way to keep the menu bar running. Prefer it
 over leaving `cswap --menubar` running in a terminal — a terminal you later close
 or suspend shouldn't own a GUI app.
 
+### Build the macOS app (personal, local only)
+
+A self-contained `claude-swap.app` (menu bar + start-at-login) can be built for
+your own machine. It is **ad-hoc signed** (no Apple Developer account) and not
+meant for distribution.
+
+```bash
+./packaging/make-app.sh                  # builds dist/claude-swap.app (uses Python 3.12)
+mv dist/claude-swap.app /Applications/    # SMAppService needs a stable location
+open /Applications/claude-swap.app        # first launch: right-click > Open to clear Gatekeeper
+```
+
+Then use **menu bar → Start at login** to register it as a native Login Item.
+If you previously used the CLI login item, remove it: `cswap --uninstall-startup`.
+Rebuild after pulling changes by re-running `./packaging/make-app.sh`.
+
 ### Menu bar troubleshooting (macOS)
 
 - **`ModuleNotFoundError: No module named 'rumps'`** (or *"Menu bar mode requires
