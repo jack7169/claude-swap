@@ -3753,7 +3753,8 @@ from claude_swap import oauth as _oauth
 
 
 class TestCollectUsageBackoff:
-    """Rate-limit backoff, last-known-good retention, and the only= subset."""
+    """Rate-limit surfacing (no cross-round backoff), last-known-good retention,
+    and the only= subset."""
 
     def _setup(self, temp_home):
         s = ClaudeAccountSwitcher()
@@ -3775,7 +3776,7 @@ class TestCollectUsageBackoff:
             return responses[num]
         monkeypatch.setattr(_oauth, "fetch_usage_for_account", fake)
 
-    def test_429_arms_backoff_and_skips_network_next_call(self, temp_home, monkeypatch):
+    def test_429_surfaced_and_no_backoff_blocks_next_fetch(self, temp_home, monkeypatch):
         s = self._setup(temp_home)
         monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
         calls = []
@@ -3784,13 +3785,15 @@ class TestCollectUsageBackoff:
                                         "2": _oauth.RATE_LIMITED}, calls)
         first = s._collect_usage(self._info())
         assert first[0] == {"five_hour": {"pct": 10.0}}
-        assert s._rate_limited_until() > _time.time()  # backoff armed
-        # Second call within the window: NO network calls; last-known-good for #1.
+        assert first[1] == "rate limited"        # 429 SURFACED, not hidden as stale
+        # A forced re-fetch right after is NOT blocked — there is no cross-round
+        # backoff; every round fetches on the user's cadence.
         calls.clear()
-        second = s._collect_usage(self._info())
-        assert calls == []                       # network skipped
-        assert second[0] == {"five_hour": {"pct": 10.0}}   # retained
-        assert second[1] == "rate limited"       # never had a dict
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 11.0}},
+                                        "2": {"five_hour": {"pct": 3.0}}}, calls)
+        out = s._collect_usage(self._info(), only={"1", "2"}, force=True)
+        assert sorted(calls) == ["1", "2"]       # both re-fetched despite the prior 429
+        assert out[1] == {"five_hour": {"pct": 3.0}}   # account 2 recovered
 
     def test_last_known_good_retained_on_transient_failure(self, temp_home, monkeypatch):
         s = self._setup(temp_home)
@@ -3814,18 +3817,6 @@ class TestCollectUsageBackoff:
                                         "2": {"five_hour": {"pct": 2.0}}}, calls)
         s._collect_usage(self._info(), only={"1"})
         assert calls == ["1"]                    # only account 1 hit the network
-
-    def test_backoff_expired_resumes_fetching(self, temp_home, monkeypatch):
-        s = self._setup(temp_home)
-        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
-        s._set_rate_limited_until(_time.time() - 1)   # already expired
-        calls = []
-        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 5.0}},
-                                        "2": {"five_hour": {"pct": 6.0}}}, calls)
-        out = s._collect_usage(self._info(), only={"1", "2"})
-        assert sorted(calls) == ["1", "2"]       # fetched again
-        assert out[0] == {"five_hour": {"pct": 5.0}}
-
 
 class TestAddAccountFromOAuth:
     def _switcher(self, temp_home):

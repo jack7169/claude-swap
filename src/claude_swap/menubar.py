@@ -618,36 +618,23 @@ def plan_auto_tick(
     last_full_fetch: float,
     cadence: int,
     in_flight: bool,
-    backoff_active: bool = False,
 ) -> str:
     """Decide the auto-switch tick's next move: ``wait`` / ``refresh`` / ``evaluate``.
 
     The auto-switcher must decide on a *full* snapshot (every account's usage
     freshly fetched) no older than the cadence — the same data "Refresh now"
-    produces. The routine display refresh is ``full=False`` (active account only;
-    backups from cache), and it keeps the overall snapshot timestamp fresh, so
-    gating the pre-eval fetch on snapshot age let the auto path decide on stale
-    backup usage and silently no-op until a manual full+forced refresh. Gate on
-    the last *full* fetch instead; the caller forces that fetch past the 15s
-    usage cache so it always re-fetches over the network.
+    produces. Gate on the last *full* fetch: the caller refreshes past the 15s
+    usage cache so it re-fetches over the network. Because there is no rate-limit
+    backoff, every ``full`` refresh stamps ``_last_full_fetch``, so a refresh is
+    followed by an ``evaluate`` on the next tick (no busy-spin, no stall).
 
     ``refresh`` is only returned when no worker holds the slot; if one does we
     ``wait`` for it rather than evaluate on stale/partial data.
-
-    ``backoff_active`` suppresses the pre-eval refresh while the usage endpoint
-    is in its per-IP 429 backoff: such a fetch is served from cache and leaves
-    ``_last_full_fetch`` unstamped by design (see the stamp site), so without
-    this guard ``last_full_fetch`` never advances and every 4 Hz tick re-promotes
-    to ``refresh``, respawning a worker per tick (a bounded but wasteful
-    busy-spin). Waiting parks the auto path until the window lifts, at which point
-    the next tick refreshes for real, stamps, and evaluation resumes.
     """
     if now - last_eval < cadence:
         return "wait"
     if now - last_full_fetch > cadence:
-        if in_flight or backoff_active:
-            return "wait"
-        return "refresh"
+        return "wait" if in_flight else "refresh"
     return "evaluate"
 
 
@@ -1058,12 +1045,10 @@ def _worker_impl(app, full: bool, force: bool = False) -> None:
             snap = _snapshot(app.switcher, full=full, force=force)
         app.snapshot = snap
         app._snapshot_at = time.time()
-        # Stamp the full fetch only when it wasn't suppressed by the 429
-        # backoff — a backoff round is served from cache, and claiming it as
-        # fresh would let plan_auto_tick evaluate the auto-switch on frozen
-        # usage. Left unstamped, the next tick promotes to full again and
-        # retries once the backoff lifts.
-        if full and not _usage_backoff_active(app.switcher):
+        # A full pass re-fetched over the network (there is no rate-limit backoff
+        # to suppress it), so stamp it as the freshest full fetch — this is what
+        # gates the auto-switch evaluation in plan_auto_tick.
+        if full:
             app._last_full_fetch = app._snapshot_at
         # Auto timer start: keep every idle account's 5-hour window warm. Runs
         # here on the worker thread (off the Cocoa main thread) where the fresh
@@ -1112,20 +1097,6 @@ def _run_warm_from_snapshot(app, snap: dict) -> None:
         warmed_at=app._warmed_at,
         notify_fn=notify.notify,
     )
-
-
-def _usage_backoff_active(switcher) -> bool:
-    """True while the per-IP 429 backoff suppresses usage fetching.
-
-    Keeps ``_last_full_fetch`` honest: a full refresh that ran during the
-    backoff was served from cache, so the auto-switch must not treat it as
-    freshly fetched data. Never raises — test harnesses' fake switchers may
-    not implement the probe (missing probe ⇒ no backoff ⇒ stamp as before).
-    """
-    try:
-        return time.time() < switcher._rate_limited_until()
-    except Exception:
-        return False
 
 
 _ADOPT_SETTLE_SECONDS = 3.0  # min age of a sighted login before it is adopted
@@ -1737,17 +1708,17 @@ def run(switcher) -> int:
                 last_full_fetch=self._last_full_fetch,
                 cadence=cadence,
                 in_flight=self._refresh_guard.in_flight,
-                backoff_active=_usage_backoff_active(self.switcher),
             )
             if action == "wait":
                 return
             if action == "refresh":
-                # Fetch fresh usage for ALL accounts before deciding, and force
-                # past the 15s usage cache — i.e. exactly what "Refresh now" does.
-                # The routine display refresh is active-only, so without this the
-                # auto path decided on stale backups and never switched until a
-                # manual refresh. Evaluate on a later tick once the snapshot lands.
-                self.refresh_async(full=True, force=True)
+                # Refresh every account's usage before deciding, but WITHOUT
+                # force: honor the per-account TTLs (active ~15s, backups ~60s) so
+                # the pre-eval fetch is a handful of calls, not all accounts every
+                # cadence. Forcing all of them each tick is what tripped the usage
+                # endpoint's per-IP 429 in the first place. Evaluate on a later
+                # tick once the snapshot lands.
+                self.refresh_async(full=True)
                 return
             self._last_auto_eval = now
             self._maybe_auto_switch(now)

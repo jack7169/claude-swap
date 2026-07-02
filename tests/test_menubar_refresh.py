@@ -83,13 +83,9 @@ class _RefreshHarness:
             t.join(timeout=max(0.0, deadline - time.time()))
 
 
-def test_worker_skips_full_stamp_during_429_backoff(monkeypatch):
-    """A full refresh served under the 429 backoff must not claim freshness.
-
-    During the backoff ``_collect_usage`` returns cached data without any
-    network fetch; stamping ``_last_full_fetch`` then would let the auto-switch
-    evaluate frozen usage believing it just fetched it (the frozen-usage bug).
-    """
+def test_worker_stamps_full_fetch(monkeypatch):
+    """A full refresh stamps ``_last_full_fetch`` (there is no rate-limit backoff
+    to suppress it), so plan_auto_tick's evaluation follows on the next tick."""
     monkeypatch.setattr(
         menubar, "_snapshot",
         lambda switcher, full=True, force=False: {
@@ -99,15 +95,10 @@ def test_worker_skips_full_stamp_during_429_backoff(monkeypatch):
     )
 
     app = _RefreshHarness()
-    app._rate_limited_until = lambda: time.time() + 60  # backoff active
+    assert app._last_full_fetch == 0.0
     menubar._refresh_async_impl(app, full=True, force=False)
     app.join_all()
-    assert app._last_full_fetch == 0.0  # not stamped: nothing was fetched
-
-    app._rate_limited_until = lambda: 0.0  # backoff over
-    menubar._refresh_async_impl(app, full=True, force=False)
-    app.join_all()
-    assert app._last_full_fetch > 0.0  # honest full fetch → stamped
+    assert app._last_full_fetch > 0.0  # full fetch → stamped
 
 
 def test_refresh_async_force_threads_force_to_snapshot(monkeypatch):
@@ -538,26 +529,6 @@ def test_plan_auto_tick_evaluates_when_full_fetch_is_fresh():
     assert menubar.plan_auto_tick(
         now=100.0, last_eval=0.0, last_full_fetch=90.0, cadence=30, in_flight=False
     ) == "evaluate"
-
-
-def test_plan_auto_tick_waits_during_usage_backoff():
-    # While the usage endpoint is in 429 backoff, a forced full refresh is served
-    # from cache and _last_full_fetch is deliberately left unstamped — so without
-    # this guard every 4 Hz auto-tick would re-promote to "refresh" and respawn a
-    # worker per tick (the observed ~3.6/s busy-spin). Wait for the window to lift.
-    assert menubar.plan_auto_tick(
-        now=100.0, last_eval=0.0, last_full_fetch=0.0, cadence=30,
-        in_flight=False, backoff_active=True,
-    ) == "wait"
-
-
-def test_plan_auto_tick_refreshes_once_backoff_clears():
-    # Same stale state, backoff over: the single re-fetch is allowed (it will
-    # stamp _last_full_fetch and let evaluation resume next tick).
-    assert menubar.plan_auto_tick(
-        now=100.0, last_eval=0.0, last_full_fetch=0.0, cadence=30,
-        in_flight=False, backoff_active=False,
-    ) == "refresh"
 
 
 # Display auto-refresh must run even when auto-switch is OFF. The default-mode

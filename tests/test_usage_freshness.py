@@ -2,11 +2,10 @@
 
 The old design had a single file-level cache timestamp and fetched every
 account in a parallel burst. In practice the usage endpoint's per-IP limit
-tolerates roughly one request per short window, so every burst tripped a 429,
-armed a 90s global backoff, and the retained-prior merge silently carried
-stale percentages forward with a fresh-looking timestamp — non-active
-accounts' usage effectively never updated, and auto-switch decided on frozen
-data.
+tolerates roughly one request per short window, so every burst tripped a 429
+and the retained-prior merge silently carried stale percentages forward with a
+fresh-looking timestamp — non-active accounts' usage effectively never updated,
+and auto-switch decided on frozen data.
 
 Contract under test:
 - cache entries are ``{"usage": <dict|str|None>, "fetchedAt": <ts>}``;
@@ -14,9 +13,11 @@ Contract under test:
   a stamp in the FUTURE is also stale (a frozen account must self-heal)
 - per-account TTL decides what to fetch: active 15s, backups 60s
 - fetching is sequential, active-first then stalest-first; the round stops
-  at the first 429 (one backoff, untouched accounts keep aging) and when the
-  wall-clock budget is exhausted (a dead-slow network must not stall callers)
-- ``force=True`` bypasses the TTLs but never the 429 backoff
+  at the first 429 (which is SURFACED, not hidden as stale; untouched accounts
+  keep aging) and when the wall-clock budget is exhausted (a dead-slow network
+  must not stall callers). There is no cross-round backoff: the next round
+  fetches on the user's cadence.
+- ``force=True`` bypasses the TTLs
 - transient failures retain the prior good dict but stamp the attempt;
   definitive failures (token expired / no creds) replace it
 - ``_active_account_usage`` (status path, second reader/writer of the cache)
@@ -190,11 +191,10 @@ class TestPerAccountFreshness(_Base):
 
         out = s._collect_usage(self._info(n=3))
 
-        # Stalest goes first; its 429 ends the round immediately.
+        # Stalest goes first; its 429 ends the round immediately (no backoff armed).
         assert calls == ["2"]
-        assert s._rate_limited_until() > FROZEN  # one backoff armed
         assert out == [{"five_hour": {"pct": 11.0}},
-                       {"five_hour": {"pct": 22.0}},   # prior dict retained
+                       "rate limited",   # slot 2's 429 is SURFACED, not hidden as stale
                        {"five_hour": {"pct": 33.0}}]
         entries = self._cache_entries(s)
         # Untouched accounts keep their old stamps (keep aging → first next
@@ -222,7 +222,6 @@ class TestPerAccountFreshness(_Base):
 
         for _ in range(3):
             s._collect_usage(self._info(n=3))
-            s._set_rate_limited_until(0.0)  # backoff window passes
 
         assert calls == ["2", "3", "1"]  # every account got its turn
 
@@ -275,9 +274,9 @@ class TestPerAccountFreshness(_Base):
         assert out[0] == {"five_hour": {"pct": 11.0}}  # prior retained
         assert self._cache_entries(s)["1"]["fetchedAt"] == FROZEN - 100
 
-    # -- force + backoff (new-format re-pin) ------------------------------
+    # -- force (bypasses TTL; no backoff to honor) ------------------------
 
-    def test_force_bypasses_ttl_but_not_backoff(
+    def test_force_bypasses_ttl(
         self, temp_home, frozen_now, monkeypatch
     ):
         s = self._setup(temp_home)
@@ -293,12 +292,6 @@ class TestPerAccountFreshness(_Base):
         out = s._collect_usage(self._info(), force=True)
         assert calls == ["1", "2"]  # TTLs bypassed (fresh entries refetched)
         assert out == [{"five_hour": {"pct": 33.0}}, {"five_hour": {"pct": 44.0}}]
-
-        calls.clear()
-        s._set_rate_limited_until(FROZEN + 3600)
-        out = s._collect_usage(self._info(), force=True)
-        assert calls == []  # backoff still wins over force
-        assert out[0] == {"five_hour": {"pct": 33.0}}  # prior served
 
     # -- merge semantics ---------------------------------------------------
 

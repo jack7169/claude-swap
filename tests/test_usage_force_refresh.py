@@ -4,8 +4,8 @@ The menu-bar "Refresh now" command does a full refresh with ``only=None``. The
 fresh-cache shortcut (``_USAGE_CACHE_TTL``) would otherwise return the cached
 ``usage.json`` without hitting the network when it is <15s old, so an explicit
 user refresh showed stale data. ``force=True`` skips that shortcut and always
-re-fetches — but it must still honor the per-IP 429 backoff so we never hammer a
-rate-limited endpoint.
+re-fetches. There is no cross-round 429 backoff: a rate-limited fetch is
+surfaced ("rate limited"), and the next round still fetches on the user's cadence.
 """
 
 from __future__ import annotations
@@ -76,18 +76,18 @@ class TestCollectUsageForceRefresh:
         assert out[0] == {"five_hour": {"pct": 33.0}}   # fresh values returned
         assert out[1] == {"five_hour": {"pct": 44.0}}
 
-    def test_force_true_still_honors_429_backoff(self, temp_home, monkeypatch):
+    def test_force_true_fetches_and_surfaces_429(self, temp_home, monkeypatch):
+        # There is no 429 backoff to block force: the round still fetches, and a
+        # rate-limited account is surfaced ("rate limited") rather than served as
+        # a frozen (stale) percentage.
         s = self._setup(temp_home)
         monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
-        # Seed a last-known-good cache, then arm the backoff window.
         self._seed_fresh_cache(s)
-        s._set_rate_limited_until(_time.time() + 3600)  # rate limited far into future
         calls = []
-        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 77.0}},
-                                        "2": {"five_hour": {"pct": 88.0}}}, calls)
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 33.0}},
+                                        "2": _oauth.RATE_LIMITED}, calls)
 
         out = s._collect_usage(self._info(), force=True)
 
-        assert calls == []                              # network NOT hit while rate limited
-        assert out[0] == {"five_hour": {"pct": 11.0}}   # prior cache returned
-        assert out[1] == {"five_hour": {"pct": 22.0}}
+        assert "2" in calls                             # backup account was fetched
+        assert out[1] == "rate limited"                 # surfaced, not the stale 22.0

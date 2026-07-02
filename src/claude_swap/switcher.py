@@ -82,7 +82,6 @@ SETUP_TOKEN_SCOPES = ("user:inference",)
 # Usage cache
 _USAGE_CACHE_TTL = 15  # seconds an ACTIVE account's usage entry stays fresh
 _BACKUP_USAGE_TTL = 60  # seconds a backup account's usage entry stays fresh
-_DEFAULT_BACKOFF = 90  # seconds to skip usage fetching after a 429 (per-IP)
 _USAGE_ROUND_BUDGET = 20  # seconds of wall clock a sequential fetch round may take
 _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
 
@@ -1960,8 +1959,6 @@ class ClaudeAccountSwitcher:
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds))
         return accounts_info
 
-    def _rate_limit_path(self) -> Path:
-        return self.backup_dir / "cache" / "usage_ratelimit.json"
     def _active_cc_running(self) -> bool:
         """Whether any default-profile Claude Code instance is running.
 
@@ -2062,16 +2059,6 @@ class ClaudeAccountSwitcher:
             return USAGE_TOKEN_EXPIRED
         return usage
 
-
-    def _rate_limited_until(self) -> float:
-        data = read_cache(self._rate_limit_path(), _FOREVER, default=None)
-        if isinstance(data, dict) and isinstance(data.get("until"), (int, float)):
-            return float(data["until"])
-        return 0.0
-
-    def _set_rate_limited_until(self, ts: float) -> None:
-        write_cache(self._rate_limit_path(), {"until": ts})
-
     def _collect_usage(
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str]],
@@ -2114,17 +2101,10 @@ class ClaudeAccountSwitcher:
             prior_raw = {}
         prior = {k: _usage_cache_entry(v) for k, v in prior_raw.items()}
 
-        def prior_usage(k: str) -> dict | str | None:
-            entry = prior.get(k)
-            return entry["usage"] if entry is not None else None
-
-        # Global per-IP backoff: skip the network while rate limited.
-        if time.time() < self._rate_limited_until():
-            return [
-                prior_usage(k) if isinstance(prior_usage(k), dict)
-                else USAGE_RATE_LIMITED
-                for k in account_keys
-            ]
+        # No rate-limit backoff: every round attempts a fetch on the user's
+        # refresh cadence. A 429 is surfaced (USAGE_RATE_LIMITED) rather than
+        # silently suppressing fetches for a fixed window, so a rate-limited
+        # account shows "rate limited" instead of a frozen (stale) percentage.
 
         def fetch(
             account_info: tuple[int, str, str, str, bool, str]
@@ -2186,7 +2166,6 @@ class ClaudeAccountSwitcher:
         # the caller linearly with the account count). Accounts left
         # unattempted keep their (older) stamps and lead the next round.
         fetched: dict[str, dict | str | None] = {}
-        rate_limited = False
         round_start = time.time()
         for info in to_fetch:
             if fetched and time.time() - round_start > _USAGE_ROUND_BUDGET:
@@ -2194,7 +2173,13 @@ class ClaudeAccountSwitcher:
             res = fetch(info)
             fetched[str(info[0])] = res
             if res == USAGE_RATE_LIMITED:
-                rate_limited = True
+                # Stop this round (further calls would only chain 429s), but do
+                # NOT arm a cross-round backoff — the next round still fetches on
+                # the user's cadence. Surface it so the failure is never silent.
+                self._logger.info(
+                    "Usage API rate-limited (429) for account %s; will retry next refresh",
+                    info[0],
+                )
                 break
 
         # Merge: a fresh usage dict wins; a DEFINITIVE failure this round
@@ -2213,8 +2198,10 @@ class ClaudeAccountSwitcher:
             if k in fetched:
                 val = fetched[k]
                 if isinstance(val, dict) or val in (
-                    USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS
+                    USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS, USAGE_RATE_LIMITED
                 ):
+                    # A 429 (USAGE_RATE_LIMITED) is now surfaced, not hidden
+                    # behind a stale cached dict — the user sees "rate limited".
                     result_entries[k] = {"usage": val, "fetchedAt": now}
                 elif prior_entry is not None and isinstance(
                     prior_entry["usage"], dict
@@ -2230,8 +2217,6 @@ class ClaudeAccountSwitcher:
                 result_entries[k] = {"usage": None, "fetchedAt": 0.0}
 
         write_cache(usage_cache_path, result_entries)
-        if rate_limited:
-            self._set_rate_limited_until(time.time() + _DEFAULT_BACKOFF)
         return [result_entries[k]["usage"] for k in account_keys]
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
