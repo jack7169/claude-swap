@@ -25,6 +25,7 @@ from pathlib import Path
 from claude_swap import notify, oauth
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.locking import FileLock
 from claude_swap.printer import abbreviate_path, entrypoint_label, ide_short_name
 from claude_swap.process_detection import get_running_instances
 
@@ -1410,6 +1411,27 @@ def _guard_against_terminal_suspend() -> None:
         pass
 
 
+# Seconds to wait for the single-instance lock before giving up. Non-zero so a
+# `launchctl kickstart -k` restart (which kills the old process then immediately
+# starts the new one) doesn't lose the race against the dying instance releasing
+# its flock — the new instance briefly retries until the old fd closes. A genuine
+# second launch (a healthy instance keeps holding the lock) still fails and exits.
+_SINGLE_INSTANCE_TIMEOUT = 3.0
+
+
+def _acquire_menubar_lock(backup_dir, *, timeout: float = _SINGLE_INSTANCE_TIMEOUT):
+    """Acquire the process-wide single-instance lock, or return ``None`` if held.
+
+    Uses a ``FileLock`` (``flock``) on ``menubar.lock`` in the backup dir. The
+    lock is tied to the open file description, so it is released automatically
+    when the holding process dies — no stale-lock cleanup needed. Returns the
+    held ``FileLock`` (keep it referenced for the process lifetime) on success,
+    or ``None`` when another menu-bar instance already holds it.
+    """
+    lock = FileLock(backup_dir / "menubar.lock", timeout=timeout)
+    return lock if lock.acquire(timeout=timeout) else None
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     import rumps  # lazy: optional dependency, imported only when launching
@@ -1421,6 +1443,20 @@ def run(switcher) -> int:
     )
 
     _guard_against_terminal_suspend()
+
+    # Single-instance guard: refuse to start a second menu bar. Two copies would
+    # each run their own refresh/auto-switch loop and fight over the active
+    # account — and because each holds its own in-memory settings, one could keep
+    # auto-switching after the user disabled auto-switch in the other's menu.
+    # Exit 0 (not an error) so the LaunchAgent's KeepAlive (SuccessfulExit=False)
+    # does not treat yielding-to-an-existing-instance as a crash and restart-loop.
+    _singleton_lock = _acquire_menubar_lock(switcher.backup_dir)
+    if _singleton_lock is None:
+        switcher._logger.info(
+            "menu bar already running; not starting a second copy (single-instance guard)"
+        )
+        notify.notify("claude-swap", "Menu bar is already running.")
+        return 0
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     state_path = switcher.backup_dir / "menubar_state.json"

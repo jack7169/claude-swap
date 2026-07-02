@@ -1082,3 +1082,30 @@ def test_snapshot_degraded_path_includes_empty_instances(monkeypatch):
     snap = menubar._snapshot(_BrokenSW(), full=True)
     assert snap["instances"] == []
     assert snap["accounts"] == []
+
+
+# ---------------------------------------------------------------------------
+# Single-instance guard — only one menu-bar process may run at a time
+# ---------------------------------------------------------------------------
+
+
+def test_single_instance_lock_blocks_a_second_holder(tmp_path: Path):
+    # The first caller acquires the menu-bar lock; a second concurrent caller
+    # (a second `cswap --menubar`) must be refused so two copies can't run and
+    # fight over the active account / auto-switch state.
+    lock1 = menubar._acquire_menubar_lock(tmp_path, timeout=0)
+    assert lock1 is not None
+    try:
+        assert menubar._acquire_menubar_lock(tmp_path, timeout=0) is None
+    finally:
+        lock1.release()
+
+
+def test_single_instance_lock_reacquirable_after_release(tmp_path: Path):
+    # When the holder exits (lock released), a fresh instance can acquire again.
+    lock1 = menubar._acquire_menubar_lock(tmp_path, timeout=0)
+    assert lock1 is not None
+    lock1.release()
+    lock2 = menubar._acquire_menubar_lock(tmp_path, timeout=0)
+    assert lock2 is not None
+    lock2.release()
