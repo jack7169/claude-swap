@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import notify, oauth
+from claude_swap import login_item, notify, oauth
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.locking import FileLock
@@ -245,6 +245,11 @@ def toggle_auto_timer_start(settings: "MenuBarSettings") -> "MenuBarSettings":
     """
     settings.auto_timer_start_enabled = not settings.auto_timer_start_enabled
     return settings
+
+
+def login_item_menu_state(status: str) -> int:
+    """Checkmark state (1/0) for the 'Start at login' item given a status string."""
+    return 1 if status == "enabled" else 0
 
 
 def format_account_label(
@@ -1789,6 +1794,15 @@ def run(switcher) -> int:
                     callback=self.on_toggle_auto_timer_start,
                 )
             )
+            # Native Login Item toggle — only meaningful (and only shown) when
+            # running from the .app bundle; the pip/terminal install uses the
+            # `cswap --install-startup` LaunchAgent instead.
+            if login_item.is_bundled():
+                login_toggle = rumps.MenuItem(
+                    "Start at login", callback=self.on_toggle_login_item
+                )
+                login_toggle.state = login_item_menu_state(login_item.status())
+                self.menu["Start at login"] = login_toggle
             self.menu.add(None)
 
             accounts = self.snapshot["accounts"]
@@ -2126,6 +2140,14 @@ def run(switcher) -> int:
         def on_toggle_auto_timer_start(self, _sender):
             toggle_auto_timer_start(self.settings)
             self._save_and_rebuild()
+
+        def on_toggle_login_item(self, _sender):
+            # SMAppService is the source of truth (not MenuBarSettings), so just
+            # flip the registration and repaint the checkmark from its status.
+            ok, err = login_item.toggle()
+            if not ok:
+                notify.notify("claude-swap", f"Start-at-login change failed: {err}")
+            self.rebuild_menu()
 
         def _make_strategy(self, name):
             def cb(_sender):

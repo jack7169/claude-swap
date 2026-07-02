@@ -1109,3 +1109,10 @@ def test_single_instance_lock_reacquirable_after_release(tmp_path: Path):
     lock2 = menubar._acquire_menubar_lock(tmp_path, timeout=0)
     assert lock2 is not None
     lock2.release()
+
+
+def test_login_item_menu_state_checked_only_when_enabled():
+    assert menubar.login_item_menu_state("enabled") == 1
+    assert menubar.login_item_menu_state("not-registered") == 0
+    assert menubar.login_item_menu_state("requires-approval") == 0
+    assert menubar.login_item_menu_state("unavailable") == 0
