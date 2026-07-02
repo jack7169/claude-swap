@@ -577,7 +577,13 @@ def evaluate_strategy(
 
 
 def plan_auto_tick(
-    *, now: float, last_eval: float, last_full_fetch: float, cadence: int, in_flight: bool
+    *,
+    now: float,
+    last_eval: float,
+    last_full_fetch: float,
+    cadence: int,
+    in_flight: bool,
+    backoff_active: bool = False,
 ) -> str:
     """Decide the auto-switch tick's next move: ``wait`` / ``refresh`` / ``evaluate``.
 
@@ -592,11 +598,21 @@ def plan_auto_tick(
 
     ``refresh`` is only returned when no worker holds the slot; if one does we
     ``wait`` for it rather than evaluate on stale/partial data.
+
+    ``backoff_active`` suppresses the pre-eval refresh while the usage endpoint
+    is in its per-IP 429 backoff: such a fetch is served from cache and leaves
+    ``_last_full_fetch`` unstamped by design (see the stamp site), so without
+    this guard ``last_full_fetch`` never advances and every 4 Hz tick re-promotes
+    to ``refresh``, respawning a worker per tick (a bounded but wasteful
+    busy-spin). Waiting parks the auto path until the window lifts, at which point
+    the next tick refreshes for real, stamps, and evaluation resumes.
     """
     if now - last_eval < cadence:
         return "wait"
     if now - last_full_fetch > cadence:
-        return "wait" if in_flight else "refresh"
+        if in_flight or backoff_active:
+            return "wait"
+        return "refresh"
     return "evaluate"
 
 
@@ -679,51 +695,46 @@ def warm_account(
     model: str = "claude-haiku-4-5",
     max_tokens: int = 8,
     timeout: float = 5.0,
-) -> tuple[str, str | None, str | None]:
+) -> tuple[str, str | None]:
     """Send one warming request for a candidate account; classify the result.
 
-    Uses the account's stored backup token **directly** — no account switch, no
-    disruption to the live account. Proactively refreshes an expired token first
-    (reusing ``oauth.is_oauth_token_expired`` / ``oauth.refresh_oauth_credentials``)
-    so an about-to-expire backup token doesn't spuriously fail the health check.
+    Uses the account's stored token **directly, read-only** — no account switch,
+    no refresh, no credential write of any kind. This is deliberate: refreshing
+    rotates the server-side refresh token, and the warm path can only persist to
+    the *backup* store, so refreshing the active account here would invalidate
+    the live credential Claude Code reads (and racing a switch could do the same
+    to a backup). It is also unnecessary — an account only becomes a warm
+    candidate because its usage fetch just succeeded, so the stored token is
+    valid for this immediately-following send, and genuinely-expired *backup*
+    tokens are already refreshed under the sequence lock by the usage-fetch path
+    (``oauth.fetch_usage_for_account``) that runs earlier in the same worker
+    cycle.
 
-    Returns ``(status, reason, new_creds)``:
+    Returns ``(status, reason)``:
 
-    * ``("ok", None, new_creds_or_None)`` on a 2xx — the window is now warm;
-    * ``("error", reason, None)`` on a 401 / network error / any exception, or
-      when there's no usable ``accessToken`` (in which case no HTTP call is made).
+    * ``("ok", None)`` on a 2xx — the window is now warm;
+    * ``("error", reason)`` on a 401 / network error / any exception, or when
+      there's no usable ``accessToken`` (in which case no HTTP call is made).
 
-    ``new_creds`` is the refreshed credentials JSON when a refresh occurred (so
-    the caller can persist it via the switcher, exactly like
-    ``oauth.fetch_usage_for_account``'s persist path), else ``None``. Never
-    raises — every failure mode is folded into an ``("error", …)`` result.
+    Never raises — every failure mode is folded into an ``("error", …)`` result.
     """
     oauth_data = oauth.extract_oauth_data(creds)
     if not oauth_data:
-        return ("error", "no oauth credentials", None)
-
-    new_creds: str | None = None
-    if oauth_data.get("refreshToken") and oauth.is_oauth_token_expired(
-        oauth_data.get("expiresAt")
-    ):
-        refreshed = oauth.refresh_oauth_credentials(creds)
-        if refreshed:
-            new_creds = refreshed
-            oauth_data = oauth.extract_oauth_data(refreshed) or oauth_data
+        return ("error", "no oauth credentials")
 
     access_token = oauth_data.get("accessToken")
     if not access_token:
-        return ("error", "no token", new_creds)
+        return ("error", "no token")
 
     try:
         oauth.send_warm_message(access_token, model, max_tokens, timeout)
     except urllib.error.HTTPError as e:
-        return ("error", f"HTTP {e.code}", new_creds)
+        return ("error", f"HTTP {e.code}")
     except urllib.error.URLError as e:
-        return ("error", str(e.reason), new_creds)
+        return ("error", str(e.reason))
     except Exception as e:  # never raise out of a warm attempt
-        return ("error", repr(e), new_creds)
-    return ("ok", None, new_creds)
+        return ("error", repr(e))
+    return ("ok", None)
 
 
 def run_warm_cycle(
@@ -731,23 +742,23 @@ def run_warm_cycle(
     accounts: list[tuple[int, str, str, dict | str | None]],
     now: float,
     warmed_at: dict[str, float],
-    persist,
     notify_fn=notify.notify,
     warm=warm_account,
     cooldown_seconds: int = WARM_COOLDOWN,
 ) -> int:
-    """Warm every idle candidate once; record cooldowns, notify, persist refreshes.
+    """Warm every idle candidate once; record cooldowns and notify.
 
     Selects candidates via :func:`select_warm_candidates`, then for each sends a
     single warming request through ``warm`` (defaults to :func:`warm_account`).
     On success it stamps ``warmed_at[str(num)] = now`` (the dedup cooldown) and
     counts it; on failure it posts a per-account banner
     (``"Account-<n> timer start failed: <reason>"``) and does NOT record a
-    cooldown, so a broken account is retried next cycle. Refreshed credentials
-    returned by ``warm`` are persisted via ``persist(num, email, new_creds)``
-    (the switcher's write-back path) regardless of send outcome. After the loop,
-    a single summary banner (``"Started timers for N account(s)"``) is posted iff
-    at least one send succeeded — failures are per-account, successes summarized.
+    cooldown, so a broken account is retried next cycle. After the loop, a single
+    summary banner (``"Started timers for N account(s)"``) is posted iff at least
+    one send succeeded — failures are per-account, successes summarized.
+
+    The warm path is send-only: it never refreshes or writes any credential (see
+    :func:`warm_account`), so there is no persist step and no lock interaction.
 
     Returns the success count. Injected ``notify_fn`` / ``warm`` (mirroring
     ``_maybe_auto_switch``'s injected deps) keep it unit-testable without HTTP or
@@ -758,14 +769,9 @@ def run_warm_cycle(
     candidates = select_warm_candidates(accounts, now, warmed_at, cooldown_seconds)
     success = 0
     for num in candidates:
-        email, creds = by_num[num]
+        _email, creds = by_num[num]
         try:
-            status, reason, new_creds = warm(creds)
-            if new_creds:
-                try:
-                    persist(num, email, new_creds)
-                except Exception:
-                    pass  # persistence failure must not abort the cycle
+            status, reason = warm(creds)
             if status == "ok":
                 warmed_at[str(num)] = now
                 success += 1
@@ -1055,8 +1061,9 @@ def _run_warm_from_snapshot(app, snap: dict) -> None:
     credentials from ``switcher._build_accounts_info()`` (a cheap local read)
     and join them to the snapshot usages by account number, producing the
     ``(num, email, creds, usage)`` input for :func:`run_warm_cycle` for ALL
-    accounts (not just the active one). Persisted refreshes go back through the
-    switcher's write path. Runs on the worker thread under the caller's guard.
+    accounts (not just the active one). The warm path is send-only — it never
+    writes credentials — so nothing here touches the credential store or the
+    sequence lock. Runs on the worker thread under the caller's guard.
     """
     usage_by_num = {num: usage for (num, _e, _a, usage) in snap.get("accounts", [])}
     accounts = [
@@ -1064,14 +1071,10 @@ def _run_warm_from_snapshot(app, snap: dict) -> None:
         for (num, email, _org, _uuid, _is_active, creds) in app.switcher._build_accounts_info()
     ]
 
-    def persist(num, email, creds):
-        app.switcher._write_account_credentials(str(num), email, creds)
-
     run_warm_cycle(
         accounts=accounts,
         now=time.time(),
         warmed_at=app._warmed_at,
-        persist=persist,
         notify_fn=notify.notify,
     )
 
@@ -1644,6 +1647,7 @@ def run(switcher) -> int:
                 last_full_fetch=self._last_full_fetch,
                 cadence=cadence,
                 in_flight=self._refresh_guard.in_flight,
+                backoff_active=_usage_backoff_active(self.switcher),
             )
             if action == "wait":
                 return

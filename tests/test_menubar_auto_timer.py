@@ -102,7 +102,16 @@ class TestSelectWarmCandidates:
 
 
 class TestWarmAccount:
-    """warm_account: reuse Bearer+beta pattern, minimal Haiku request, refresh."""
+    """warm_account: send-only Bearer+beta minimal Haiku request; never refreshes.
+
+    The warm path deliberately does NOT refresh or rotate any OAuth token: doing
+    so would rotate the server-side refresh token while persisting only to the
+    backup store, corrupting the live credential Claude Code reads for the active
+    account (and racing a concurrent switch for backups). A candidate only exists
+    because its usage fetch just succeeded, so its stored token is API-valid for
+    the immediately-following send; genuine expiry is refreshed under the lock by
+    the usage-fetch path (oauth.fetch_usage_for_account) that runs first.
+    """
 
     def _ok_response(self):
         resp = MagicMock()
@@ -119,11 +128,10 @@ class TestWarmAccount:
             return self._ok_response()
 
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
-            status, reason, new_creds = menubar.warm_account(_oauth_creds(access="tok123"))
+            status, reason = menubar.warm_account(_oauth_creds(access="tok123"))
 
         assert status == "ok"
         assert reason is None
-        assert new_creds is None
         req = captured["req"]
         assert req.full_url == "https://api.anthropic.com/v1/messages"
         assert req.get_method() == "POST"
@@ -141,23 +149,22 @@ class TestWarmAccount:
             code=401, msg="Unauthorized", hdrs=None, fp=None,
         )
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
-            status, reason, new_creds = menubar.warm_account(_oauth_creds())
+            status, reason = menubar.warm_account(_oauth_creds())
         assert status == "error"
         assert reason is not None
-        assert new_creds is None
 
     def test_network_error_is_failure(self):
         err = urllib.error.URLError("no route to host")
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
-            status, reason, new_creds = menubar.warm_account(_oauth_creds())
+            status, reason = menubar.warm_account(_oauth_creds())
         assert status == "error"
         assert reason is not None
 
-    def test_expired_token_refreshed_first(self):
-        # An expired token with a refresh token -> refresh_oauth_credentials is
-        # called and the send uses the refreshed access token.
-        expired = _oauth_creds(access="old", refresh="r", expires_at=0)
-        refreshed = _oauth_creds(access="new-access", refresh="r2", expires_at=99999999999999)
+    def test_expired_token_is_not_refreshed(self):
+        # An expired token is NOT refreshed/rotated: the send uses the stored
+        # access token as-is (the usage-fetch path already refreshed it under the
+        # lock before this account became a candidate).
+        expired = _oauth_creds(access="stored", refresh="r", expires_at=0)
         captured = {}
 
         def fake_urlopen(req, timeout=0):
@@ -165,22 +172,20 @@ class TestWarmAccount:
             return self._ok_response()
 
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen), \
-             patch("claude_swap.oauth.refresh_oauth_credentials", return_value=refreshed) as rf:
-            status, reason, new_creds = menubar.warm_account(expired)
+             patch("claude_swap.oauth.refresh_oauth_credentials") as rf:
+            status, reason = menubar.warm_account(expired)
 
-        rf.assert_called_once()
+        rf.assert_not_called()
         assert status == "ok"
-        assert captured["auth"] == "Bearer new-access"
-        assert new_creds == refreshed
+        assert captured["auth"] == "Bearer stored"
 
     def test_no_token_returns_error(self):
         creds = json.dumps({"claudeAiOauth": {"refreshToken": "r"}})
         with patch("claude_swap.oauth.urllib.request.urlopen") as urlopen:
-            status, reason, new_creds = menubar.warm_account(creds)
+            status, reason = menubar.warm_account(creds)
         urlopen.assert_not_called()
         assert status == "error"
         assert reason is not None
-        assert new_creds is None
 
 
 # ---------------------------------------------------------------------------
@@ -202,11 +207,11 @@ class TestRunWarmCycle:
 
         def warm(creds, **kw):
             seen.append(creds)
-            return ("ok", None, None)
+            return ("ok", None)
 
         menubar.run_warm_cycle(
             accounts=self._accounts(), now=1000.0, warmed_at={},
-            persist=lambda *a: None, notify_fn=lambda *a: None, warm=warm,
+            notify_fn=lambda *a: None, warm=warm,
         )
         assert len(seen) == 2
 
@@ -214,8 +219,8 @@ class TestRunWarmCycle:
         warmed_at = {}
         menubar.run_warm_cycle(
             accounts=[self._accounts()[0]], now=1000.0, warmed_at=warmed_at,
-            persist=lambda *a: None, notify_fn=lambda *a: None,
-            warm=lambda creds, **kw: ("ok", None, None),
+            notify_fn=lambda *a: None,
+            warm=lambda creds, **kw: ("ok", None),
         )
         assert warmed_at["1"] == 1000.0
 
@@ -224,9 +229,8 @@ class TestRunWarmCycle:
         notes = []
         menubar.run_warm_cycle(
             accounts=[self._accounts()[0]], now=1000.0, warmed_at=warmed_at,
-            persist=lambda *a: None,
             notify_fn=lambda title, msg: notes.append(msg),
-            warm=lambda creds, **kw: ("error", "401", None),
+            warm=lambda creds, **kw: ("error", "401"),
         )
         assert "1" not in warmed_at  # cooldown NOT recorded on failure
         assert any("Account-1" in m and "timer start failed" in m for m in notes)
@@ -235,9 +239,8 @@ class TestRunWarmCycle:
         notes = []
         menubar.run_warm_cycle(
             accounts=self._accounts(), now=1000.0, warmed_at={},
-            persist=lambda *a: None,
             notify_fn=lambda title, msg: notes.append(msg),
-            warm=lambda creds, **kw: ("ok", None, None),
+            warm=lambda creds, **kw: ("ok", None),
         )
         summaries = [m for m in notes if "Started timers for" in m]
         assert summaries == ["Started timers for 2 account(s)"]
@@ -246,22 +249,10 @@ class TestRunWarmCycle:
         notes = []
         menubar.run_warm_cycle(
             accounts=self._accounts(), now=1000.0, warmed_at={},
-            persist=lambda *a: None,
             notify_fn=lambda title, msg: notes.append(msg),
-            warm=lambda creds, **kw: ("error", "boom", None),
+            warm=lambda creds, **kw: ("error", "boom"),
         )
         assert not any("Started timers for" in m for m in notes)
-
-    def test_refreshed_creds_persisted(self):
-        persisted = []
-        new = _oauth_creds(access="fresh")
-        menubar.run_warm_cycle(
-            accounts=[self._accounts()[0]], now=1000.0, warmed_at={},
-            persist=lambda n, e, c: persisted.append((n, e, c)),
-            notify_fn=lambda *a: None,
-            warm=lambda creds, **kw: ("ok", None, new),
-        )
-        assert persisted == [(1, "a@x", new)]
 
     def test_one_failure_never_breaks_cycle(self):
         # A raising warm for one account must not prevent the others running.
@@ -271,11 +262,11 @@ class TestRunWarmCycle:
             seen.append(creds)
             if len(seen) == 1:
                 raise RuntimeError("boom")
-            return ("ok", None, None)
+            return ("ok", None)
 
         menubar.run_warm_cycle(
             accounts=self._accounts(), now=1000.0, warmed_at={},
-            persist=lambda *a: None, notify_fn=lambda *a: None, warm=warm,
+            notify_fn=lambda *a: None, warm=warm,
         )
         assert len(seen) == 2
 
@@ -378,6 +369,71 @@ class TestWorkerWiring:
         app.join_all()
         assert app.snapshot["accounts"]  # snapshot still stored
         assert app._dirty is True
+
+
+class TestWarmNeverWritesCredentials:
+    """The warm path is send-only: it never rotates or persists any credential.
+
+    Regression guard for two confirmed defects the first cut had:
+      * warming the ACTIVE account refreshed+rotated its OAuth token but wrote
+        only to the backup store, invalidating the live creds Claude Code reads
+        (invalid_grant / forced re-login);
+      * the (backup) persist ran off the refresh worker WITHOUT the sequence
+        lock, racing a concurrent switch's read-modify-write of the backup.
+    Both vanish if the warm path never writes credentials at all — which is safe
+    because a candidate's token was just validated by the usage fetch, and the
+    usage-fetch path already refreshes genuinely-expired backups under the lock.
+    """
+
+    def _ok_response(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"content": []}).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_run_warm_from_snapshot_never_refreshes_or_writes(self):
+        writes = []
+
+        class _App:
+            _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
+
+            def __init__(self):
+                self._warmed_at = {}
+                self.switcher = self
+
+            def _build_accounts_info(self):
+                # (num, email, org, uuid, is_active, creds); tokens marked expired
+                # (expiresAt=0) to prove even an "expired" token is NOT refreshed.
+                return [
+                    (1, "a@x", "", "", True, _oauth_creds(access="live-active", expires_at=0)),
+                    (2, "b@x", "", "", False, _oauth_creds(access="backup", expires_at=0)),
+                ]
+
+            def _write_account_credentials(self, num, email, creds):
+                writes.append((num, email, creds))
+
+        snap = {
+            "accounts": [
+                (1, "a@x", True, {"five_hour": {"pct": 0}}),
+                (2, "b@x", False, {"five_hour": {"pct": 0}}),
+            ],
+        }
+        sends = []
+
+        def fake_urlopen(req, timeout=0):
+            sends.append(req.get_header("Authorization"))
+            return self._ok_response()
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen), \
+             patch("claude_swap.oauth.refresh_oauth_credentials") as rf, \
+             patch("claude_swap.notify.notify"):
+            menubar._run_warm_from_snapshot(_App(), snap)
+
+        assert writes == []          # warm path NEVER persists credentials
+        rf.assert_not_called()       # and NEVER refreshes/rotates a token
+        # Both accounts warmed with their stored token as-is (incl. the active one).
+        assert sorted(sends) == ["Bearer backup", "Bearer live-active"]
 
 
 # ---------------------------------------------------------------------------

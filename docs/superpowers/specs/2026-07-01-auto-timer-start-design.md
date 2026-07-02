@@ -69,9 +69,21 @@ Request shape (minimal):
 - `messages`: `[{"role": "user", "content": "can you hear me?"}]`.
 - Short network timeout (align with the existing usage-fetch timeout).
 
-The token may need a proactive refresh first (reuse
-`oauth.is_oauth_token_expired` / `oauth.refresh_oauth_credentials`) so an
-about-to-expire backup token doesn't spuriously fail the health check.
+The warm path is **send-only**: it uses the stored token read-only and never
+refreshes or writes any credential. (Revised from the original "proactively
+refresh first" design after review found refreshing here to be both unsafe and
+unnecessary.) Refreshing rotates the server-side refresh token, and the warm
+path can only persist to the *backup* store — so refreshing the **active**
+account here would leave the live store (what Claude Code reads) holding the
+now-invalidated token, forcing a re-login; refreshing a backup could likewise
+race a concurrent switch's read-modify-write of that backup. It is also
+redundant: an account only becomes a candidate because its usage fetch just
+succeeded, so the stored token is valid for the immediately-following send, and
+genuinely-expired **backup** tokens are already refreshed under the sequence
+lock by `oauth.fetch_usage_for_account` earlier in the same worker cycle. If a
+token nonetheless expires in the seconds before the send, the 401 is reported
+and the account is retried next cycle (by which point the usage path has
+refreshed it) — self-healing, with no credential writes on the warm path.
 
 ## Dedup / cooldown
 
@@ -103,8 +115,9 @@ exactly once per 5-hour window.
   Cocoa main thread), where the usage snapshot is already available.
 - Sends are HTTP via `urllib` — **no `fork()`** — so there is zero interaction
   with the fork-serialization freeze fix (`spawn.fork_lock`).
-- No account switching → independent of auto-switch; the two toggles can be on
-  together without conflict.
+- No account switching **and no credential writes** (send-only) → independent of
+  auto-switch and of the credential store; the two toggles can be on together
+  without conflict, with no sequence-lock interaction.
 
 ## Risks / validation
 
@@ -116,8 +129,10 @@ exactly once per 5-hour window.
 2. **Quota / ToS:** each ping consumes a sliver of that account's 5-hour budget
    (intended — that is what starts the timer) and is an automated multi-account
    send. Implemented as specified; documented so the behavior is explicit.
-3. **Token refresh:** a backup token may be expired; refresh before sending so a
-   refreshable account isn't misreported as broken.
+3. **Token freshness:** the warm path does **not** refresh (send-only, see
+   above); it relies on the usage-fetch path having refreshed genuinely-expired
+   backup tokens earlier in the same cycle. A token that expires in the brief gap
+   before the send 401s and is retried next cycle — never misreported durably.
 
 ## Testing
 

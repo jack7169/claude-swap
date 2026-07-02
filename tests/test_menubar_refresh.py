@@ -309,6 +309,11 @@ def test_snapshot_signature_changes_when_state_changes():
     changed_settings = menubar.MenuBarSettings(title_pct="off")
     assert menubar._snapshot_signature(base, changed_settings) != sig_base
 
+    # Toggling auto-timer-start must repaint the menu (its label lives in the bar),
+    # so the flag must participate in the signature.
+    toggled = menubar.MenuBarSettings(auto_timer_start_enabled=True)
+    assert menubar._snapshot_signature(base, toggled) != sig_base
+
 
 def test_sync_tick_skips_rebuild_when_signature_unchanged():
     """on_sync_tick rebuilds only when the rendered-state signature changed."""
@@ -533,6 +538,26 @@ def test_plan_auto_tick_evaluates_when_full_fetch_is_fresh():
     assert menubar.plan_auto_tick(
         now=100.0, last_eval=0.0, last_full_fetch=90.0, cadence=30, in_flight=False
     ) == "evaluate"
+
+
+def test_plan_auto_tick_waits_during_usage_backoff():
+    # While the usage endpoint is in 429 backoff, a forced full refresh is served
+    # from cache and _last_full_fetch is deliberately left unstamped — so without
+    # this guard every 4 Hz auto-tick would re-promote to "refresh" and respawn a
+    # worker per tick (the observed ~3.6/s busy-spin). Wait for the window to lift.
+    assert menubar.plan_auto_tick(
+        now=100.0, last_eval=0.0, last_full_fetch=0.0, cadence=30,
+        in_flight=False, backoff_active=True,
+    ) == "wait"
+
+
+def test_plan_auto_tick_refreshes_once_backoff_clears():
+    # Same stale state, backoff over: the single re-fetch is allowed (it will
+    # stamp _last_full_fetch and let evaluation resume next tick).
+    assert menubar.plan_auto_tick(
+        now=100.0, last_eval=0.0, last_full_fetch=0.0, cadence=30,
+        in_flight=False, backoff_active=False,
+    ) == "refresh"
 
 
 def test_rebuild_deferred_while_menu_open_then_runs_on_close():
