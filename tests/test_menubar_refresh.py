@@ -83,6 +83,33 @@ class _RefreshHarness:
             t.join(timeout=max(0.0, deadline - time.time()))
 
 
+def test_worker_skips_full_stamp_during_429_backoff(monkeypatch):
+    """A full refresh served under the 429 backoff must not claim freshness.
+
+    During the backoff ``_collect_usage`` returns cached data without any
+    network fetch; stamping ``_last_full_fetch`` then would let the auto-switch
+    evaluate frozen usage believing it just fetched it (the frozen-usage bug).
+    """
+    monkeypatch.setattr(
+        menubar, "_snapshot",
+        lambda switcher, full=True, force=False: {
+            "accounts": [], "active_email": None, "active_usage": None,
+            "instances": [],
+        },
+    )
+
+    app = _RefreshHarness()
+    app._rate_limited_until = lambda: time.time() + 60  # backoff active
+    menubar._refresh_async_impl(app, full=True, force=False)
+    app.join_all()
+    assert app._last_full_fetch == 0.0  # not stamped: nothing was fetched
+
+    app._rate_limited_until = lambda: 0.0  # backoff over
+    menubar._refresh_async_impl(app, full=True, force=False)
+    app.join_all()
+    assert app._last_full_fetch > 0.0  # honest full fetch → stamped
+
+
 def test_refresh_async_force_threads_force_to_snapshot(monkeypatch):
     """on_refresh_now -> refresh_async(force=True) -> _snapshot(force=True)."""
     seen = {}

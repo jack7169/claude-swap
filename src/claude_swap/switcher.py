@@ -11,7 +11,6 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -27,7 +26,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth
-from claude_swap.cache import MISSING, read_cache, write_cache
+from claude_swap.cache import read_cache, write_cache
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_API_KEY,
@@ -81,9 +80,39 @@ KEYRING_SERVICE = "claude-code"
 SETUP_TOKEN_SCOPES = ("user:inference",)
 
 # Usage cache
-_USAGE_CACHE_TTL = 15  # seconds
+_USAGE_CACHE_TTL = 15  # seconds an ACTIVE account's usage entry stays fresh
+_BACKUP_USAGE_TTL = 60  # seconds a backup account's usage entry stays fresh
 _DEFAULT_BACKOFF = 90  # seconds to skip usage fetching after a 429 (per-IP)
+_USAGE_ROUND_BUDGET = 20  # seconds of wall clock a sequential fetch round may take
 _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
+
+
+def _usage_cache_entry(value) -> dict:
+    """Normalize a usage-cache entry to ``{"usage", "fetchedAt"}``.
+
+    Current entries carry their own per-account freshness stamp. Legacy
+    entries (bare usage dict / sentinel string / null from before the stamp
+    format) normalize to ``fetchedAt=0`` — always stale — so they refresh on
+    the next round and upgrade on write. No migration pass needed.
+    """
+    if (
+        isinstance(value, dict)
+        and set(value.keys()) == {"usage", "fetchedAt"}
+        and isinstance(value.get("fetchedAt"), (int, float))
+    ):
+        return value
+    return {"usage": value, "fetchedAt": 0.0}
+
+
+def _usage_entry_fresh(entry: dict, ttl: float, now: float) -> bool:
+    """True while a normalized cache entry's stamp is within its TTL.
+
+    A stamp in the FUTURE (clock rollback, restored backup) is NOT fresh —
+    treating it as fresh would freeze that account's usage until wall-clock
+    time caught up with the stamp.
+    """
+    age = now - entry["fetchedAt"]
+    return 0 <= age < ttl
 
 
 def _format_usage_lines(usage: dict) -> list[str]:
@@ -922,6 +951,25 @@ class ClaudeAccountSwitcher:
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
             )
 
+    def _reject_tokenless_live_capture(self, creds: str) -> None:
+        """Guard for captures of the LIVE credential: it must hold a usable token.
+
+        ``claude /logout`` leaves Claude Code's keychain item in place holding
+        only ``mcpOAuth`` server tokens — the ``claudeAiOauth`` section is
+        removed while ``~/.claude.json``'s oauthAccount can survive. That blob
+        is non-empty, so the empty-credential aborts pass, and capturing it
+        (add/adopt, or switch Step 1's backup-current) silently overwrites the
+        slot's only good backup with a payload that can't log anyone in.
+        Managed API keys are a valid raw-string shape and pass.
+        """
+        if looks_like_api_key(creds):
+            return
+        if not oauth.extract_access_token(creds):
+            raise CredentialReadError(
+                "Live credentials contain no usable OAuth token (logged out?); "
+                "refusing to capture them"
+            )
+
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
         """Reject registering a token whose (email, personal-org) already exists as
         the *other* kind.
@@ -1090,7 +1138,7 @@ class ClaudeAccountSwitcher:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
 
-    def add_account(self, slot: int | None = None) -> None:
+    def add_account(self, slot: int | None = None, quiet: bool = False) -> None:
         """Add current account to managed accounts.
 
         Args:
@@ -1098,6 +1146,9 @@ class ClaudeAccountSwitcher:
                   When None, auto-assigns the next available number.
                   When specified, prompts for confirmation if the slot
                   is already occupied by a different account.
+            quiet: Suppress human-facing prints (logging is unaffected), for
+                  programmatic callers — e.g. adoption during a ``--json``
+                  switch, where stray stdout would corrupt the JSON envelope.
         """
         self._setup_directories()
         self._init_sequence_file()
@@ -1132,6 +1183,7 @@ class ClaudeAccountSwitcher:
             if not current_creds:
                 raise CredentialReadError("No credentials found for current account")
             self._reject_live_api_key_capture(current_creds)
+            self._reject_tokenless_live_capture(current_creds)
 
             config_path = self._get_claude_config_path()
             try:
@@ -1161,10 +1213,11 @@ class ClaudeAccountSwitcher:
 
                     tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
                     self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
-                    print(
-                        f"{accent('Updated credentials')} for Account {account_num} "
-                        f"({current_email} {muted(f'[{tag}]')})."
-                    )
+                    if not quiet:
+                        print(
+                            f"{accent('Updated credentials')} for Account {account_num} "
+                            f"({current_email} {muted(f'[{tag}]')})."
+                        )
                     return
 
         # Determine slot number and collect confirmation decisions
@@ -1215,6 +1268,7 @@ class ClaudeAccountSwitcher:
         if not current_creds:
             raise CredentialReadError("No credentials found for current account")
         self._reject_live_api_key_capture(current_creds)
+        self._reject_tokenless_live_capture(current_creds)
 
         config_path = self._get_claude_config_path()
         try:
@@ -1237,7 +1291,18 @@ class ClaudeAccountSwitcher:
         # lock; assign the auto slot here so two concurrent adds can't collide.
         with self._sequence_lock():
             if account_num is None:
-                account_num = str(self._get_next_account_number())
+                # Re-check membership under the lock: a concurrent add/adopt
+                # (menu-bar worker vs CLI) may have committed this identity
+                # since the unlocked pre-check, and allocating a fresh slot
+                # then would duplicate the account. Reuse the existing slot
+                # (refresh-in-place) instead.
+                locked_data = self._get_sequence_data() or {}
+                account_num = (
+                    self._find_account_slot(
+                        locked_data, current_email, current_org_uuid
+                    )
+                    or str(self._get_next_account_number())
+                )
 
             # Re-validate the displacement against current state: the occupant
             # may have changed (or been removed) since the prompt above.
@@ -1273,14 +1338,16 @@ class ClaudeAccountSwitcher:
             self._write_account_credentials(account_num, current_email, current_creds)
             self._write_account_config(account_num, current_email, current_config)
 
-            # Update sequence.json
+            # Update sequence.json. A reused slot (locked re-check above, or
+            # an explicit --slot refresh) keeps its original "added" stamp.
             data = self._get_sequence_data()
+            prior_added = data["accounts"].get(account_num, {}).get("added")
             data["accounts"][account_num] = {
                 "email": current_email,
                 "uuid": account_uuid,
                 "organizationUuid": organization_uuid,
                 "organizationName": organization_name,
-                "added": get_timestamp(),
+                "added": prior_added or get_timestamp(),
             }
             if int(account_num) not in data["sequence"]:
                 data["sequence"].append(int(account_num))
@@ -1292,7 +1359,42 @@ class ClaudeAccountSwitcher:
 
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
         self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
-        print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        if not quiet:
+            print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+
+    def adopt_unmanaged_active(self) -> tuple[str, str] | None:
+        """Adopt an unmanaged live login into a new managed slot (non-interactive).
+
+        Companion to the interactive auto-add in ``switch()`` for headless
+        callers (the menu bar's refresh tick): when the account signed into
+        Claude Code matches no managed slot — e.g. the user ran ``claude
+        /login`` while cswap was running — capture it via ``add_account()``.
+
+        Returns ``(slot, email)`` for the adopted account, or ``None`` when
+        there is nothing to adopt: no live login, nothing managed yet (a
+        fresh machine must not be silently bootstrapped — mirrors
+        ``switch()``'s precondition), or the live identity already matches a
+        managed slot. The membership check runs on org-migrated data so a
+        pre-v0.6.0 record isn't mistaken for unmanaged and duplicated.
+        Capture failures (API-key login, unreadable credentials) propagate.
+        """
+        if not self.sequence_file.exists():
+            return None
+        identity = self._get_current_account()
+        if identity is None:
+            return None
+        data = self._get_sequence_data_migrated() or {}
+        if not data.get("accounts"):
+            return None
+        email, org_uuid = identity
+        if self._find_account_slot(data, email, org_uuid) is not None:
+            return None
+        # quiet: callers own the messaging (menubar notifies, switch_to prints
+        # its own notice) and a --json switch must keep stdout free of prints.
+        self.add_account(quiet=True)
+        data = self._get_sequence_data() or {}
+        slot = self._find_account_slot(data, email, org_uuid)
+        return (slot, email) if slot is not None else None
 
     def _token_credentials_payload(self, token: str, is_api_key: bool) -> str:
         """Credential payload for a token add: managed keys raw, tokens wrapped."""
@@ -1982,26 +2084,45 @@ class ClaudeAccountSwitcher:
         ``"rate limited"``, or ``None`` when the API call failed. While a 429
         backoff window is active, the network is skipped entirely and the
         last-known-good cache is returned. ``only`` (a set of account-number
-        strings) restricts which accounts hit the network this call; the rest
-        come from cache. ``only=None`` fetches all (the CLI behavior).
+        strings) restricts which accounts may hit the network this call; the
+        rest come from cache.
 
-        ``force=True`` skips the <15s fresh-cache shortcut so an explicit user
-        refresh always re-fetches over the network (the menu-bar "Refresh now"
-        bug). It deliberately does NOT bypass the per-IP 429 backoff above — a
-        forced refresh must never hammer a rate-limited endpoint.
+        Freshness is tracked PER ACCOUNT: each cache entry carries its own
+        ``fetchedAt`` stamp, and only accounts staler than their TTL (active
+        ``_USAGE_CACHE_TTL``, backups ``_BACKUP_USAGE_TTL``) are fetched.
+        Fetching is sequential — active accounts first, then stalest-first —
+        and the round STOPS at the first 429: the usage endpoint's per-IP
+        limit tolerates roughly one request per short window, so a parallel
+        burst trips it every round, and one 429 freezes everything for the
+        backoff window. Untouched accounts keep their older stamps and go
+        first next round, so every account's data age stays bounded instead
+        of frozen behind chained backoffs.
+
+        ``force=True`` bypasses the per-account TTLs so an explicit user
+        refresh always re-fetches over the network. It deliberately does NOT
+        bypass the per-IP 429 backoff — a forced refresh must never hammer a
+        rate-limited endpoint.
         """
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         account_keys = [str(info[0]) for info in accounts_info]
 
-        # Last-known-good cache, ignoring the freshness TTL (for retention/backoff).
-        prior = read_cache(usage_cache_path, _FOREVER, default=None)
-        if not isinstance(prior, dict):
-            prior = {}
+        # Last-known-good cache, ignoring file age (for retention/backoff).
+        # Entries are normalized to {"usage", "fetchedAt"}; legacy bare values
+        # (pre-stamp format) read as fetchedAt=0, i.e. always stale.
+        prior_raw = read_cache(usage_cache_path, _FOREVER, default=None)
+        if not isinstance(prior_raw, dict):
+            prior_raw = {}
+        prior = {k: _usage_cache_entry(v) for k, v in prior_raw.items()}
+
+        def prior_usage(k: str) -> dict | str | None:
+            entry = prior.get(k)
+            return entry["usage"] if entry is not None else None
 
         # Global per-IP backoff: skip the network while rate limited.
         if time.time() < self._rate_limited_until():
             return [
-                prior[k] if isinstance(prior.get(k), dict) else USAGE_RATE_LIMITED
+                prior_usage(k) if isinstance(prior_usage(k), dict)
+                else USAGE_RATE_LIMITED
                 for k in account_keys
             ]
 
@@ -2032,58 +2153,86 @@ class ClaudeAccountSwitcher:
                 persist_credentials=persist,
             )
 
-        # Fresh-cache shortcut (CLI path only): reuse if <15s old and same keys.
-        # Skipped when force=True so an explicit user refresh always re-fetches.
-        if only is None and not force:
-            cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
-            if (cached is not MISSING and isinstance(cached, dict)
-                    and set(cached.keys()) == set(account_keys)):
-                return [cached.get(k) for k in account_keys]
+        # Per-account staleness decides what hits the network this round.
+        now = time.time()
 
-        to_fetch = (
+        def is_stale(info) -> bool:
+            entry = prior.get(str(info[0]))
+            if entry is None:
+                return True
+            ttl = _USAGE_CACHE_TTL if info[4] else _BACKUP_USAGE_TTL
+            return not _usage_entry_fresh(entry, ttl, now)
+
+        in_scope = (
             accounts_info if only is None
             else [info for info in accounts_info if str(info[0]) in only]
         )
+        to_fetch = list(in_scope) if force else [i for i in in_scope if is_stale(i)]
+        # Strictly stalest-first — the active account gets NO priority. With
+        # stop-on-first-429 below, prioritizing the active account (stale
+        # nearly every round via its short TTL) would let a chronically
+        # rate-limited environment starve every backup forever; stalest-first
+        # plus stamping each attempt rotates the one request a 429-bound
+        # round gets across all accounts.
+        to_fetch.sort(
+            key=lambda info: prior.get(
+                str(info[0]), {"fetchedAt": 0.0}
+            )["fetchedAt"]
+        )
+
+        # Sequential, stop on the first 429: further requests would only chain
+        # the backoff. Also stop when the round has burned its wall-clock
+        # budget (a dead-slow network timing out per request must not stall
+        # the caller linearly with the account count). Accounts left
+        # unattempted keep their (older) stamps and lead the next round.
         fetched: dict[str, dict | str | None] = {}
-        if to_fetch:
-            with ThreadPoolExecutor() as executor:
-                fetched = dict(zip(
-                    (str(info[0]) for info in to_fetch),
-                    executor.map(fetch, to_fetch),
-                ))
+        rate_limited = False
+        round_start = time.time()
+        for info in to_fetch:
+            if fetched and time.time() - round_start > _USAGE_ROUND_BUDGET:
+                break
+            res = fetch(info)
+            fetched[str(info[0])] = res
+            if res == USAGE_RATE_LIMITED:
+                rate_limited = True
+                break
 
         # Merge: a fresh usage dict wins; a DEFINITIVE failure this round
         # (USAGE_TOKEN_EXPIRED / USAGE_NO_CREDENTIALS — the credential just
         # failed) overrides any stale cached dict so account_headroom resolves
         # to None ("unknown" → never auto-selected by best/next-available);
         # TRANSIENT/ambiguous results (a bare None network blip, or
-        # USAGE_RATE_LIMITED) retain the prior good dict for display resilience;
-        # otherwise store the sentinel/None. Accounts not fetched this round take
-        # their prior cached value.
-        rate_limited = False
-        result_map: dict[str, dict | str | None] = {}
+        # USAGE_RATE_LIMITED) retain the prior good dict for display
+        # resilience. Every ATTEMPTED account is stamped ``now`` — even on
+        # failure — so ordering rotates and a broken account isn't hammered
+        # every tick; unattempted accounts keep their prior entry unchanged
+        # (their stamps keep aging, putting them first next round).
+        result_entries: dict[str, dict] = {}
         for k in account_keys:
+            prior_entry = prior.get(k)
             if k in fetched:
                 val = fetched[k]
-                if val == USAGE_RATE_LIMITED:
-                    rate_limited = True
-                if isinstance(val, dict):
-                    result_map[k] = val
-                elif val in (USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS):
-                    # Definitive failure: do NOT mask it with a stale dict —
-                    # the decision path must see "unknown", not fake headroom.
-                    result_map[k] = val
-                elif isinstance(prior.get(k), dict):
-                    result_map[k] = prior[k]
+                if isinstance(val, dict) or val in (
+                    USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS
+                ):
+                    result_entries[k] = {"usage": val, "fetchedAt": now}
+                elif prior_entry is not None and isinstance(
+                    prior_entry["usage"], dict
+                ):
+                    result_entries[k] = {
+                        "usage": prior_entry["usage"], "fetchedAt": now
+                    }
                 else:
-                    result_map[k] = val
+                    result_entries[k] = {"usage": val, "fetchedAt": now}
+            elif prior_entry is not None:
+                result_entries[k] = prior_entry
             else:
-                result_map[k] = prior.get(k)
+                result_entries[k] = {"usage": None, "fetchedAt": 0.0}
 
-        write_cache(usage_cache_path, result_map)
+        write_cache(usage_cache_path, result_entries)
         if rate_limited:
             self._set_rate_limited_until(time.time() + _DEFAULT_BACKOFF)
-        return [result_map[k] for k in account_keys]
+        return [result_entries[k]["usage"] for k in account_keys]
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → usage entry (cache-first) for managed accounts."""
@@ -2279,8 +2428,11 @@ class ClaudeAccountSwitcher:
         Returns ``USAGE_NO_CREDENTIALS`` when the live store has no usable token, a
         usage dict on success, ``USAGE_TOKEN_EXPIRED`` when the token is expired and
         Claude Code owns it, or ``None`` when the fetch fails. Reuses the same
-        ``cache/usage.json`` list_accounts writes — cache-first — and delegates the
-        owner-aware refresh decision to ``_fetch_active_usage``.
+        ``cache/usage.json`` list_accounts writes — cache-first, speaking the same
+        per-account ``{"usage", "fetchedAt"}`` entry format as ``_collect_usage``
+        (freshness judged per entry, merge-writes never wipe other accounts'
+        entries) — and delegates the owner-aware refresh decision to
+        ``_fetch_active_usage``.
         """
         creds = self._read_credentials() or ""
         if looks_like_api_key(creds):
@@ -2289,20 +2441,24 @@ class ClaudeAccountSwitcher:
         if not creds or not oauth.extract_access_token(creds):
             return USAGE_NO_CREDENTIALS
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
-        cached = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
-        if (cached is not MISSING and isinstance(cached, dict)
-                and account_num in cached):
-            return cached[account_num]
+        cached = read_cache(usage_cache_path, _FOREVER, default=None)
+        if isinstance(cached, dict) and account_num in cached:
+            entry = _usage_cache_entry(cached[account_num])
+            if _usage_entry_fresh(entry, _USAGE_CACHE_TTL, time.time()):
+                return entry["usage"]
         # Fetch OUTSIDE the lock: _fetch_active_usage does network I/O and its
         # persist callback re-acquires the lock (non-reentrant — must not nest).
         usage = self._fetch_active_usage(account_num, current_email, creds)
         # Serialize the cache read-merge-write under the lock so a concurrent
         # writer (e.g. _collect_usage / another active-usage fetch) can't clobber
-        # this slot's entry. Re-read inside the lock so we merge onto the latest.
+        # this slot's entry. Re-read inside the lock (ignoring file age — other
+        # accounts' entries and their freshness stamps must survive the merge)
+        # and write this slot as a stamped entry.
         with self._sequence_lock():
-            latest = read_cache(usage_cache_path, _USAGE_CACHE_TTL)
-            existing = latest if (latest is not MISSING and isinstance(latest, dict)) else {}
-            existing[account_num] = usage
+            latest = read_cache(usage_cache_path, _FOREVER, default=None)
+            existing = latest if isinstance(latest, dict) else {}
+            existing = {k: _usage_cache_entry(v) for k, v in existing.items()}
+            existing[account_num] = {"usage": usage, "fetchedAt": time.time()}
             write_cache(usage_cache_path, existing)
         return usage
 
@@ -2851,8 +3007,41 @@ class ClaudeAccountSwitcher:
                         message=f"Already on Account-{target_account} ({email})",
                     )
 
+        # Never discard an unmanaged live login: the switch below would take
+        # the direct-activation path, which backs up nothing — the login's
+        # credentials would be silently lost. Adopt it into a slot first so
+        # the switch backs it up as the "current" account. A failed adoption
+        # (e.g. an API-key login) degrades to the old discard behavior with a
+        # warning rather than blocking the switch the user asked for.
+        adopt_warnings: list[str] = []
+        try:
+            adopted = self.adopt_unmanaged_active()
+        except Exception as e:
+            adopted = None
+            self._logger.warning(
+                "could not adopt unmanaged live login before switch: %s", e
+            )
+            adopt_warnings.append(
+                f"Active account could not be added before switching: {e}"
+            )
+            if not json_output:
+                warning(f"Active account could not be added before switching: {e}")
+        if adopted is not None:
+            num, email = adopted
+            adopt_warnings.append(
+                f"Adopted unmanaged account {email} as Account-{num} before switching"
+            )
+            if not json_output:
+                print(
+                    f"{accent('Notice:')} Active account '{email}' was not managed; "
+                    f"added as Account-{num}."
+                )
+
         op = self._perform_switch(target_account, emit_output=not json_output)
-        return self._switch_result_from_op(op, "direct") if json_output else None
+        return (
+            self._switch_result_from_op(op, "direct", adopt_warnings)
+            if json_output else None
+        )
 
     def set_switch_notifier(self, callback) -> None:
         """Register a ``callback(account_num: int, email: str)`` fired on every
@@ -3076,6 +3265,11 @@ class ClaudeAccountSwitcher:
                         "Current account credential is empty; refusing to overwrite "
                         "its backup"
                     )
+                # Same fail-closed rule for a token-less payload: after a
+                # /logout the keychain item can survive holding only mcpOAuth
+                # entries — non-empty, but backing it up would destroy the
+                # slot's only good backup.
+                self._reject_tokenless_live_capture(original_creds)
                 original_config = config_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")

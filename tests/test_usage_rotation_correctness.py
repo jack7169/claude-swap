@@ -119,7 +119,7 @@ class TestCollectUsageDefinitiveFailure:
 
         # The cache file wraps the usage map in a {"timestamp", "data"} envelope.
         written = json.loads((s.backup_dir / "cache" / "usage.json").read_text())
-        assert written["data"]["2"] == USAGE_TOKEN_EXPIRED
+        assert written["data"]["2"]["usage"] == USAGE_TOKEN_EXPIRED
 
 
 class TestCollectUsageTransientFailure:

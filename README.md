@@ -122,6 +122,12 @@ Claude's OAuth login in your browser and adds the account automatically once you
 approve — no CLI or pre-obtained token needed. Browser sign-in is add-only: it
 never changes your active account.
 
+**New logins are adopted automatically.** If you sign into a different account
+with `claude /login` while the menu bar is running, the next refresh (within a
+second or two) detects that the live login isn't in your account list, adds it
+as a new slot, marks it active, and posts a notification. API-key logins can't
+be captured this way — add those with *From setup-token…* / `cswap --add-token`.
+
 **Auto-switch.** Enable *Settings → Auto-switch accounts* to have the app
 switch automatically when the active account crosses a usage threshold. When the
 active account hits the threshold on its 5h or 7d window, it switches to the

@@ -41,11 +41,11 @@ class TestCollectUsageForceRefresh:
         monkeypatch.setattr(_oauth, "fetch_usage_for_account", fake)
 
     def _seed_fresh_cache(self, s):
-        """Write a <15s-old usage.json whose keys match the account keys."""
+        """Write a usage.json where every account's entry is freshly stamped."""
         cache_path = s.backup_dir / "cache" / "usage.json"
         write_cache(cache_path, {
-            "1": {"five_hour": {"pct": 11.0}},
-            "2": {"five_hour": {"pct": 22.0}},
+            "1": {"usage": {"five_hour": {"pct": 11.0}}, "fetchedAt": _time.time()},
+            "2": {"usage": {"five_hour": {"pct": 22.0}}, "fetchedAt": _time.time()},
         })
 
     def test_force_false_uses_fresh_cache_without_network(self, temp_home, monkeypatch):

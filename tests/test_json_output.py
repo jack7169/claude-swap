@@ -293,7 +293,12 @@ class TestSwitchJson:
         self, temp_home: Path, mock_claude_config: Path,
         sample_sequence_data: dict,
     ):
-        """Current live account unmanaged → --switch-to proceeds, from.number is null."""
+        """Current live account unmanaged → --switch-to adopts it first.
+
+        The unmanaged login is captured into a new slot before the switch (its
+        credentials must survive; the direct-activation path would discard
+        them), so ``from.number`` reports the adopted slot.
+        """
         # Managed accounts use other emails; the live account (test@example.com)
         # is not among them.
         switcher = ClaudeAccountSwitcher()
@@ -313,8 +318,10 @@ class TestSwitchJson:
             for p in patches:
                 p.stop()
         assert result["switched"] is True
-        assert result["from"] == {"number": None, "email": "test@example.com"}
+        assert result["from"] == {"number": 3, "email": "test@example.com"}
         assert result["to"]["number"] == 2
+        # The adopted slot preserves the previously-unmanaged credentials.
+        assert creds[("3", "test@example.com")] == live_creds
 
     def test_switch_to_ambiguous_email_raises(
         self, temp_home: Path, mock_claude_config: Path,

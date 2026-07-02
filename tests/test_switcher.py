@@ -519,9 +519,11 @@ class TestStatusCache:
         switcher._setup_directories()
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
+        import time as _t
         cached_usage = {
-            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
-                  "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
+            "1": {"usage": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
+                            "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
+                  "fetchedAt": _t.time()},
         }
         write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
 
@@ -566,7 +568,7 @@ class TestStatusCache:
         cache_path = switcher.backup_dir / "cache" / "usage.json"
         cached = read_cache(cache_path, 300)
         assert cached is not MISSING
-        assert cached["1"] == usage_result
+        assert cached["1"]["usage"] == usage_result
 
     def test_status_preserves_other_accounts_in_cache(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
@@ -594,8 +596,10 @@ class TestStatusCache:
 
         cached = read_cache(cache_path, 300)
         assert cached is not MISSING
-        assert cached["1"] == usage_result
-        assert cached["2"] == {"five_hour": {"pct": 80}}
+        assert cached["1"]["usage"] == usage_result
+        # The legacy bare entry survives the merge, upgraded to the stamped
+        # format (fetchedAt=0: never observed fresh).
+        assert cached["2"]["usage"] == {"five_hour": {"pct": 80}}
 
 
 class TestListAccountsUsage:
@@ -759,11 +763,15 @@ class TestListAccountsUsage:
         switcher._write_json(switcher.sequence_file, sample_sequence_data)
 
         # Pre-populate cache with usage data for both accounts
+        # Entries carry per-account freshness stamps; fresh stamps mean
+        # no account is due a re-fetch.
         cached_usage = {
-            "1": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
-                   "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
-            "2": {"five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m"},
-                   "seven_day": {"pct": 90, "clock": "Jan 3 03:00", "countdown": "3d"}},
+            "1": {"usage": {"five_hour": {"pct": 25, "clock": "Jan 1 03:00", "countdown": "1h"},
+                            "seven_day": {"pct": 60, "clock": "Jan 2 03:00", "countdown": "2d"}},
+                  "fetchedAt": time.time()},
+            "2": {"usage": {"five_hour": {"pct": 80, "clock": "Jan 1 04:00", "countdown": "30m"},
+                            "seven_day": {"pct": 90, "clock": "Jan 3 03:00", "countdown": "3d"}},
+                  "fetchedAt": time.time()},
         }
         write_cache(switcher.backup_dir / "cache" / "usage.json", cached_usage)
 

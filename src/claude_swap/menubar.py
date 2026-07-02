@@ -777,10 +777,20 @@ def _worker_impl(app, full: bool, force: bool = False) -> None:
         # concurrent main-thread read can't observe a torn state.
         with app._refresh_guard.run_exclusive():
             app.switcher.recheck_keychain()
+            # Adopt BEFORE the snapshot so an account signed in via
+            # `claude /login` renders checked-and-titled in this same pass
+            # (otherwise the live login is invisible: bare-icon title, no
+            # active row, auto-switch inert).
+            _maybe_adopt_unmanaged(app)
             snap = _snapshot(app.switcher, full=full, force=force)
         app.snapshot = snap
         app._snapshot_at = time.time()
-        if full:
+        # Stamp the full fetch only when it wasn't suppressed by the 429
+        # backoff — a backoff round is served from cache, and claiming it as
+        # fresh would let plan_auto_tick evaluate the auto-switch on frozen
+        # usage. Left unstamped, the next tick promotes to full again and
+        # retries once the backoff lifts.
+        if full and not _usage_backoff_active(app.switcher):
             app._last_full_fetch = app._snapshot_at
         app._dirty = True  # picked up by on_sync_tick on the main thread
     finally:
@@ -789,6 +799,87 @@ def _worker_impl(app, full: bool, force: bool = False) -> None:
         # at a time, since the follow-up re-claims the freed slot).
         if app._refresh_guard.finish_and_take_pending():
             _refresh_async_impl(app, full=True, force=True)
+
+
+def _usage_backoff_active(switcher) -> bool:
+    """True while the per-IP 429 backoff suppresses usage fetching.
+
+    Keeps ``_last_full_fetch`` honest: a full refresh that ran during the
+    backoff was served from cache, so the auto-switch must not treat it as
+    freshly fetched data. Never raises — test harnesses' fake switchers may
+    not implement the probe (missing probe ⇒ no backoff ⇒ stamp as before).
+    """
+    try:
+        return time.time() < switcher._rate_limited_until()
+    except Exception:
+        return False
+
+
+_ADOPT_SETTLE_SECONDS = 3.0  # min age of a sighted login before it is adopted
+_ADOPT_RETRY_SECONDS = 900.0  # cooldown before re-attempting a failed adoption
+
+
+def _maybe_adopt_unmanaged(app) -> tuple[str, str] | None:
+    """Adopt an unmanaged live login into the managed list; never raises.
+
+    Runs each refresh-worker cycle before the snapshot. Import-safe: no
+    rumps; notify.notify (osascript) works from the non-bundled LaunchAgent.
+
+    Settle debounce: `claude /login` writes ~/.claude.json (identity) and the
+    credential store as two separate writes, and the config-mtime watcher can
+    land us here within ~1s of the first one — adopting then could capture the
+    NEW identity with the OLD tokens. The same identity must therefore have
+    been first sighted at least ``_ADOPT_SETTLE_SECONDS`` ago (elapsed time,
+    not pass count — two worker passes can run back-to-back).
+
+    Failures (API-key login, keychain hiccup) are notified once per identity
+    and retried only after ``_ADOPT_RETRY_SECONDS`` — transient errors
+    self-heal without a manual re-login, hopeless logins don't hammer the
+    Keychain or spam notifications every tick. Sighting a different login
+    resets both the settle window and the cooldown.
+    """
+    try:
+        identity = app.switcher._get_current_account()
+    except Exception:
+        return None
+    now = time.time()
+    if identity is None:
+        app._adopt_seen_identity = None
+        return None
+    if identity != getattr(app, "_adopt_seen_identity", None):
+        # First sighting of this login: start the settle window and forget
+        # the previous login's failure cooldown.
+        app._adopt_seen_identity = identity
+        app._adopt_seen_at = now
+        app._adopt_retry_at = 0.0
+        return None
+    if now - getattr(app, "_adopt_seen_at", 0.0) < _ADOPT_SETTLE_SECONDS:
+        return None
+    if now < getattr(app, "_adopt_retry_at", 0.0):
+        return None
+    try:
+        adopted = app.switcher.adopt_unmanaged_active()
+    except Exception as e:
+        app._adopt_retry_at = now + _ADOPT_RETRY_SECONDS
+        try:
+            app.switcher._logger.warning("auto-add of live login failed: %s", e)
+        except Exception:
+            pass
+        if identity != getattr(app, "_adopt_notified_identity", None):
+            app._adopt_notified_identity = identity
+            notify.notify(
+                "claude-swap",
+                f"Couldn't add {identity[0]}: {e}",
+            )
+        return None
+    if adopted is None:
+        return None
+    num, email = adopted
+    notify.notify(
+        "claude-swap",
+        f"Added Account-{num}: {email} (from current login)",
+    )
+    return adopted
 
 
 def _offload_action(app_guard, work, on_done=None) -> bool:
@@ -1099,6 +1190,14 @@ def run(switcher) -> int:
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
             self._last_full_fetch = 0.0
+            # Auto-adoption state (see _maybe_adopt_unmanaged): the login
+            # last sighted + when (the settle debounce), the earliest time a
+            # failed adoption may retry, and the identity already notified
+            # about a failure (one banner per login, not one per tick).
+            self._adopt_seen_identity = None
+            self._adopt_seen_at = 0.0
+            self._adopt_retry_at = 0.0
+            self._adopt_notified_identity = None
             # Thread-safe in-flight guard: the compare-and-set that admits at
             # most one worker, plus the lock that confines the keychain-
             # capability-cache mutation to one thread at a time.
