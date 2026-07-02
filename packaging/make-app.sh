@@ -20,8 +20,18 @@ echo "==> generate icon (best-effort)"
 python "$ROOT/packaging/make-icon.py" || echo "icon generation skipped"
 
 echo "==> py2app build"
+# Build from a scratch dir with NO pyproject.toml. Run at the repo root,
+# setuptools applies [project].dependencies to the Distribution, and py2app
+# rejects any install_requires ("no longer supported", build_app.py). Deps are
+# already installed in the build venv and get bundled by py2app's own scan.
+# setup_app.py uses absolute paths, so the working directory is irrelevant to it.
+RUNDIR="$ROOT/build/py2app-run"
+rm -rf "$RUNDIR"
+mkdir -p "$RUNDIR"
+( cd "$RUNDIR" && python "$ROOT/packaging/setup_app.py" py2app )
 rm -rf "$ROOT/dist/claude-swap.app"
-( cd "$ROOT" && python packaging/setup_app.py py2app )
+mkdir -p "$ROOT/dist"
+mv "$RUNDIR/dist/claude-swap.app" "$ROOT/dist/claude-swap.app"
 
 APP="$ROOT/dist/claude-swap.app"
 echo "==> ad-hoc code sign"
