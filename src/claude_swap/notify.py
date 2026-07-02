@@ -13,6 +13,8 @@ import logging
 import subprocess
 import sys
 
+from claude_swap import spawn
+
 _logger = logging.getLogger("claude-swap")
 
 # Pin the absolute path (mirrors macos_keychain._SECURITY) so a PATH-injected
@@ -53,10 +55,14 @@ def notify(title: str, message: str) -> None:
     if sys.platform != "darwin":
         return
     try:
-        subprocess.run(
-            [_OSASCRIPT, "-e", _build_notification_script(title, message)],
-            capture_output=True,
-            timeout=5,
-        )
+        # Serialize with the other menu-bar spawns: an osascript notification
+        # fired during auto-switch must not fork() concurrently with a refresh
+        # worker (malloc atfork livelock). See claude_swap.spawn.
+        with spawn.fork_lock:
+            subprocess.run(
+                [_OSASCRIPT, "-e", _build_notification_script(title, message)],
+                capture_output=True,
+                timeout=5,
+            )
     except Exception:
         _logger.debug("notification failed", exc_info=True)

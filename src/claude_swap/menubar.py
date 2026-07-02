@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -741,6 +742,49 @@ def _maybe_rebuild_on_dirty(app) -> bool:
     return True
 
 
+# --- worker-concurrency census (instrumentation) --------------------------
+# The refresh guard's invariant is exactly one live _worker_impl at a time (see
+# _RefreshGuard). In the wild it was observed violated — ~14 workers live at
+# once, all wedged in concurrent fork() — a runaway we could not reproduce
+# headless (the guard provably conserves concurrency at 1 in isolation). This
+# census is a canary: it counts admitted-but-not-finished workers and, the
+# instant concurrency exceeds 1, logs the admitting call stack so the next live
+# occurrence is fully captured. Cost in the normal path is one lock + int per
+# worker; a stack is formatted only on the anomaly.
+_worker_census_lock = threading.Lock()
+_live_workers = 0
+
+
+def _census_admit(app) -> int:
+    """Record a newly admitted worker; return the live count after admitting.
+
+    Logs a warning with the admitting stack when the count exceeds the guard's
+    invariant of 1. Never raises.
+    """
+    global _live_workers
+    with _worker_census_lock:
+        _live_workers += 1
+        count = _live_workers
+    if count > 1:
+        try:
+            app.switcher._logger.warning(
+                "menubar refresh concurrency anomaly: %d workers live at once "
+                "(guard invariant is 1). Admitting call stack:\n%s",
+                count, "".join(traceback.format_stack()),
+            )
+        except Exception:
+            pass
+    return count
+
+
+def _census_release() -> None:
+    """Record a finished worker. Never raises; floors at zero."""
+    global _live_workers
+    with _worker_census_lock:
+        if _live_workers > 0:
+            _live_workers -= 1
+
+
 def _refresh_async_impl(app, full: bool = False, force: bool = False) -> bool:
     """Start a background refresh worker, honoring the in-flight guard.
 
@@ -754,7 +798,16 @@ def _refresh_async_impl(app, full: bool = False, force: bool = False) -> bool:
     """
     if not app._refresh_guard.try_begin(force=force):
         return False
-    app._spawn(_worker_impl, (app, full, force))
+    # Census admit is paired with _census_release in the worker's finally. If
+    # the spawn itself fails, release both the census slot and the guard so a
+    # failed thread-create can't wedge future refreshes.
+    _census_admit(app)
+    try:
+        app._spawn(_worker_impl, (app, full, force))
+    except BaseException:
+        _census_release()
+        app._refresh_guard.finish()
+        raise
     return True
 
 
@@ -794,6 +847,9 @@ def _worker_impl(app, full: bool, force: bool = False) -> None:
             app._last_full_fetch = app._snapshot_at
         app._dirty = True  # picked up by on_sync_tick on the main thread
     finally:
+        # Record this worker as finished (paired with the _census_admit at its
+        # spawn) BEFORE any follow-up admit, so the census reflects reality.
+        _census_release()
         # Release the slot and atomically learn whether a forced refresh was
         # queued meanwhile; if so, run it now (exactly one worker still active
         # at a time, since the follow-up re-claims the freed slot).

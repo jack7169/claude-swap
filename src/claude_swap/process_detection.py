@@ -16,6 +16,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from claude_swap import spawn
 from claude_swap.paths import get_claude_config_home
 
 logger = logging.getLogger(__name__)
@@ -105,19 +106,23 @@ def get_process_start_time(pid: int) -> float | None:
     if sys.platform == "win32":
         return None
     try:
-        proc = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "lstart="],
-            capture_output=True,
-            text=True,
-            check=False,
-            # Force a stable C locale so lstart's weekday/month names are always
-            # English and the strptime parse below works regardless of the
-            # caller's LC_TIME; without this a non-English locale silently
-            # disables PID-reuse detection.
-            env={**os.environ, "LC_ALL": "C", "LANG": "C"},
-            # Bound a wedged ps so this hot path can't hang.
-            timeout=2,
-        )
+        # Serialize the fork with the keychain spawns: concurrent fork() from the
+        # multithreaded menu-bar process livelocks the malloc atfork handlers.
+        # See claude_swap.spawn.
+        with spawn.fork_lock:
+            proc = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                capture_output=True,
+                text=True,
+                check=False,
+                # Force a stable C locale so lstart's weekday/month names are
+                # always English and the strptime parse below works regardless
+                # of the caller's LC_TIME; without this a non-English locale
+                # silently disables PID-reuse detection.
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+                # Bound a wedged ps so this hot path can't hang.
+                timeout=2,
+            )
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         logger.debug("Could not read start time for pid %s: %s", pid, exc)
         return None

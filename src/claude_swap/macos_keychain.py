@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 import subprocess
 
+from claude_swap import spawn
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
 # A command line longer than this is truncated mid-argument: it fails to write
 # while leaving any previous entry intact (Claude Code #30337). 64 bytes of
@@ -58,6 +59,16 @@ _TIMEOUT = 5.0
 # PATH must not be able to intercept secrets. ``/usr/bin/security`` is present on
 # every macOS.
 _SECURITY = "/usr/bin/security"
+
+
+def _run(*args, **kwargs):
+    """``subprocess.run`` serialized process-wide so only one ``fork()`` runs at
+    a time. Forking concurrently from the multithreaded menu-bar process
+    livelocks in the malloc atfork handlers; see :mod:`claude_swap.spawn`. The
+    ``subprocess.run`` reference stays in this module so tests can patch it.
+    """
+    with spawn.fork_lock:
+        return subprocess.run(*args, **kwargs)
 
 
 class KeychainError(Exception):
@@ -169,7 +180,7 @@ def get_password(service: str, account: str) -> str | None:
     _validate_name(account)
     _validate_name(service)
     try:
-        result = subprocess.run(
+        result = _run(
             [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
             capture_output=True,
             text=True,
@@ -213,7 +224,7 @@ def item_exists(service: str, account: str) -> bool:
     if any(ord(ch) < 0x20 for ch in account) or any(ord(ch) < 0x20 for ch in service):
         return False
     try:
-        result = subprocess.run(
+        result = _run(
             [_SECURITY, "find-generic-password", "-a", account, "-s", service],
             capture_output=True,
             text=True,
@@ -253,7 +264,7 @@ def set_password(service: str, account: str, password: str) -> None:
         argv.append(keychain)
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
-            result = subprocess.run(
+            result = _run(
                 [_SECURITY, "-i"],
                 input=command,
                 capture_output=True,
@@ -264,7 +275,7 @@ def set_password(service: str, account: str, password: str) -> None:
             # Overflows the stdin line buffer; fall back to argv. Hex in argv is
             # recoverable by a determined observer but defeats naive plaintext-grep
             # rules, and the alternative — silent corruption — is strictly worse.
-            result = subprocess.run(
+            result = _run(
                 argv,
                 capture_output=True,
                 text=True,
@@ -294,7 +305,7 @@ def delete_password(service: str, account: str) -> None:
     _validate_name(account)
     _validate_name(service)
     try:
-        result = subprocess.run(
+        result = _run(
             [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
             capture_output=True,
             text=True,

@@ -186,6 +186,42 @@ def test_forced_refresh_while_in_flight_schedules_followup(monkeypatch):
     assert started == [True, True]
 
 
+def test_worker_census_logs_anomaly_when_concurrency_exceeds_one(monkeypatch):
+    """The census logs a warning (with a stack) only when >1 worker is live.
+
+    Instrumentation to capture the production worker-multiplication runaway: the
+    guard's invariant is one live refresh worker; a second concurrent admit is an
+    anomaly and must be recorded with the admitting call stack.
+    """
+    warnings: list[tuple] = []
+
+    class _App:
+        switcher = type(
+            "S", (),
+            {"_logger": type("L", (), {"warning": staticmethod(
+                lambda *a, **k: warnings.append(a))})()},
+        )()
+
+    monkeypatch.setattr(menubar, "_live_workers", 0, raising=False)
+
+    app = _App()
+    assert menubar._census_admit(app) == 1  # first worker: within invariant
+    assert warnings == []                    # no anomaly logged
+
+    assert menubar._census_admit(app) == 2   # second concurrent worker: anomaly
+    assert len(warnings) == 1
+    logged = " ".join(str(x) for x in warnings[0])
+    assert "concurrency" in logged.lower()
+
+    menubar._census_release()
+    menubar._census_release()
+    # released back to zero; a fresh single admit is again clean
+    warnings.clear()
+    assert menubar._census_admit(app) == 1
+    assert warnings == []
+    menubar._census_release()
+
+
 def test_nonforced_refresh_while_in_flight_is_dropped(monkeypatch):
     """A plain (non-forced) tick while in flight is still dropped (no follow-up)."""
     started = []
