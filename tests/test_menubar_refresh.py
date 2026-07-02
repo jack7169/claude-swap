@@ -560,6 +560,40 @@ def test_plan_auto_tick_refreshes_once_backoff_clears():
     ) == "refresh"
 
 
+# Display auto-refresh must run even when auto-switch is OFF. The default-mode
+# refresh_timer is paused while the menu is open, and the common-modes tick only
+# refreshed when auto-switch was enabled — so with auto-switch off and the menu
+# open, usage froze. plan_display_refresh drives a refresh from the common-modes
+# tick, gated so it fires at most once per cadence and never while in flight.
+
+def test_plan_display_refresh_fires_when_cadence_elapsed():
+    assert menubar.plan_display_refresh(
+        now=100.0, last_snapshot_at=0.0, cadence=30, in_flight=False
+    ) is True
+
+
+def test_plan_display_refresh_waits_within_cadence():
+    assert menubar.plan_display_refresh(
+        now=10.0, last_snapshot_at=0.0, cadence=30, in_flight=False
+    ) is False
+
+
+def test_plan_display_refresh_skips_while_in_flight():
+    assert menubar.plan_display_refresh(
+        now=100.0, last_snapshot_at=0.0, cadence=30, in_flight=True
+    ) is False
+
+
+def test_refresh_countdown_text_counts_down():
+    text = menubar.refresh_countdown_text(12.0, 30)
+    assert text.startswith("Next refresh:")
+    assert text.endswith("(every 30s)")
+
+
+def test_refresh_countdown_text_shows_activity_at_zero():
+    assert menubar.refresh_countdown_text(0.0, 30) == "Refreshing now… (every 30s)"
+
+
 def test_rebuild_deferred_while_menu_open_then_runs_on_close():
     """A rebuild requested while the menu is open is deferred (tearing down the
     NSMenu under an open menu collapses it -> flicker) and runs on close."""

@@ -214,6 +214,35 @@ def auto_switch_countdown_text(seconds_to_next: float, cadence: int) -> str:
     return f"Next check: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
 
 
+def refresh_countdown_text(seconds_to_next: float, cadence: int) -> str:
+    """The live 'next display refresh' line, shown when auto-switch is OFF.
+
+    Auto-switch on has its own 'Next check' countdown; when it is off this shows
+    that usage still auto-refreshes on the display cadence. Mirrors
+    :func:`auto_switch_countdown_text` — an activity hint at zero rather than a
+    frozen ``0:00`` while the (background) refresh runs.
+    """
+    if seconds_to_next <= 0:
+        return f"Refreshing now… (every {cadence}s)"
+    return f"Next refresh: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
+
+
+def plan_display_refresh(
+    *, now: float, last_snapshot_at: float, cadence: int, in_flight: bool
+) -> bool:
+    """Whether the common-modes tick should fire a display refresh (auto-switch OFF).
+
+    Keeps usage current while the menu is open: the default-mode ``refresh_timer``
+    is paused during menu tracking, and the common-modes auto-tick only refreshes
+    when auto-switch is enabled. Gated on time-since-last-snapshot so it fires at
+    most once per ``cadence`` and never while a worker is in flight — ``_snapshot_at``
+    advances on every refresh (even cache-served ones), so this can't busy-spin.
+    """
+    if in_flight:
+        return False
+    return now - last_snapshot_at >= cadence
+
+
 def auto_switch_header_lines(
     enabled: bool, strategy: str, cadence: int, seconds_to_next: float
 ) -> list[str]:
@@ -1489,6 +1518,16 @@ def run(switcher) -> int:
             app = self.app
             if app.settings.auto_switch_enabled:
                 app._auto_tick()  # run the check in common modes (works while open)
+            elif plan_display_refresh(
+                now=time.time(),
+                last_snapshot_at=app._snapshot_at,
+                cadence=app.settings.refresh_interval,
+                in_flight=app._refresh_guard.in_flight,
+            ):
+                # Auto-switch off: keep usage fresh from the common-modes timer so
+                # the menu still updates while it's open (the default-mode
+                # refresh_timer is paused during menu tracking).
+                app.refresh_async(full=True)
             app._update_live_rows()
 
     class MenuBarApp(rumps.App):
@@ -1503,6 +1542,7 @@ def run(switcher) -> int:
             self._dirty = False
             self._menu_sig = None  # signature of the last rendered menu (3.3)
             self._countdown_item = None  # live "Next check:" header item, if any
+            self._refresh_countdown_item = None  # live "Next refresh:" item (auto-swap off)
             self._account_rows = []  # [(num, label_item, [detail_items])] for live updates
             self._menu_open = False  # set by the NSMenu delegate; gates rebuilds
             self.state = MenuBarState.load(state_path)
@@ -1639,6 +1679,15 @@ def run(switcher) -> int:
                 )
                 if item.title != text:
                     item.title = text
+
+            rc = self._refresh_countdown_item
+            if rc is not None and not self.settings.auto_switch_enabled:
+                rcadence = self.settings.refresh_interval
+                rtext = refresh_countdown_text(
+                    max(0.0, (self._snapshot_at + rcadence) - now), rcadence
+                )
+                if rc.title != rtext:
+                    rc.title = rtext
 
             by_num = {
                 num: (email, usage)
@@ -1785,6 +1834,19 @@ def run(switcher) -> int:
                 self.menu.add(item)
                 if self.settings.auto_switch_enabled and idx == len(header) - 1:
                     self._countdown_item = item  # the live "Next check:" line
+            # Auto-switch OFF has no "Next check" line, but usage still
+            # auto-refreshes on the display cadence — show a live "Next refresh:"
+            # countdown so that activity is visible (re-titled by _update_live_rows,
+            # so its text stays OUT of the rebuild signature).
+            self._refresh_countdown_item = None
+            if not self.settings.auto_switch_enabled:
+                rcadence = self.settings.refresh_interval
+                rsecs = max(0.0, (self._snapshot_at + rcadence) - time.time())
+                rc_item = rumps.MenuItem(
+                    refresh_countdown_text(rsecs, rcadence), callback=None
+                )
+                self.menu.add(rc_item)
+                self._refresh_countdown_item = rc_item
             # Auto-timer-start toggle: its own clickable line directly below the
             # Auto-swap header, mirroring on_toggle_autoswitch (flip -> save ->
             # rebuild, no restart). Keeps warming every idle account's 5h window.
