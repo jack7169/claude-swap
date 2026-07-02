@@ -9,6 +9,41 @@ from __future__ import annotations
 from claude_swap import notify
 
 
+def test_wire_switch_notifier_registers_on_darwin(monkeypatch):
+    monkeypatch.setattr(notify.sys, "platform", "darwin")
+    posted = []
+    monkeypatch.setattr(notify, "notify", lambda title, msg: posted.append((title, msg)))
+
+    class _SW:
+        cb = None
+
+        def set_switch_notifier(self, callback):
+            self.cb = callback
+
+    sw = _SW()
+    notify.wire_switch_notifier(sw)
+    assert sw.cb is not None
+    sw.cb(3, "x@y.com")
+    assert len(posted) == 1
+    title, message = posted[0]
+    assert title == "claude-swap"
+    assert "Account-3" in message and "x@y.com" in message
+
+
+def test_wire_switch_notifier_noop_off_darwin(monkeypatch):
+    monkeypatch.setattr(notify.sys, "platform", "linux")
+
+    class _SW:
+        called = False
+
+        def set_switch_notifier(self, callback):
+            self.called = True
+
+    sw = _SW()
+    notify.wire_switch_notifier(sw)
+    assert sw.called is False
+
+
 def test_build_notification_script_basic():
     assert notify._build_notification_script("claude-swap", "Switched to 2") == (
         'display notification "Switched to 2" with title "claude-swap"'

@@ -371,17 +371,11 @@ Examples:
 
         # Wire the unified swap notifier (macOS only — osascript posts the alert).
         # The same switcher instance is handed to --menubar, so CLI swaps, menu
-        # clicks, and auto-switch all notify through this one path.
-        if sys.platform == "darwin":
-            from claude_swap import notify as _notify
+        # clicks, and auto-switch all notify through this one path. app_main.py
+        # (the bundled .app) calls the same helper so it notifies too.
+        from claude_swap import notify as _notify
 
-            switcher.set_switch_notifier(
-                lambda num, email: _notify.notify(
-                    "claude-swap",
-                    f"Switched to Account-{num} ({email}) — restart Claude Code "
-                    "to apply (active within ~30s).",
-                )
-            )
+        _notify.wire_switch_notifier(switcher)
 
         if args.add_account:
             switcher.add_account(slot=args.slot)

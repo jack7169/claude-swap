@@ -50,6 +50,26 @@ def _build_notification_script(title: str, message: str) -> str:
     )
 
 
+def wire_switch_notifier(switcher) -> None:
+    """Register the standard swap notifier on ``switcher`` (macOS only).
+
+    Shared by ``cli.main`` and the bundled app's ``app_main.main`` so a switch
+    from ANY entry point — CLI command, menu-bar click, or auto-switch — posts
+    the same alert. The bundled ``.app`` bypasses the CLI, so it must call this
+    too or its switches would fire ``_announce_switch`` against a ``None``
+    notifier and stay silent. No-op off macOS (osascript is mac-only).
+    """
+    if sys.platform != "darwin":
+        return
+    switcher.set_switch_notifier(
+        lambda num, email: notify(
+            "claude-swap",
+            f"Switched to Account-{num} ({email}) — restart Claude Code "
+            "to apply (active within ~30s).",
+        )
+    )
+
+
 def notify(title: str, message: str) -> None:
     """Post a macOS notification. No-op off macOS; never raises."""
     if sys.platform != "darwin":
