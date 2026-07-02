@@ -17,11 +17,13 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import notify, oauth
+from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.printer import abbreviate_path, entrypoint_label, ide_short_name
 from claude_swap.process_detection import get_running_instances
@@ -30,6 +32,7 @@ ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (15, 30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
 AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
+WARM_COOLDOWN = 600  # seconds an account is skipped after a successful warm/send
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 15, 30, 60, 180, 300)  # 0 == with display refresh
 AUTO_STRATEGY_CHOICES: tuple[str, ...] = ("reactive", "consume-first")
 AUTO_HYSTERESIS = 5.0  # dead band (percent) that prevents auto-switch thrash
@@ -49,6 +52,7 @@ class MenuBarSettings:
     auto_switch_cooldown: int = 600
     auto_switch_interval: int = 0  # 0 == evaluate with each display refresh
     auto_switch_strategy: str = "reactive"  # one of AUTO_STRATEGY_CHOICES
+    auto_timer_start_enabled: bool = False
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -225,6 +229,21 @@ def auto_switch_header_lines(
         f"Method: {auto_switch_strategy_label(strategy)}",
         auto_switch_countdown_text(seconds_to_next, cadence),
     ]
+
+
+def auto_timer_start_label(enabled: bool) -> str:
+    """Menu label for the auto-timer-start toggle line (ON/OFF)."""
+    return f"Auto timer start: {'ON' if enabled else 'OFF'}"
+
+
+def toggle_auto_timer_start(settings: "MenuBarSettings") -> "MenuBarSettings":
+    """Return ``settings`` with ``auto_timer_start_enabled`` negated (pure).
+
+    Import-safe helper so the menu callback's flip logic is unit-testable
+    without rumps; the callback mutates in place, this returns the same object.
+    """
+    settings.auto_timer_start_enabled = not settings.auto_timer_start_enabled
+    return settings
 
 
 def format_account_label(
@@ -604,6 +623,165 @@ def plan_auto_switch(
     return ("noop", None)
 
 
+def select_warm_candidates(
+    accounts: list[tuple[int, str, str, dict | str | None]],
+    now: float,
+    cooldowns: dict[str, float],
+    cooldown_seconds: int = WARM_COOLDOWN,
+) -> list[int]:
+    """Managed accounts whose 5-hour window is idle and due for a warm/send.
+
+    ``accounts`` is the warm-cycle input shape ``(num, email, creds, usage)`` —
+    the display snapshot shape ``(num, email, is_active, usage)`` with the
+    active flag replaced by the stored credential (the token needed to send).
+    Candidacy does not depend on active status: an idle active account is warmed
+    exactly like an idle backup (per the design, warming never switches).
+
+    An account is a candidate when ALL hold:
+
+    * its credential is not a raw managed API key (``looks_like_api_key`` — an
+      API-key account has no subscription window and a send would bill it);
+    * its usage is a dict with a ``five_hour`` dict entry (a string sentinel
+      like ``"rate limited"``, ``None``, or a missing 5h window means there is
+      no window to start — not "idle");
+    * that ``five_hour`` dict has **no** ``resets_at`` (the window has not
+      started — mirrors ``oauth.build_usage_result``, which sets ``resets_at``
+      only when the API returns one for an active window); and
+    * it is not within the per-account cooldown: ``now - cooldowns[str(num)]``
+      is at least ``cooldown_seconds`` (the cooldown prevents a double-send in
+      the gap before the just-started window's ``resets_at`` is reflected).
+
+    An OAuth account with no usable ``accessToken`` is still a candidate —
+    attempting and failing produces the health-check signal. Total — never
+    raises; ``now`` is passed in (no ``time.time()`` inside), matching the
+    ``plan_auto_*`` pure-function convention.
+    """
+    out: list[int] = []
+    for num, _email, creds, usage in accounts:
+        if looks_like_api_key(creds):
+            continue
+        if not isinstance(usage, dict):
+            continue
+        five_hour = usage.get("five_hour")
+        if not isinstance(five_hour, dict):
+            continue
+        if "resets_at" in five_hour:
+            continue  # window already counting down — nothing to start
+        if now - cooldowns.get(str(num), 0.0) < cooldown_seconds:
+            continue
+        out.append(num)
+    return out
+
+
+def warm_account(
+    creds: str,
+    *,
+    model: str = "claude-haiku-4-5",
+    max_tokens: int = 8,
+    timeout: float = 5.0,
+) -> tuple[str, str | None, str | None]:
+    """Send one warming request for a candidate account; classify the result.
+
+    Uses the account's stored backup token **directly** — no account switch, no
+    disruption to the live account. Proactively refreshes an expired token first
+    (reusing ``oauth.is_oauth_token_expired`` / ``oauth.refresh_oauth_credentials``)
+    so an about-to-expire backup token doesn't spuriously fail the health check.
+
+    Returns ``(status, reason, new_creds)``:
+
+    * ``("ok", None, new_creds_or_None)`` on a 2xx — the window is now warm;
+    * ``("error", reason, None)`` on a 401 / network error / any exception, or
+      when there's no usable ``accessToken`` (in which case no HTTP call is made).
+
+    ``new_creds`` is the refreshed credentials JSON when a refresh occurred (so
+    the caller can persist it via the switcher, exactly like
+    ``oauth.fetch_usage_for_account``'s persist path), else ``None``. Never
+    raises — every failure mode is folded into an ``("error", …)`` result.
+    """
+    oauth_data = oauth.extract_oauth_data(creds)
+    if not oauth_data:
+        return ("error", "no oauth credentials", None)
+
+    new_creds: str | None = None
+    if oauth_data.get("refreshToken") and oauth.is_oauth_token_expired(
+        oauth_data.get("expiresAt")
+    ):
+        refreshed = oauth.refresh_oauth_credentials(creds)
+        if refreshed:
+            new_creds = refreshed
+            oauth_data = oauth.extract_oauth_data(refreshed) or oauth_data
+
+    access_token = oauth_data.get("accessToken")
+    if not access_token:
+        return ("error", "no token", new_creds)
+
+    try:
+        oauth.send_warm_message(access_token, model, max_tokens, timeout)
+    except urllib.error.HTTPError as e:
+        return ("error", f"HTTP {e.code}", new_creds)
+    except urllib.error.URLError as e:
+        return ("error", str(e.reason), new_creds)
+    except Exception as e:  # never raise out of a warm attempt
+        return ("error", repr(e), new_creds)
+    return ("ok", None, new_creds)
+
+
+def run_warm_cycle(
+    *,
+    accounts: list[tuple[int, str, str, dict | str | None]],
+    now: float,
+    warmed_at: dict[str, float],
+    persist,
+    notify_fn=notify.notify,
+    warm=warm_account,
+    cooldown_seconds: int = WARM_COOLDOWN,
+) -> int:
+    """Warm every idle candidate once; record cooldowns, notify, persist refreshes.
+
+    Selects candidates via :func:`select_warm_candidates`, then for each sends a
+    single warming request through ``warm`` (defaults to :func:`warm_account`).
+    On success it stamps ``warmed_at[str(num)] = now`` (the dedup cooldown) and
+    counts it; on failure it posts a per-account banner
+    (``"Account-<n> timer start failed: <reason>"``) and does NOT record a
+    cooldown, so a broken account is retried next cycle. Refreshed credentials
+    returned by ``warm`` are persisted via ``persist(num, email, new_creds)``
+    (the switcher's write-back path) regardless of send outcome. After the loop,
+    a single summary banner (``"Started timers for N account(s)"``) is posted iff
+    at least one send succeeded — failures are per-account, successes summarized.
+
+    Returns the success count. Injected ``notify_fn`` / ``warm`` (mirroring
+    ``_maybe_auto_switch``'s injected deps) keep it unit-testable without HTTP or
+    Cocoa. Per-account work is wrapped so one exception can never abort the
+    cycle. Never raises.
+    """
+    by_num = {num: (email, creds) for num, email, creds, _usage in accounts}
+    candidates = select_warm_candidates(accounts, now, warmed_at, cooldown_seconds)
+    success = 0
+    for num in candidates:
+        email, creds = by_num[num]
+        try:
+            status, reason, new_creds = warm(creds)
+            if new_creds:
+                try:
+                    persist(num, email, new_creds)
+                except Exception:
+                    pass  # persistence failure must not abort the cycle
+            if status == "ok":
+                warmed_at[str(num)] = now
+                success += 1
+            else:
+                notify_fn(
+                    "claude-swap",
+                    f"Account-{num} timer start failed: {reason}",
+                )
+        except Exception:
+            # A single account's failure can never break the whole cycle.
+            notify_fn("claude-swap", f"Account-{num} timer start failed")
+    if success > 0:
+        notify_fn("claude-swap", f"Started timers for {success} account(s)")
+    return success
+
+
 def _snapshot(switcher, full: bool = True, force: bool = False) -> dict:
     """Fetch accounts + usage off the main thread. Returns a render snapshot.
 
@@ -685,6 +863,7 @@ def _snapshot_signature(snapshot: dict, settings: "MenuBarSettings") -> tuple:
         settings.auto_switch_cooldown,
         settings.auto_switch_interval,
         settings.refresh_interval,
+        settings.auto_timer_start_enabled,
     )
     return (
         snapshot.get("active_email"),
@@ -845,6 +1024,17 @@ def _worker_impl(app, full: bool, force: bool = False) -> None:
         # retries once the backoff lifts.
         if full and not _usage_backoff_active(app.switcher):
             app._last_full_fetch = app._snapshot_at
+        # Auto timer start: keep every idle account's 5-hour window warm. Runs
+        # here on the worker thread (off the Cocoa main thread) where the fresh
+        # usage snapshot is available; urllib sends only, no fork, so it's
+        # independent of the fork-serialization freeze fix and of auto-switch.
+        # Guarded whole so a warm failure can never abort the refresh or leave
+        # _dirty unset. See select_warm_candidates / run_warm_cycle.
+        try:
+            if app.settings.auto_timer_start_enabled:
+                _run_warm_from_snapshot(app, snap)
+        except Exception:
+            app.switcher._logger.debug("menubar warm cycle failed", exc_info=True)
         app._dirty = True  # picked up by on_sync_tick on the main thread
     finally:
         # Record this worker as finished (paired with the _census_admit at its
@@ -855,6 +1045,35 @@ def _worker_impl(app, full: bool, force: bool = False) -> None:
         # at a time, since the follow-up re-claims the freed slot).
         if app._refresh_guard.finish_and_take_pending():
             _refresh_async_impl(app, full=True, force=True)
+
+
+def _run_warm_from_snapshot(app, snap: dict) -> None:
+    """Build the warm-cycle input from the snapshot + creds, then run it.
+
+    The render snapshot's account rows are ``(num, email, is_active, usage)`` —
+    they drop the credential that ``warm_account`` needs to send. Re-read the
+    credentials from ``switcher._build_accounts_info()`` (a cheap local read)
+    and join them to the snapshot usages by account number, producing the
+    ``(num, email, creds, usage)`` input for :func:`run_warm_cycle` for ALL
+    accounts (not just the active one). Persisted refreshes go back through the
+    switcher's write path. Runs on the worker thread under the caller's guard.
+    """
+    usage_by_num = {num: usage for (num, _e, _a, usage) in snap.get("accounts", [])}
+    accounts = [
+        (num, email, creds, usage_by_num.get(num))
+        for (num, email, _org, _uuid, _is_active, creds) in app.switcher._build_accounts_info()
+    ]
+
+    def persist(num, email, creds):
+        app.switcher._write_account_credentials(str(num), email, creds)
+
+    run_warm_cycle(
+        accounts=accounts,
+        now=time.time(),
+        warmed_at=app._warmed_at,
+        persist=persist,
+        notify_fn=notify.notify,
+    )
 
 
 def _usage_backoff_active(switcher) -> bool:
@@ -1246,6 +1465,10 @@ def run(switcher) -> int:
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
             self._last_full_fetch = 0.0
+            # Per-account warm cooldown (account-num-str -> last successful warm
+            # epoch); prevents a double-send in the gap before a just-started
+            # window's resets_at is reflected. In-memory for the MVP.
+            self._warmed_at = {}
             # Auto-adoption state (see _maybe_adopt_unmanaged): the login
             # last sighted + when (the settle debounce), the earliest time a
             # failed adoption may retry, and the identity already notified
@@ -1517,6 +1740,15 @@ def run(switcher) -> int:
                 self.menu.add(item)
                 if self.settings.auto_switch_enabled and idx == len(header) - 1:
                     self._countdown_item = item  # the live "Next check:" line
+            # Auto-timer-start toggle: its own clickable line directly below the
+            # Auto-swap header, mirroring on_toggle_autoswitch (flip -> save ->
+            # rebuild, no restart). Keeps warming every idle account's 5h window.
+            self.menu.add(
+                rumps.MenuItem(
+                    auto_timer_start_label(self.settings.auto_timer_start_enabled),
+                    callback=self.on_toggle_auto_timer_start,
+                )
+            )
             self.menu.add(None)
 
             accounts = self.snapshot["accounts"]
@@ -1849,6 +2081,10 @@ def run(switcher) -> int:
         def on_toggle_autoswitch(self, _sender):
             self.settings.auto_switch_enabled = not self.settings.auto_switch_enabled
             self._last_auto_eval = 0.0  # let it evaluate on the next tick when enabling
+            self._save_and_rebuild()
+
+        def on_toggle_auto_timer_start(self, _sender):
+            toggle_auto_timer_start(self.settings)
             self._save_and_rebuild()
 
         def _make_strategy(self, name):

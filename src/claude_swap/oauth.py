@@ -179,6 +179,42 @@ def request_usage_data(access_token: str) -> dict:
 
 
 
+def send_warm_message(
+    access_token: str, model: str, max_tokens: int, timeout: float
+) -> dict:
+    """POST a minimal Messages API request to warm an account's 5-hour window.
+
+    Mirrors :func:`request_usage_data`'s authenticated-request pattern
+    (``Authorization: Bearer <token>`` + the ``anthropic-beta`` OAuth header)
+    but against the Messages endpoint. Sends a fixed one-line prompt; the reply
+    is discarded — the point is that the request registers against the account's
+    5-hour window (starting its reset countdown) and confirms the token still
+    authenticates. Returns the parsed 2xx body; propagates ``urllib`` errors on
+    a non-2xx status or network failure (the caller in ``menubar.warm_account``
+    classifies them into a health-check result). ``model`` is the bare Haiku
+    alias (``claude-haiku-4-5``) — no date suffix.
+    """
+    url = "https://api.anthropic.com/v1/messages"
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": OAUTH_BETA_HEADER,
+        # The Messages API is stricter than the OAuth usage endpoint: it returns
+        # HTTP 400 ("anthropic-version: header is required") without this header.
+        # Confirmed against the live endpoint; the stable version suffices.
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "claude-swap/1.0",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": "can you hear me?"}],
+    }).encode()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
 def build_usage_result(data: dict) -> dict | None:
     """Normalize raw usage API data into the structure used by the CLI."""
     _logger.debug("Usage API response: %s", json.dumps(data, indent=2))

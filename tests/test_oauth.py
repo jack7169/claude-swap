@@ -695,3 +695,57 @@ def test_fetch_usage_returns_rate_limited_on_429_after_refresh():
          patch.object(oauth, "refresh_oauth_credentials", return_value=refreshed):
         result = oauth.fetch_usage_for_account("1", "a@x.com", creds, is_active=False)
     assert result == oauth.RATE_LIMITED
+
+
+class TestSendWarmMessage:
+    """send_warm_message: minimal Messages API POST, Bearer + beta headers."""
+
+    def _ok_response(self):
+        resp = MagicMock()
+        resp.read.return_value = json.dumps({"content": []}).encode()
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = MagicMock(return_value=False)
+        return resp
+
+    def test_builds_bearer_beta_post_request(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=0):
+            captured["req"] = req
+            captured["timeout"] = timeout
+            return self._ok_response()
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            body = oauth.send_warm_message("tok123", "claude-haiku-4-5", 8, 5.0)
+
+        req = captured["req"]
+        assert req.full_url == "https://api.anthropic.com/v1/messages"
+        assert req.get_method() == "POST"
+        assert req.get_header("Authorization") == "Bearer tok123"
+        assert req.get_header("Anthropic-beta") == oauth.OAUTH_BETA_HEADER
+        # The Messages API rejects the request (HTTP 400 "anthropic-version:
+        # header is required") without a version header — confirmed against the
+        # live endpoint. Unlike the OAuth usage endpoint, this one is mandatory.
+        assert req.get_header("Anthropic-version") == "2023-06-01"
+        assert req.get_header("Content-type") == "application/json"
+        assert captured["timeout"] == 5.0
+        sent = json.loads(req.data.decode())
+        assert sent == {
+            "model": "claude-haiku-4-5",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "can you hear me?"}],
+        }
+        assert body == {"content": []}
+
+    def test_raises_on_http_error(self):
+        err = urllib.error.HTTPError(
+            url="https://api.anthropic.com/v1/messages",
+            code=401, msg="Unauthorized", hdrs=None, fp=None,
+        )
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=err):
+            try:
+                oauth.send_warm_message("tok", "claude-haiku-4-5", 8, 5.0)
+            except urllib.error.HTTPError as e:
+                assert e.code == 401
+            else:
+                raise AssertionError("expected HTTPError to propagate")

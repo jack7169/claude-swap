@@ -207,6 +207,18 @@ def test_settings_auto_switch_round_trip(tmp_path: Path):
     assert menubar.MenuBarSettings.load(path) == orig
 
 
+def test_settings_auto_timer_start_default(tmp_path: Path):
+    s = menubar.MenuBarSettings.load(tmp_path / "missing.json")
+    assert s.auto_timer_start_enabled is False
+
+
+def test_settings_auto_timer_start_round_trip(tmp_path: Path):
+    path = tmp_path / "settings.json"
+    orig = menubar.MenuBarSettings(auto_timer_start_enabled=True)
+    orig.save(path)
+    assert menubar.MenuBarSettings.load(path) == orig
+
+
 def test_state_defaults(tmp_path: Path):
     st = menubar.MenuBarState.load(tmp_path / "missing.json")
     assert st.last_switch_at == 0.0
