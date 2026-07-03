@@ -17,6 +17,7 @@ import collections
 import os
 import subprocess
 import threading
+import time
 
 from claude_swap import spawn
 
@@ -109,6 +110,25 @@ def moving_average(values: list[int], window: int) -> list[float]:
         chunk = values[lo:i + 1]
         out.append(sum(chunk) / len(chunk))
     return out
+
+
+def scroll_fraction(now: float, last_sample_at: float | None, interval: float) -> float:
+    """Progress in ``[0.0, 1.0]`` from the last sample toward the next one.
+
+    Lets the graph scroll continuously between the 1 Hz ``nettop`` samples: the
+    plot shifts left by ``fraction * one-sample-width``. Clamped so a late
+    sample holds at the fully-advanced position (``1.0``) instead of scrolling
+    into empty space, and a backwards clock reads ``0.0``. Returns ``0.0`` when
+    there is no sample yet or the interval is non-positive.
+    """
+    if last_sample_at is None or interval <= 0:
+        return 0.0
+    frac = (now - last_sample_at) / interval
+    if frac < 0.0:
+        return 0.0
+    if frac > 1.0:
+        return 1.0
+    return frac
 
 
 class _NettopStream:
@@ -209,15 +229,21 @@ class PacketRateMonitor:
     absent, the deque simply stops updating and the graph shows its empty state.
     """
 
-    def __init__(self, *, window: int = 30, avg_window: int = 2, sampler=None):
+    def __init__(self, *, window: int = 30, avg_window: int = 2, interval: float = 1.0,
+                 sampler=None):
         self._sampler = sampler or _spawn_nettop
         # Samples to average for display. nettop samples at 1 Hz (its floor —
         # it rejects sub-second ``-s``), so 2 samples ≈ a 2-second rolling
         # average. Exposed so the graph view can smooth the plotted series.
         self.avg_window = avg_window
+        # Nominal seconds between samples (nettop -s 1) and the ring size, both
+        # read by the graph view to position + scroll the plot.
+        self.interval = interval
+        self.window = window
         self._rates: collections.deque[int] = collections.deque(maxlen=window)
         self._prev_total: int | None = None
         self._pids: set[int] = set()
+        self._last_sample_at: float | None = None  # time.monotonic() of last append
         self._lock = threading.Lock()
         self._stream = None
         self._thread: threading.Thread | None = None
@@ -252,6 +278,15 @@ class PacketRateMonitor:
         with self._lock:
             return self._rates[-1] if self._rates else 0
 
+    def last_sample_at(self) -> float | None:
+        """``time.monotonic()`` of the most recent sample, or ``None`` if none.
+
+        Read by the graph view (with :func:`scroll_fraction`) to scroll the
+        plot smoothly between the 1 Hz samples.
+        """
+        with self._lock:
+            return self._last_sample_at
+
     def _read_loop(self) -> None:
         block: list[str] = []
         try:
@@ -277,3 +312,4 @@ class PacketRateMonitor:
             rate = delta_rate(self._prev_total, cur)
             self._prev_total = cur
             self._rates.append(rate)
+            self._last_sample_at = time.monotonic()

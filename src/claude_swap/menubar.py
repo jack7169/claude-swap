@@ -1605,36 +1605,71 @@ def run(switcher) -> int:
             right = w - _GRAPH_PAD
             span = max(1.0, right - left)
             n = len(norm)
-            step = span / max(1, n - 1) if n > 1 else span
 
-            def _pt(i, v):
-                x = left + (i * step if n > 1 else span)
-                y = plot_bottom + v * plot_h
-                return NSMakePoint(x, y)
+            # Continuous scroll: samples land at 1 Hz but we advance the plot
+            # every redraw. Fixed per-sample width (span over the full ring) so
+            # the graph fills from the right and scrolls uniformly; each sample
+            # sits `frac` of a step further left as time passes toward the next.
+            window = max(2, self._monitor.window)
+            step = span / (window - 1)
+            frac = net_packets.scroll_fraction(
+                time.monotonic(), self._monitor.last_sample_at(),
+                self._monitor.interval,
+            )
+            # i = 0 (oldest) .. n-1 (newest); newest sits at right - frac*step.
+            pts = [
+                (right - ((n - 1 - i) + frac) * step, plot_bottom + norm[i] * plot_h)
+                for i in range(n)
+            ]
+            # Hold the newest value flat out to the right edge (no gap while the
+            # next sample is still pending).
+            pts.append((right, pts[-1][1]))
+
+            def _smooth(path, points):
+                # Quadratic-midpoint smoothing: the curve passes through the
+                # segment midpoints using each point as the control handle,
+                # expressed as cubic Béziers. `path` must already be at points[0].
+                if len(points) < 3:
+                    for p in points[1:]:
+                        path.lineToPoint_(NSMakePoint(*p))
+                    return
+                cur = points[0]
+                for i in range(1, len(points) - 1):
+                    ctrl = points[i]
+                    end = ((points[i][0] + points[i + 1][0]) / 2.0,
+                           (points[i][1] + points[i + 1][1]) / 2.0)
+                    cp1 = (cur[0] + 2.0 / 3.0 * (ctrl[0] - cur[0]),
+                           cur[1] + 2.0 / 3.0 * (ctrl[1] - cur[1]))
+                    cp2 = (end[0] + 2.0 / 3.0 * (ctrl[0] - end[0]),
+                           end[1] + 2.0 / 3.0 * (ctrl[1] - end[1]))
+                    path.curveToPoint_controlPoint1_controlPoint2_(
+                        NSMakePoint(*end), NSMakePoint(*cp1), NSMakePoint(*cp2))
+                    cur = end
+                path.lineToPoint_(NSMakePoint(*points[-1]))
+
+            # Clip to the plot rect so points scrolled off the left don't paint
+            # over the rest of the row.
+            NSBezierPath.bezierPathWithRect_(
+                NSMakeRect(left, plot_bottom, span, plot_h)
+            ).addClip()
 
             accent = NSColor.systemBlueColor()
 
-            # Filled area (accent at low alpha) under the line.
+            # Filled area (accent at low alpha) under the smoothed line.
             area = NSBezierPath.bezierPath()
-            area.moveToPoint_(NSMakePoint(left, plot_bottom))
-            for i, v in enumerate(norm):
-                area.lineToPoint_(_pt(i, v))
-            area.lineToPoint_(
-                NSMakePoint(left + (n - 1) * step if n > 1 else right, plot_bottom)
-            )
+            area.moveToPoint_(NSMakePoint(pts[0][0], plot_bottom))
+            area.lineToPoint_(NSMakePoint(*pts[0]))
+            _smooth(area, pts)
+            area.lineToPoint_(NSMakePoint(pts[-1][0], plot_bottom))
             area.closePath()
             accent.colorWithAlphaComponent_(0.18).setFill()
             area.fill()
 
-            # Stroked line on top.
+            # Stroked smoothed line on top.
             line = NSBezierPath.bezierPath()
             line.setLineWidth_(1.5)
-            for i, v in enumerate(norm):
-                pt = _pt(i, v)
-                if i == 0:
-                    line.moveToPoint_(pt)
-                else:
-                    line.lineToPoint_(pt)
+            line.moveToPoint_(NSMakePoint(*pts[0]))
+            _smooth(line, pts)
             accent.setStroke()
             line.stroke()
 
@@ -1668,11 +1703,17 @@ def run(switcher) -> int:
             if app.settings.auto_switch_enabled:
                 app._auto_tick()  # run the check in common modes (works while open)
             app._update_live_rows()
-            # Animate the packet-rate graph ~1/s (kept out of _snapshot_signature
-            # so it never triggers a full menu rebuild).
-            graph_view = getattr(app, "_graph_view", None)
-            if graph_view is not None:
-                graph_view.setNeedsDisplay_(True)
+
+        def graphTick_(self, _timer):
+            # Fast (~30 Hz) redraw so the packet graph scrolls smoothly between
+            # the 1 Hz samples. Only while the menu is open (the view is
+            # invisible otherwise); kept out of _snapshot_signature so it never
+            # triggers a full menu rebuild.
+            app = self.app
+            if getattr(app, "_menu_open", False):
+                graph_view = getattr(app, "_graph_view", None)
+                if graph_view is not None:
+                    graph_view.setNeedsDisplay_(True)
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -1743,6 +1784,19 @@ def run(switcher) -> int:
             self._countdown_nstimer.setTolerance_(0.05)
             NSRunLoop.currentRunLoop().addTimer_forMode_(
                 self._countdown_nstimer, NSRunLoopCommonModes
+            )
+            # Separate fast timer (~30 Hz) that only repaints the packet graph
+            # while the menu is open, so its scroll is smooth without running the
+            # heavier tick_ logic (rolling/auto-switch) at that rate. Common
+            # modes so it keeps firing during menu tracking; no tolerance so the
+            # animation stays even.
+            self._graph_nstimer = (
+                NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+                    1.0 / 30.0, self._menu_observer, "graphTick:", None, True
+                )
+            )
+            NSRunLoop.currentRunLoop().addTimer_forMode_(
+                self._graph_nstimer, NSRunLoopCommonModes
             )
             # Background refresh on the user's interval, plus a fast UI-sync tick
             # that applies snapshots produced by worker threads on the main thread.

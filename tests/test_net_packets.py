@@ -110,6 +110,33 @@ def test_moving_average_window_one_is_identity():
     assert net_packets.moving_average([2, 4, 6], 1) == [2.0, 4.0, 6.0]
 
 
+# ---- scroll_fraction ----------------------------------------------------
+
+def test_scroll_fraction_none_last_sample_is_zero():
+    assert net_packets.scroll_fraction(100.0, None, 1.0) == 0.0
+
+
+def test_scroll_fraction_zero_interval_is_zero():
+    assert net_packets.scroll_fraction(100.0, 99.0, 0.0) == 0.0
+
+
+def test_scroll_fraction_just_after_sample_is_zero():
+    assert net_packets.scroll_fraction(50.0, 50.0, 1.0) == 0.0
+
+
+def test_scroll_fraction_halfway():
+    assert net_packets.scroll_fraction(50.5, 50.0, 1.0) == 0.5
+
+
+def test_scroll_fraction_clamps_to_one_when_sample_overdue():
+    # A late next sample holds the scroll at the fully-advanced position.
+    assert net_packets.scroll_fraction(52.0, 50.0, 1.0) == 1.0
+
+
+def test_scroll_fraction_clamps_low_on_backwards_clock():
+    assert net_packets.scroll_fraction(49.0, 50.0, 1.0) == 0.0
+
+
 # ---- PacketRateMonitor --------------------------------------------------
 
 class _FakeStream:
@@ -173,6 +200,21 @@ def test_monitor_stop_closes_stream():
     mon._thread.join(timeout=2.0)
     mon.stop()
     assert stream.closed is True
+
+
+def test_monitor_records_last_sample_time():
+    mon = net_packets.PacketRateMonitor()
+    assert mon.last_sample_at() is None  # nothing consumed yet
+    driven = _run_monitor(
+        ["time,,packets_in,packets_out,\n", _sample(42, 100, 0)], {42}
+    )
+    assert isinstance(driven.last_sample_at(), float)  # stamped on consume
+
+
+def test_monitor_exposes_interval_and_window_defaults():
+    mon = net_packets.PacketRateMonitor()
+    assert mon.interval == 1.0
+    assert mon.window == 30
 
 
 def test_monitor_start_is_idempotent():
