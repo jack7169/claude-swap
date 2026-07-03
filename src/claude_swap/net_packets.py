@@ -14,6 +14,7 @@ shared Cloudflare addresses.
 from __future__ import annotations
 
 import collections
+import math
 import os
 import subprocess
 import threading
@@ -110,6 +111,14 @@ def moving_average(values: list[int], window: int) -> list[float]:
         chunk = values[lo:i + 1]
         out.append(sum(chunk) / len(chunk))
     return out
+
+
+def log2_scale(values: list[int]) -> list[float]:
+    """Map rates onto a log2 axis: ``log2(1 + v)`` (so ``0 -> 0`` and there are
+    no negatives). Compresses large spikes and expands the low end, matching a
+    log2 y-axis. Empty input -> ``[]``.
+    """
+    return [math.log2(1 + v) for v in values]
 
 
 def scroll_fraction(now: float, last_sample_at: float | None, interval: float) -> float:
@@ -251,7 +260,14 @@ class PacketRateMonitor:
 
     def set_target_pids(self, pids: set[int]) -> None:
         with self._lock:
-            self._pids = set(pids)
+            new = set(pids)
+            if new != self._pids:
+                # The cumulative baseline was summed over the OLD population;
+                # keeping it would make the next delta subtract different
+                # processes and emit a spurious spike. Re-baseline: the next
+                # sample reads 0, then deltas resume over the new set.
+                self._prev_total = None
+                self._pids = new
 
     def start(self) -> None:
         with self._lock:

@@ -137,6 +137,52 @@ def test_scroll_fraction_clamps_low_on_backwards_clock():
     assert net_packets.scroll_fraction(49.0, 50.0, 1.0) == 0.0
 
 
+# ---- log2_scale ---------------------------------------------------------
+
+def test_log2_scale_empty_is_empty():
+    assert net_packets.log2_scale([]) == []
+
+
+def test_log2_scale_zero_maps_to_zero():
+    assert net_packets.log2_scale([0]) == [0.0]  # log2(1) == 0
+
+
+def test_log2_scale_powers_of_two_minus_one():
+    # log2(1+v) for v in {1,3,7} == {1,2,3}
+    assert net_packets.log2_scale([1, 3, 7]) == [1.0, 2.0, 3.0]
+
+
+def test_log2_scale_compresses_large_values():
+    out = net_packets.log2_scale([0, 1023])
+    assert out[0] == 0.0
+    assert out[1] == 10.0  # log2(1024)
+
+
+# ---- set_target_pids re-baselines to avoid a spike on set change --------
+
+def test_set_target_pids_change_rebaselines_to_avoid_spike():
+    mon = net_packets.PacketRateMonitor()
+    mon.set_target_pids({1})
+    mon._consume("t,proc.1,100,0,\n")  # baseline for pid 1 (rate 0)
+    mon._consume("t,proc.1,150,0,\n")  # delta 50
+    assert mon.rates() == [0, 50]
+    # Set now includes pid 2 with a huge cumulative counter. A stale prev_total
+    # would make the next delta ~100k; re-baselining yields 0 instead.
+    mon.set_target_pids({1, 2})
+    mon._consume("t,proc.1,160,0,\nt,proc.2,99999,0,\n")
+    assert mon.rates() == [0, 50, 0]
+
+
+def test_set_target_pids_same_set_keeps_baseline():
+    mon = net_packets.PacketRateMonitor()
+    mon.set_target_pids({1})
+    mon._consume("t,proc.1,100,0,\n")  # baseline
+    mon._consume("t,proc.1,150,0,\n")  # delta 50
+    mon.set_target_pids({1})  # unchanged set -> no re-baseline
+    mon._consume("t,proc.1,170,0,\n")  # delta 20
+    assert mon.rates() == [0, 50, 20]
+
+
 # ---- PacketRateMonitor --------------------------------------------------
 
 class _FakeStream:

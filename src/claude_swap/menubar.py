@@ -1593,7 +1593,9 @@ def run(switcher) -> int:
                 NSMakePoint(_GRAPH_PAD, h - 18.0), attrs
             )
 
-            norm = net_packets.normalize(smoothed)
+            # Plot heights on a log2 axis (log2(1+v)) so a few big spikes don't
+            # flatten everything else; the headline number above stays linear.
+            norm = net_packets.normalize(net_packets.log2_scale(smoothed))
             if not norm:
                 return
 
