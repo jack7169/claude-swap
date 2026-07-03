@@ -577,7 +577,7 @@ class TestWorkerAdoptsBeforeSnapshot:
     def test_worker_runs_adopt_before_snapshot(self, monkeypatch):
         calls = []
 
-        def fake_snapshot(switcher, full=True, force=False):
+        def fake_snapshot(switcher, full=True, force=False, max_fetch=None):
             calls.append("snapshot")
             return {"accounts": [], "active_email": None, "active_usage": None,
                     "instances": []}

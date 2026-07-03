@@ -3818,6 +3818,18 @@ class TestCollectUsageBackoff:
         s._collect_usage(self._info(), only={"1"})
         assert calls == ["1"]                    # only account 1 hit the network
 
+    def test_max_fetch_caps_calls_per_round(self, temp_home, monkeypatch):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 1.0}},
+                                        "2": {"five_hour": {"pct": 2.0}}}, calls)
+        # Both accounts are stale, but max_fetch=1 fetches only ONE per round —
+        # the rolling refresh spaces calls out instead of bursting all accounts.
+        out = s._collect_usage(self._info(), max_fetch=1)
+        assert len(calls) == 1                   # only one account hit the network
+        assert isinstance(out[0], dict)          # the fetched account has fresh usage
+
 class TestAddAccountFromOAuth:
     def _switcher(self, temp_home):
         from claude_swap.switcher import ClaudeAccountSwitcher

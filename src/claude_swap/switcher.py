@@ -2064,6 +2064,7 @@ class ClaudeAccountSwitcher:
         accounts_info: list[tuple[int, str, str, str, bool, str]],
         only: set[str] | None = None,
         force: bool = False,
+        max_fetch: int | None = None,
     ) -> list[dict | str | None]:
         """Fetch usage per account (cache-first), with per-IP 429 backoff.
 
@@ -2159,6 +2160,13 @@ class ClaudeAccountSwitcher:
                 str(info[0]), {"fetchedAt": 0.0}
             )["fetchedAt"]
         )
+        # Rolling refresh: cap how many accounts this round fetches. The stalest
+        # ``max_fetch`` go now; the rest keep their (older) stamps and lead the
+        # next round — so callers can spread the usage-API calls across the
+        # refresh period (one account at a time) instead of bursting all of them
+        # and tripping the endpoint's per-IP 429.
+        if max_fetch is not None:
+            to_fetch = to_fetch[:max_fetch]
 
         # Sequential, stop on the first 429: further requests would only chain
         # the backoff. Also stop when the round has burned its wall-clock

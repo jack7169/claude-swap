@@ -227,20 +227,33 @@ def refresh_countdown_text(seconds_to_next: float, cadence: int) -> str:
     return f"Next refresh: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
 
 
-def plan_display_refresh(
-    *, now: float, last_snapshot_at: float, cadence: int, in_flight: bool
-) -> bool:
-    """Whether the common-modes tick should fire a display refresh (auto-switch OFF).
+_ROLL_MIN_INTERVAL = 5.0  # never fetch faster than this, however many accounts
 
-    Keeps usage current while the menu is open: the default-mode ``refresh_timer``
-    is paused during menu tracking, and the common-modes auto-tick only refreshes
-    when auto-switch is enabled. Gated on time-since-last-snapshot so it fires at
-    most once per ``cadence`` and never while a worker is in flight — ``_snapshot_at``
-    advances on every refresh (even cache-served ones), so this can't busy-spin.
+
+def _roll_interval(refresh_interval: float, n_accounts: int) -> float:
+    """Seconds between single-account rolls so all accounts refresh once per
+    ``refresh_interval`` — floored so a large account list can't fetch fast
+    enough to re-trip the usage endpoint's per-IP 429."""
+    return max(_ROLL_MIN_INTERVAL, refresh_interval / max(1, n_accounts))
+
+
+def _maybe_roll(app) -> None:
+    """Fetch ONE account's usage if a roll is due (rolling refresh).
+
+    Spreads usage-API calls across the refresh interval — one account per
+    :func:`_roll_interval` — so a burst never trips the endpoint's per-IP 429.
+    Driven by the common-modes tick so it rolls whether the menu is open or
+    closed. ``_collect_usage``'s stalest-first order means successive rolls
+    naturally rotate across all accounts (and favor the short-TTL active one).
     """
-    if in_flight:
-        return False
-    return now - last_snapshot_at >= cadence
+    now = time.time()
+    n = len(app.snapshot.get("accounts") or ()) or 1
+    if now - app._last_roll < _roll_interval(app.settings.refresh_interval, n):
+        return
+    if app._refresh_guard.in_flight:
+        return
+    app._last_roll = now
+    app.refresh_async(full=True, max_fetch=1)
 
 
 def auto_switch_header_lines(
@@ -810,18 +823,21 @@ def run_warm_cycle(
     return success
 
 
-def _snapshot(switcher, full: bool = True, force: bool = False) -> dict:
+def _snapshot(
+    switcher, full: bool = True, force: bool = False, max_fetch: int | None = None
+) -> dict:
     """Fetch accounts + usage off the main thread. Returns a render snapshot.
 
     Shape: ``{"accounts": [(num, email, is_active, usage), ...],
     "active_email": str | None, "active_usage": dict | str | None,
     "instances": [(label, folder, session_count, has_ide), ...]}``.
     ``full=False`` fetches only the active account over the network (backups come
-    from cache) to stay under the usage endpoint's per-IP rate limit; ``full=True``
-    fetches all. ``force=True`` bypasses ``_collect_usage``'s 15s fresh-cache
-    shortcut so an explicit user refresh always re-fetches (the per-IP 429
-    backoff still applies). The running-instance list is computed exactly once
-    per refresh and reused. Never raises — failures degrade to empty/unknown.
+    from cache); ``full=True`` considers all accounts. ``max_fetch`` caps how many
+    are actually fetched this pass (the rolling driver passes 1 so calls spread
+    across the refresh period). ``force=True`` bypasses ``_collect_usage``'s 15s
+    fresh-cache shortcut so an explicit user refresh always re-fetches. The
+    running-instance list is computed once per refresh and reused. Never raises —
+    failures degrade to empty/unknown.
     """
     instances = _snapshot_instances(switcher)
     try:
@@ -830,7 +846,9 @@ def _snapshot(switcher, full: bool = True, force: bool = False) -> dict:
         if not full:
             active = next((str(info[0]) for info in accounts_info if info[4]), None)
             only = {active} if active else None
-        usages = switcher._collect_usage(accounts_info, only=only, force=force)
+        usages = switcher._collect_usage(
+            accounts_info, only=only, force=force, max_fetch=max_fetch
+        )
     except Exception:
         switcher._logger.debug("menubar snapshot failed", exc_info=True)
         return {
@@ -992,7 +1010,9 @@ def _census_release() -> None:
             _live_workers -= 1
 
 
-def _refresh_async_impl(app, full: bool = False, force: bool = False) -> bool:
+def _refresh_async_impl(
+    app, full: bool = False, force: bool = False, max_fetch: int | None = None
+) -> bool:
     """Start a background refresh worker, honoring the in-flight guard.
 
     Compare-and-set under the guard's lock so at most one worker runs at a time.
@@ -1010,7 +1030,7 @@ def _refresh_async_impl(app, full: bool = False, force: bool = False) -> bool:
     # failed thread-create can't wedge future refreshes.
     _census_admit(app)
     try:
-        app._spawn(_worker_impl, (app, full, force))
+        app._spawn(_worker_impl, (app, full, force, max_fetch))
     except BaseException:
         _census_release()
         app._refresh_guard.finish()
@@ -1018,7 +1038,9 @@ def _refresh_async_impl(app, full: bool = False, force: bool = False) -> bool:
     return True
 
 
-def _worker_impl(app, full: bool, force: bool = False) -> None:
+def _worker_impl(
+    app, full: bool, force: bool = False, max_fetch: int | None = None
+) -> None:
     """Background-refresh worker body (runs off the Cocoa main thread).
 
     Rebinds plain attributes (atomic in CPython) that the main-thread sync tick
@@ -1042,7 +1064,7 @@ def _worker_impl(app, full: bool, force: bool = False) -> None:
             # (otherwise the live login is invisible: bare-icon title, no
             # active row, auto-switch inert).
             _maybe_adopt_unmanaged(app)
-            snap = _snapshot(app.switcher, full=full, force=force)
+            snap = _snapshot(app.switcher, full=full, force=force, max_fetch=max_fetch)
         app.snapshot = snap
         app._snapshot_at = time.time()
         # A full pass re-fetched over the network (there is no rate-limit backoff
@@ -1487,18 +1509,14 @@ def run(switcher) -> int:
 
         def tick_(self, _timer):
             app = self.app
+            # Rolling refresh: keep usage current one account at a time, whether
+            # the menu is open or closed (the default-mode refresh_timer is paused
+            # during menu tracking, so drive rolling from the common-modes tick).
+            # This also keeps _last_full_fetch fresh, so the auto-switch below just
+            # evaluates on the rolling snapshot rather than bursting its own fetch.
+            _maybe_roll(app)
             if app.settings.auto_switch_enabled:
                 app._auto_tick()  # run the check in common modes (works while open)
-            elif plan_display_refresh(
-                now=time.time(),
-                last_snapshot_at=app._snapshot_at,
-                cadence=app.settings.refresh_interval,
-                in_flight=app._refresh_guard.in_flight,
-            ):
-                # Auto-switch off: keep usage fresh from the common-modes timer so
-                # the menu still updates while it's open (the default-mode
-                # refresh_timer is paused during menu tracking).
-                app.refresh_async(full=True)
             app._update_live_rows()
 
     class MenuBarApp(rumps.App):
@@ -1520,6 +1538,7 @@ def run(switcher) -> int:
             self._snapshot_at = 0.0
             self._last_auto_eval = 0.0
             self._last_full_fetch = 0.0
+            self._last_roll = 0.0  # last single-account rolling-refresh fetch
             # Per-account warm cooldown (account-num-str -> last successful warm
             # epoch); prevents a double-send in the gap before a just-started
             # window's resets_at is reflected. In-memory for the MVP.
@@ -1570,7 +1589,10 @@ def run(switcher) -> int:
             self.refresh_timer.start()
             self.sync_timer = rumps.Timer(self.on_sync_tick, 1)
             self.sync_timer.start()
-            self.refresh_async(full=True)  # first fetch is a full one
+            # First fetch is active-only (a single call) for immediate title/active
+            # usage; the rolling driver (_maybe_roll) then fills in the backups one
+            # at a time, so startup never bursts all accounts at once.
+            self.refresh_async(full=False)
 
         # ---- refresh plumbing -------------------------------------------------
         def _spawn(self, target, args):
@@ -1578,12 +1600,13 @@ def run(switcher) -> int:
             ``_refresh_async_impl`` can spawn without referencing rumps)."""
             threading.Thread(target=target, args=args, daemon=True).start()
 
-        def refresh_async(self, full=False, force=False):
+        def refresh_async(self, full=False, force=False, max_fetch=None):
             # Compare-and-set under a lock: at most one worker runs at a time.
             # A forced refresh (manual "Refresh now") that loses the slot is
             # queued (not dropped); a non-forced tick is dropped as before. See
-            # _refresh_async_impl / _RefreshGuard.
-            return _refresh_async_impl(self, full=full, force=force)
+            # _refresh_async_impl / _RefreshGuard. ``max_fetch`` caps how many
+            # accounts a single refresh fetches (the rolling driver passes 1).
+            return _refresh_async_impl(self, full=full, force=force, max_fetch=max_fetch)
 
         def _worker(self, full, force=False):
             # Handoff: the worker rebinds plain attributes (atomic in CPython);
@@ -1609,10 +1632,12 @@ def run(switcher) -> int:
             )
 
         def on_refresh_tick(self, _timer):
-            # Full refresh so every account's usage % (not just the active one's)
-            # is re-fetched each cycle. Heavier on the usage API than an
-            # active-only refresh, but the per-IP 429 backoff still applies.
-            self.refresh_async(full=True)
+            # Rolling refresh: fetch one account per roll, spaced across the
+            # refresh interval, so a burst never trips the usage endpoint's 429.
+            # Driven here (default mode, menu closed) and from the common-modes
+            # tick (menu open); both go through _maybe_roll, coordinated by
+            # _last_roll so they never double-fetch.
+            _maybe_roll(self)
 
         def on_sync_tick(self, _timer):
             # Rebuild the menu only when the rendered-state signature changed

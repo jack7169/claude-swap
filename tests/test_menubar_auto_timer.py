@@ -306,7 +306,7 @@ class _RunWarmHarness:
             (2, "b@x", "", "", False, _oauth_creds()),
         ]
 
-    def _collect_usage(self, info, only=None, force=False):
+    def _collect_usage(self, info, only=None, force=False, max_fetch=None):
         return [{"five_hour": {"pct": 0}} for _ in info]
 
     def _write_account_credentials(self, num, email, creds):

@@ -67,7 +67,7 @@ class _RefreshHarness:
     def _build_accounts_info(self):
         return [(1, "a@x", "", "", True, "")]
 
-    def _collect_usage(self, info, only=None, force=False):
+    def _collect_usage(self, info, only=None, force=False, max_fetch=None):
         return [None]
 
     # spawn worker threads synchronously-joinable for tests
@@ -88,7 +88,7 @@ def test_worker_stamps_full_fetch(monkeypatch):
     to suppress it), so plan_auto_tick's evaluation follows on the next tick."""
     monkeypatch.setattr(
         menubar, "_snapshot",
-        lambda switcher, full=True, force=False: {
+        lambda switcher, full=True, force=False, max_fetch=None: {
             "accounts": [], "active_email": None, "active_usage": None,
             "instances": [],
         },
@@ -105,7 +105,7 @@ def test_refresh_async_force_threads_force_to_snapshot(monkeypatch):
     """on_refresh_now -> refresh_async(force=True) -> _snapshot(force=True)."""
     seen = {}
 
-    def fake_snapshot(switcher, full=True, force=False):
+    def fake_snapshot(switcher, full=True, force=False, max_fetch=None):
         seen["full"] = full
         seen["force"] = force
         return {"accounts": [], "active_email": None, "active_usage": None,
@@ -131,7 +131,7 @@ def test_snapshot_threads_force_to_collect_usage(monkeypatch):
         def _build_accounts_info(self):
             return [(1, "a@x", "", "", True, "")]
 
-        def _collect_usage(self, info, only=None, force=False):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
             seen["force"] = force
             seen["only"] = only
             return [None]
@@ -153,7 +153,7 @@ def test_forced_refresh_while_in_flight_schedules_followup(monkeypatch):
     release = threading.Event()
     first_in_snapshot = threading.Event()
 
-    def fake_snapshot(switcher, full=True, force=False):
+    def fake_snapshot(switcher, full=True, force=False, max_fetch=None):
         started.append(force)
         if len(started) == 1:
             first_in_snapshot.set()
@@ -219,7 +219,7 @@ def test_nonforced_refresh_while_in_flight_is_dropped(monkeypatch):
     release = threading.Event()
     first_in_snapshot = threading.Event()
 
-    def fake_snapshot(switcher, full=True, force=False):
+    def fake_snapshot(switcher, full=True, force=False, max_fetch=None):
         started.append(force)
         if len(started) == 1:
             first_in_snapshot.set()
@@ -364,7 +364,7 @@ def test_snapshot_computes_instances_once(monkeypatch):
         def _build_accounts_info(self):
             return [(1, "a@x", "", "", True, "")]
 
-        def _collect_usage(self, info, only=None, force=False):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
             return [None]
 
     menubar._snapshot(_SW(), full=True)
@@ -531,29 +531,63 @@ def test_plan_auto_tick_evaluates_when_full_fetch_is_fresh():
     ) == "evaluate"
 
 
+# Rolling refresh: fetch one account per roll, spaced across the refresh interval,
+# so a burst never trips the usage endpoint's per-IP 429.
+
+def test_roll_interval_spreads_across_refresh_period():
+    # 5 accounts over a 30s refresh interval -> one every 6s.
+    assert menubar._roll_interval(30, 5) == 6.0
+
+
+def test_roll_interval_single_account_uses_full_period():
+    assert menubar._roll_interval(30, 1) == 30.0
+
+
+def test_roll_interval_floored_for_many_accounts():
+    # Many accounts must not fetch faster than the floor (or they'd re-trip 429).
+    assert menubar._roll_interval(30, 100) == menubar._ROLL_MIN_INTERVAL
+
+
+def test_roll_interval_zero_accounts_safe():
+    assert menubar._roll_interval(30, 0) == 30.0
+
+
+class _RollApp:
+    def __init__(self, *, last_roll=0.0, in_flight=False, n=5, refresh_interval=30):
+        self._last_roll = last_roll
+        self.snapshot = {"accounts": [(i, f"{i}@x", False, {}) for i in range(1, n + 1)]}
+        self.settings = menubar.MenuBarSettings(refresh_interval=refresh_interval)
+        self._refresh_guard = type("G", (), {"in_flight": in_flight})()
+        self.calls = []
+
+    def refresh_async(self, full=False, force=False, max_fetch=None):
+        self.calls.append((full, force, max_fetch))
+
+
+def test_maybe_roll_fetches_one_account_when_due():
+    app = _RollApp(last_roll=0.0, n=5, refresh_interval=30)
+    menubar._maybe_roll(app)
+    assert app.calls == [(True, False, 1)]  # full, not forced, one account
+    assert app._last_roll > 0.0
+
+
+def test_maybe_roll_waits_within_interval():
+    app = _RollApp(last_roll=time.time(), n=5, refresh_interval=30)
+    menubar._maybe_roll(app)
+    assert app.calls == []
+
+
+def test_maybe_roll_skips_while_in_flight():
+    app = _RollApp(last_roll=0.0, in_flight=True, n=5)
+    menubar._maybe_roll(app)
+    assert app.calls == []
+
+
 # Display auto-refresh must run even when auto-switch is OFF. The default-mode
 # refresh_timer is paused while the menu is open, and the common-modes tick only
-# refreshed when auto-switch was enabled — so with auto-switch off and the menu
-# open, usage froze. plan_display_refresh drives a refresh from the common-modes
-# tick, gated so it fires at most once per cadence and never while in flight.
-
-def test_plan_display_refresh_fires_when_cadence_elapsed():
-    assert menubar.plan_display_refresh(
-        now=100.0, last_snapshot_at=0.0, cadence=30, in_flight=False
-    ) is True
-
-
-def test_plan_display_refresh_waits_within_cadence():
-    assert menubar.plan_display_refresh(
-        now=10.0, last_snapshot_at=0.0, cadence=30, in_flight=False
-    ) is False
-
-
-def test_plan_display_refresh_skips_while_in_flight():
-    assert menubar.plan_display_refresh(
-        now=100.0, last_snapshot_at=0.0, cadence=30, in_flight=True
-    ) is False
-
+# refreshed when auto-switch was enabled. Rolling refresh (_maybe_roll, tested
+# above) now keeps usage current one account at a time whether the menu is open
+# or closed, superseding the old plan_display_refresh gate.
 
 def test_refresh_countdown_text_counts_down():
     text = menubar.refresh_countdown_text(12.0, 30)

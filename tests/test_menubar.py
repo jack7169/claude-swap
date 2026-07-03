@@ -347,7 +347,7 @@ def test_snapshot_full_fetches_all(monkeypatch):
         def _build_accounts_info(self):
             creds = ""
             return [(1, "a@x", "", "", True, creds), (2, "b@x", "", "", False, creds)]
-        def _collect_usage(self, info, only=None, force=False):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
             seen["only"] = only
             return [None, None]
     menubar._snapshot(_SW(), full=True)
@@ -360,7 +360,7 @@ def test_snapshot_incremental_fetches_active_only():
         _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
         def _build_accounts_info(self):
             return [(1, "a@x", "", "", False, ""), (2, "b@x", "", "", True, "")]
-        def _collect_usage(self, info, only=None, force=False):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
             seen["only"] = only
             return [None, None]
     menubar._snapshot(_SW(), full=False)
@@ -1050,7 +1050,7 @@ class _SnapSW:
     def _build_accounts_info(self):
         return [(1, "a@x", "", "", True, "")]
 
-    def _collect_usage(self, info, only=None, force=False):
+    def _collect_usage(self, info, only=None, force=False, max_fetch=None):
         return [None]
 
 
