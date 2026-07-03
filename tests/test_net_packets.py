@@ -85,3 +85,82 @@ def test_normalize_all_zero_is_all_zero():
 
 def test_normalize_scales_against_peak():
     assert net_packets.normalize([0, 50, 100]) == [0.0, 0.5, 1.0]
+
+
+# ---- PacketRateMonitor --------------------------------------------------
+
+class _FakeStream:
+    """Canned nettop stream: a finite list of lines + a close flag."""
+
+    def __init__(self, lines):
+        self.lines = iter(lines)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _sample(pid, pin, pout):
+    return f"12:00:00.0,proc.{pid},{pin},{pout},\n"
+
+
+def _run_monitor(lines, pids):
+    """Start a monitor on a finite fake stream and wait for the reader to drain."""
+    stream = _FakeStream(lines)
+    mon = net_packets.PacketRateMonitor(window=30, sampler=lambda: stream)
+    mon.set_target_pids(pids)
+    mon.start()
+    mon._thread.join(timeout=2.0)  # finite stream -> thread exits on drain
+    return mon
+
+
+def test_monitor_computes_per_second_deltas_for_target_pid():
+    # Three samples for pid 42: cumulative 100 -> 250 -> 400.
+    # First sample = baseline (rate 0), then deltas 150, 150.
+    lines = [
+        "time,,packets_in,packets_out,\n", _sample(42, 100, 0),
+        "time,,packets_in,packets_out,\n", _sample(42, 250, 0),
+        "time,,packets_in,packets_out,\n", _sample(42, 400, 0),
+    ]
+    mon = _run_monitor(lines, {42})
+    assert mon.rates() == [0, 150, 150]
+    assert mon.current() == 150
+
+
+def test_monitor_sums_in_and_out_and_ignores_other_pids():
+    lines = [
+        "time,,packets_in,packets_out,\n", _sample(1, 10, 5), _sample(2, 999, 999),
+        "time,,packets_in,packets_out,\n", _sample(1, 40, 5), _sample(2, 999, 999),
+    ]
+    mon = _run_monitor(lines, {1})  # pid 2 excluded
+    # baseline 15, then cur 45 -> delta 30
+    assert mon.rates() == [0, 30]
+
+
+def test_monitor_empty_before_start():
+    mon = net_packets.PacketRateMonitor()
+    assert mon.rates() == []
+    assert mon.current() == 0
+
+
+def test_monitor_stop_closes_stream():
+    stream = _FakeStream([])
+    mon = net_packets.PacketRateMonitor(sampler=lambda: stream)
+    mon.start()
+    mon._thread.join(timeout=2.0)
+    mon.stop()
+    assert stream.closed is True
+
+
+def test_monitor_start_is_idempotent():
+    calls = []
+
+    def sampler():
+        calls.append(1)
+        return _FakeStream([])
+
+    mon = net_packets.PacketRateMonitor(sampler=sampler)
+    mon.start()
+    mon.start()
+    mon._thread.join(timeout=2.0)
+    assert len(calls) == 1

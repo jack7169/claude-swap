@@ -366,32 +366,64 @@ Expected: FAIL — `AttributeError: module 'claude_swap.net_packets' has no attr
 
 Append to `src/claude_swap/net_packets.py`:
 
+> **Buffering note (discovered during implementation):** `nettop -L 0`
+> **full-buffers** its stdout to a pipe, so a `subprocess.PIPE` yields nothing
+> until ~8 KB accumulates or the process exits — the monitor's deque stays
+> empty. Attaching a **pseudo-terminal** makes `nettop` line-buffer as it does
+> in a real terminal, so each 1 Hz sample flushes promptly. The real stream
+> therefore reads a pty master fd. (The injected-fake-sampler tests are
+> unaffected — they never touch `_spawn_nettop`.)
+
 ```python
 class _NettopStream:
-    """Adapts a live ``nettop`` subprocess to the sampler stream contract."""
+    """Adapts a live ``nettop`` subprocess to the sampler stream contract.
 
-    def __init__(self, proc: subprocess.Popen):
+    ``nettop -L 0`` full-buffers stdout to a pipe; a pty makes it line-buffer.
+    We read the pty master fd and split it into newline-terminated lines.
+    """
+
+    def __init__(self, proc: subprocess.Popen, master_fd: int):
         self._proc = proc
-        self.lines = proc.stdout  # iterable of decoded lines
+        self._master_fd = master_fd
+        self.lines = self._iter_lines()
+
+    def _iter_lines(self):
+        buf = b""
+        try:
+            while True:
+                chunk = os.read(self._master_fd, 65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    yield (line + b"\n").decode("utf-8", "replace")
+        except OSError:
+            # pty master read raises EIO once the child exits — clean EOF.
+            pass
 
     def close(self) -> None:
         try:
             self._proc.terminate()
         except Exception:
             pass
+        try:
+            os.close(self._master_fd)
+        except Exception:
+            pass
 
 
 def _spawn_nettop() -> _NettopStream:
     """Launch the one long-lived ``nettop`` stream (single fork, under the lock)."""
+    import pty  # lazy: keeps this module import-safe on non-Unix
+
+    master, slave = pty.openpty()
     with spawn.fork_lock:
         proc = subprocess.Popen(
-            NETTOP_ARGS,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
+            NETTOP_ARGS, stdout=slave, stderr=subprocess.DEVNULL, close_fds=True,
         )
-    return _NettopStream(proc)
+    os.close(slave)
+    return _NettopStream(proc, master)
 
 
 class PacketRateMonitor:
