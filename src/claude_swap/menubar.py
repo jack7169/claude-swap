@@ -1093,6 +1093,23 @@ def _worker_impl(
             snap = _snapshot(app.switcher, full=full, force=force, max_fetch=max_fetch)
         app.snapshot = snap
         app._snapshot_at = time.time()
+        # Keep the packet-rate graph summing the right processes. One extra
+        # local read of the session/IDE lockfiles per refresh cycle (cheap,
+        # and independent of the usage snapshot). Guarded: no-op when no
+        # monitor is attached (e.g. in unit tests / off macOS).
+        monitor = getattr(app, "_packet_monitor", None)
+        if monitor is not None:
+            try:
+                sessions, ides = get_running_instances()
+                monitor.set_target_pids(
+                    {os.getpid()}
+                    | {s.pid for s in sessions}
+                    | {i.pid for i in ides}
+                )
+            except Exception:
+                app.switcher._logger.debug(
+                    "packet monitor pid update failed", exc_info=True
+                )
         # A full pass re-fetched over the network (there is no rate-limit backoff
         # to suppress it), so stamp it as the freshest full fetch — this is what
         # gates the auto-switch evaluation in plan_auto_tick.

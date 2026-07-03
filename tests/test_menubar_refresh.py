@@ -658,3 +658,45 @@ def test_unchanged_signature_consumes_dirty_even_while_open():
     app._dirty = True  # dirty but snapshot/settings unchanged
     assert menubar._maybe_rebuild_on_dirty(app) is False
     assert app._dirty is False  # consumed; nothing pending
+
+
+# ---------------------------------------------------------------------------
+# Packet-rate monitor — the refresh worker keeps its target PIDs current
+# ---------------------------------------------------------------------------
+
+
+def test_worker_updates_packet_monitor_target_pids(monkeypatch):
+    """_worker_impl pushes cswap + Claude Code PIDs to an attached monitor."""
+    import os
+    from claude_swap.process_detection import ClaudeSession, IdeInstance
+
+    captured = {}
+
+    class FakeMonitor:
+        def set_target_pids(self, pids):
+            captured["pids"] = set(pids)
+
+    # Two running Claude processes: one CLI session (pid 4242), one IDE (pid 5353).
+    monkeypatch.setattr(
+        menubar, "get_running_instances",
+        lambda *a, **k: (
+            [ClaudeSession(pid=4242, session_id="s", cwd="/", started_at=0,
+                           kind="interactive", entrypoint="cli")],
+            [IdeInstance(port=1, pid=5353, ide_name="VS Code")],
+        ),
+    )
+    # Keep the snapshot itself trivial and side-effect free.
+    monkeypatch.setattr(
+        menubar, "_snapshot",
+        lambda switcher, full=True, force=False, max_fetch=None: {
+            "accounts": [], "active_email": None, "active_usage": None,
+            "instances": [],
+        },
+    )
+
+    app = _RefreshHarness()
+    app._packet_monitor = FakeMonitor()
+
+    menubar._worker_impl(app, full=True)
+
+    assert captured["pids"] == {os.getpid(), 4242, 5353}
