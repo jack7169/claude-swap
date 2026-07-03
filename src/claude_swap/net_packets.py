@@ -93,6 +93,24 @@ def normalize(values: list[int]) -> list[float]:
     return [v / peak for v in values]
 
 
+def moving_average(values: list[int], window: int) -> list[float]:
+    """Trailing moving average: element ``i`` is the mean of the last ``window``
+    values up to and including ``i`` (fewer near the start).
+
+    Smooths the per-sample noise into a rolling window (e.g. a 2-sample window
+    over 1 Hz samples is a 2-second average). Empty input -> ``[]``.
+    """
+    if not values:
+        return []
+    window = max(1, window)
+    out: list[float] = []
+    for i in range(len(values)):
+        lo = max(0, i - window + 1)
+        chunk = values[lo:i + 1]
+        out.append(sum(chunk) / len(chunk))
+    return out
+
+
 class _NettopStream:
     """Adapts a live ``nettop`` subprocess to the sampler stream contract.
 
@@ -101,6 +119,13 @@ class _NettopStream:
     until exit). Attaching a pseudo-terminal makes ``nettop`` line-buffer the
     way it does in a real terminal, so each 1 Hz sample flushes promptly. We
     read the pty master fd and split it into newline-terminated lines.
+
+    The child is also made a **session leader with the pty slave as its
+    controlling terminal** (see :func:`_spawn_nettop`), so that when this
+    process dies for *any* reason — graceful quit, ``SIGTERM``, ``SIGKILL``, or
+    a crash — closing the master fd delivers ``SIGHUP`` to ``nettop`` and it
+    exits within one sample. This is the real anti-orphan guarantee; the
+    explicit :meth:`close` below is belt-and-suspenders for the normal path.
     """
 
     def __init__(self, proc: subprocess.Popen, master_fd: int):
@@ -140,17 +165,32 @@ class _NettopStream:
 def _spawn_nettop() -> _NettopStream:
     """Launch the one long-lived ``nettop`` stream (single fork, under the lock).
 
-    Runs under a pty (see :class:`_NettopStream`) so ``nettop`` line-buffers.
-    ``pty`` is imported lazily to keep this module import-safe on non-Unix.
+    Runs ``nettop`` under a pty (see :class:`_NettopStream`) so it line-buffers,
+    and makes it a session leader owning the pty slave as its controlling
+    terminal so it receives ``SIGHUP`` (and dies) the moment we close the master
+    fd — including implicit close on our process death, orphan-proofing it.
+
+    ``pty``/``fcntl``/``termios`` are imported lazily to keep this module
+    import-safe on non-Unix.
     """
+    import fcntl
     import pty
+    import termios
+
+    def _preexec():
+        # Async-signal-safe only: new session, then claim the slave (fd 0) as
+        # the controlling tty. No Python-level locks touched between fork+exec.
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
     master, slave = pty.openpty()
     with spawn.fork_lock:
         proc = subprocess.Popen(
             NETTOP_ARGS,
+            stdin=slave,
             stdout=slave,
             stderr=subprocess.DEVNULL,
+            preexec_fn=_preexec,
             close_fds=True,
         )
     os.close(slave)  # our copy; nettop holds its own
@@ -169,8 +209,12 @@ class PacketRateMonitor:
     absent, the deque simply stops updating and the graph shows its empty state.
     """
 
-    def __init__(self, *, window: int = 30, sampler=None):
+    def __init__(self, *, window: int = 30, avg_window: int = 2, sampler=None):
         self._sampler = sampler or _spawn_nettop
+        # Samples to average for display. nettop samples at 1 Hz (its floor —
+        # it rejects sub-second ``-s``), so 2 samples ≈ a 2-second rolling
+        # average. Exposed so the graph view can smooth the plotted series.
+        self.avg_window = avg_window
         self._rates: collections.deque[int] = collections.deque(maxlen=window)
         self._prev_total: int | None = None
         self._pids: set[int] = set()

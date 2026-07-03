@@ -374,12 +374,25 @@ Append to `src/claude_swap/net_packets.py`:
 > therefore reads a pty master fd. (The injected-fake-sampler tests are
 > unaffected — they never touch `_spawn_nettop`.)
 
+> **Orphan-proofing (also discovered during implementation):** killing the app
+> with a signal skips the `finally: stop()`, and a plain pty slave is not
+> `nettop`'s controlling terminal — so closing the master did **not** kill
+> `nettop`, leaving one orphan per launch. Fix: make `nettop` a session leader
+> that owns the pty slave as its **controlling terminal** (`setsid()` +
+> `TIOCSCTTY` in a `preexec_fn`). Then closing the master fd — which happens on
+> *any* parent death (graceful quit, `SIGTERM`, `SIGKILL`, crash) — delivers
+> `SIGHUP` and `nettop` exits within one sample. Verified live: orphan gone in
+> ~0.25 s. Both syscalls are async-signal-safe and the spawn is already under
+> `fork_lock`.
+
 ```python
 class _NettopStream:
     """Adapts a live ``nettop`` subprocess to the sampler stream contract.
 
     ``nettop -L 0`` full-buffers stdout to a pipe; a pty makes it line-buffer.
-    We read the pty master fd and split it into newline-terminated lines.
+    We read the pty master fd and split it into newline-terminated lines. The
+    child owns the pty as its controlling terminal, so closing the master fd
+    (on any parent death) delivers SIGHUP and it exits — orphan-proofing it.
     """
 
     def __init__(self, proc: subprocess.Popen, master_fd: int):
@@ -415,12 +428,19 @@ class _NettopStream:
 
 def _spawn_nettop() -> _NettopStream:
     """Launch the one long-lived ``nettop`` stream (single fork, under the lock)."""
+    import fcntl
     import pty  # lazy: keeps this module import-safe on non-Unix
+    import termios
+
+    def _preexec():  # async-signal-safe only
+        os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)  # slave (fd 0) -> controlling tty
 
     master, slave = pty.openpty()
     with spawn.fork_lock:
         proc = subprocess.Popen(
-            NETTOP_ARGS, stdout=slave, stderr=subprocess.DEVNULL, close_fds=True,
+            NETTOP_ARGS, stdin=slave, stdout=slave, stderr=subprocess.DEVNULL,
+            preexec_fn=_preexec, close_fds=True,
         )
     os.close(slave)
     return _NettopStream(proc, master)
@@ -789,8 +809,10 @@ to:
     try:
         MenuBarApp().run()
     finally:
-        # Best-effort: also, nettop self-terminates on SIGPIPE when this
-        # process exits (its next 1 Hz write hits the closed pipe).
+        # Belt-and-suspenders for the graceful path. The real guarantee is the
+        # controlling-tty SIGHUP in net_packets: nettop dies whenever this
+        # process closes the master fd, including on signals/crash where this
+        # finally never runs.
         packet_monitor.stop()
     return 0
 ```
@@ -872,6 +894,6 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 - **Why one extra `get_running_instances()` call (Task 3) instead of threading PIDs through `_snapshot`?** Adding a key to the snapshot dict would ripple into `_snapshot`'s equality-based tests and `_snapshot_signature`. The extra call is a handful of local JSON reads once per refresh interval (15–60 s) — negligible, and zero blast radius on existing tests.
 - **Why insert on the raw `NSMenu` (Task 4) instead of `self.menu[...] = item`?** rumps keys items by title; a view-only item has no meaningful title and rumps would mismanage/drop it. `insertItem_atIndex_` on `self.menu._menu` is the same escape hatch the code already uses (`self.menu._menu.setDelegate_`, `.highlightedItem()`).
-- **Lifecycle safety:** `nettop` is a child of the cswap process; when cswap exits, `nettop`'s next 1 Hz write to the closed stdout pipe raises SIGPIPE and it dies on its own. The `try/finally: stop()` is belt-and-suspenders for the graceful-quit path.
+- **Lifecycle safety:** `nettop` runs under a pty it owns as its controlling terminal, so closing the master fd (which happens on any cswap-process death — graceful quit, SIGTERM, SIGKILL, crash) delivers SIGHUP and `nettop` exits within one sample. The `try/finally: stop()` is belt-and-suspenders for the graceful path. Verified live: no orphaned `nettop` after killing the app.
 - **Do not** put the graph behind `login_item.is_bundled()` — it should work in both the `.app` and the terminal/LaunchAgent install.
 ```
