@@ -1655,35 +1655,31 @@ def run(switcher) -> int:
             )
 
             def _smooth(path, points):
-                # Quadratic-midpoint smoothing expressed as cubic Béziers.
-                # _GRAPH_SMOOTHING blends the control handles between the fully
-                # curved position (1.0) and the straight segment (0.0).
-                if len(points) < 3:
+                # Catmull-Rom spline expressed as cubic Béziers. Unlike the old
+                # midpoint method, the curve passes THROUGH every point, so a
+                # sample looks the same whether it is at an edge or the middle
+                # (no control-vs-anchor flip that made edge points overshoot the
+                # tick before they scrolled off). Endpoint tangents are clamped
+                # (one-sided) so the visible ends don't overshoot the data.
+                # _GRAPH_SMOOTHING scales the tangents: 0.0 = straight segments,
+                # 1.0 = full Catmull-Rom. `path` must already be at points[0].
+                m = len(points)
+                if m < 3:
                     for p in points[1:]:
                         path.lineToPoint_(NSMakePoint(*p))
                     return
                 s = _GRAPH_SMOOTHING
-                cur = points[0]
-                for i in range(1, len(points) - 1):
-                    ctrl = points[i]
-                    end = ((points[i][0] + points[i + 1][0]) / 2.0,
-                           (points[i][1] + points[i + 1][1]) / 2.0)
-                    cp1s = (cur[0] + 2.0 / 3.0 * (ctrl[0] - cur[0]),
-                            cur[1] + 2.0 / 3.0 * (ctrl[1] - cur[1]))
-                    cp2s = (end[0] + 2.0 / 3.0 * (ctrl[0] - end[0]),
-                            end[1] + 2.0 / 3.0 * (ctrl[1] - end[1]))
-                    cp1l = (cur[0] + (end[0] - cur[0]) / 3.0,
-                            cur[1] + (end[1] - cur[1]) / 3.0)
-                    cp2l = (cur[0] + 2.0 * (end[0] - cur[0]) / 3.0,
-                            cur[1] + 2.0 * (end[1] - cur[1]) / 3.0)
-                    cp1 = (cp1l[0] + s * (cp1s[0] - cp1l[0]),
-                           cp1l[1] + s * (cp1s[1] - cp1l[1]))
-                    cp2 = (cp2l[0] + s * (cp2s[0] - cp2l[0]),
-                           cp2l[1] + s * (cp2s[1] - cp2l[1]))
+                for i in range(m - 1):
+                    p0 = points[i - 1] if i > 0 else points[0]
+                    p1 = points[i]
+                    p2 = points[i + 1]
+                    p3 = points[i + 2] if i + 2 < m else points[m - 1]
+                    cp1 = (p1[0] + s * (p2[0] - p0[0]) / 6.0,
+                           p1[1] + s * (p2[1] - p0[1]) / 6.0)
+                    cp2 = (p2[0] - s * (p3[0] - p1[0]) / 6.0,
+                           p2[1] - s * (p3[1] - p1[1]) / 6.0)
                     path.curveToPoint_controlPoint1_controlPoint2_(
-                        NSMakePoint(*end), NSMakePoint(*cp1), NSMakePoint(*cp2))
-                    cur = end
-                path.lineToPoint_(NSMakePoint(*points[-1]))
+                        NSMakePoint(*p2), NSMakePoint(*cp1), NSMakePoint(*cp2))
 
             # Clip to the plot rect so points scrolled off the left don't paint
             # over the rest of the row.
