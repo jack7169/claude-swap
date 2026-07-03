@@ -583,21 +583,11 @@ def test_maybe_roll_skips_while_in_flight():
     assert app.calls == []
 
 
-# Display auto-refresh must run even when auto-switch is OFF. The default-mode
-# refresh_timer is paused while the menu is open, and the common-modes tick only
-# refreshed when auto-switch was enabled. Rolling refresh (_maybe_roll, tested
-# above) now keeps usage current one account at a time whether the menu is open
-# or closed, superseding the old plan_display_refresh gate.
-
-def test_refresh_countdown_text_counts_down():
-    text = menubar.refresh_countdown_text(12.0, 30)
-    assert text.startswith("Next refresh:")
-    assert text.endswith("(every 30s)")
-
-
-def test_refresh_countdown_text_shows_activity_at_zero():
-    assert menubar.refresh_countdown_text(0.0, 30) == "Refreshing now… (every 30s)"
-
+# Display auto-refresh runs even when auto-switch is OFF: rolling refresh
+# (_maybe_roll, tested above) keeps usage current one account at a time whether
+# the menu is open or closed. Each row shows its own "↻ <n> ago" freshness
+# (format_account_label / format_refresh_age), so there is no global "next
+# refresh" countdown anymore (it was meaningless under continuous rolling).
 
 def test_rebuild_deferred_while_menu_open_then_runs_on_close():
     """A rebuild requested while the menu is open is deferred (tearing down the

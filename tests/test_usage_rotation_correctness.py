@@ -140,7 +140,7 @@ class TestCollectUsageTransientFailure:
         # Display resilience: last-known-good dict is retained for slot 2.
         assert out[1] == {"five_hour": {"pct": 20.0}}
 
-    def test_rate_limited_surfaces_indication(self, temp_home, monkeypatch):
+    def test_rate_limited_retains_last_usage(self, temp_home, monkeypatch):
         s = _make_switcher()
         monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
         _seed_prior_cache(s)
@@ -151,9 +151,9 @@ class TestCollectUsageTransientFailure:
 
         out = s._collect_usage(_info(), only={"1", "2"})
 
-        # A 429 is SURFACED as the "rate limited" sentinel, not hidden behind the
-        # stale cached dict — visibility over silent staleness.
-        assert out[1] == "rate limited"
+        # A 429 does NOT wipe the last usage — the prior % dict is retained (its
+        # validAt records how stale it is) rather than replaced by a sentinel.
+        assert out[1] == {"five_hour": {"pct": 20.0}}
 
 
 class TestBestStrategySkipsDefinitivelyFailed:

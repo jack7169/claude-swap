@@ -214,19 +214,6 @@ def auto_switch_countdown_text(seconds_to_next: float, cadence: int) -> str:
     return f"Next check: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
 
 
-def refresh_countdown_text(seconds_to_next: float, cadence: int) -> str:
-    """The live 'next display refresh' line, shown when auto-switch is OFF.
-
-    Auto-switch on has its own 'Next check' countdown; when it is off this shows
-    that usage still auto-refreshes on the display cadence. Mirrors
-    :func:`auto_switch_countdown_text` — an activity hint at zero rather than a
-    frozen ``0:00`` while the (background) refresh runs.
-    """
-    if seconds_to_next <= 0:
-        return f"Refreshing now… (every {cadence}s)"
-    return f"Next refresh: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
-
-
 _ROLL_MIN_INTERVAL = 5.0  # never fetch faster than this, however many accounts
 
 
@@ -294,11 +281,40 @@ def login_item_menu_state(status: str) -> int:
     return 1 if status == "enabled" else 0
 
 
+def format_refresh_age(valid_at: float | None, now: float) -> str:
+    """Compact 'time since last valid usage refresh' (e.g. ``"3m ago"``).
+
+    Empty when unknown (no successful fetch yet, or a clock-skew future stamp).
+    Lets each row show how stale its (retained) usage is under a rate limit,
+    instead of wiping the data.
+    """
+    if not valid_at or now < valid_at:
+        return ""
+    d = int(now - valid_at)
+    if d < 60:
+        return f"{d}s ago"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    return f"{d // 3600}h ago"
+
+
 def format_account_label(
     num: int, email: str, usage: dict | str | None, now: float | None = None
 ) -> str:
-    """Build one account row's menu label."""
-    return f"{num}  {email}  {usage_summary(usage, now)}"
+    """Build one account row's menu label, with a 'last valid refresh' age.
+
+    The age (``↻ <n> ago``) shows how fresh each account's usage is — under a
+    usage-API rate limit the last-known ``%`` is kept and simply ages, rather
+    than being wiped, so the row stays useful and the staleness is visible.
+    """
+    if now is None:
+        now = time.time()
+    label = f"{num}  {email}  {usage_summary(usage, now)}"
+    if isinstance(usage, dict):
+        age = format_refresh_age(usage.get("validAt"), now)
+        if age:
+            label += f"   ↻ {age}"
+    return label
 
 
 def account_detail_lines(usage: dict | str | None) -> list[str]:
@@ -849,6 +865,16 @@ def _snapshot(
         usages = switcher._collect_usage(
             accounts_info, only=only, force=force, max_fetch=max_fetch
         )
+        # Attach the per-account "last valid fetch" epoch to a DISPLAY copy of
+        # each usage dict (kept off the switcher's cached dicts / CLI / JSON) so
+        # the row can show how stale a rate-limited-but-retained % is.
+        valid_at = getattr(switcher, "_last_valid_at", {}) or {}
+        usages = [
+            {**u, "validAt": valid_at[str(info[0])]}
+            if isinstance(u, dict) and valid_at.get(str(info[0]))
+            else u
+            for info, u in zip(accounts_info, usages)
+        ]
     except Exception:
         switcher._logger.debug("menubar snapshot failed", exc_info=True)
         return {
@@ -1531,7 +1557,6 @@ def run(switcher) -> int:
             self._dirty = False
             self._menu_sig = None  # signature of the last rendered menu (3.3)
             self._countdown_item = None  # live "Next check:" header item, if any
-            self._refresh_countdown_item = None  # live "Next refresh:" item (auto-swap off)
             self._account_rows = []  # [(num, label_item, [detail_items])] for live updates
             self._menu_open = False  # set by the NSMenu delegate; gates rebuilds
             self.state = MenuBarState.load(state_path)
@@ -1675,15 +1700,6 @@ def run(switcher) -> int:
                 )
                 if item.title != text:
                     item.title = text
-
-            rc = self._refresh_countdown_item
-            if rc is not None and not self.settings.auto_switch_enabled:
-                rcadence = self.settings.refresh_interval
-                rtext = refresh_countdown_text(
-                    max(0.0, (self._snapshot_at + rcadence) - now), rcadence
-                )
-                if rc.title != rtext:
-                    rc.title = rtext
 
             by_num = {
                 num: (email, usage)
@@ -1830,19 +1846,9 @@ def run(switcher) -> int:
                 self.menu.add(item)
                 if self.settings.auto_switch_enabled and idx == len(header) - 1:
                     self._countdown_item = item  # the live "Next check:" line
-            # Auto-switch OFF has no "Next check" line, but usage still
-            # auto-refreshes on the display cadence — show a live "Next refresh:"
-            # countdown so that activity is visible (re-titled by _update_live_rows,
-            # so its text stays OUT of the rebuild signature).
-            self._refresh_countdown_item = None
-            if not self.settings.auto_switch_enabled:
-                rcadence = self.settings.refresh_interval
-                rsecs = max(0.0, (self._snapshot_at + rcadence) - time.time())
-                rc_item = rumps.MenuItem(
-                    refresh_countdown_text(rsecs, rcadence), callback=None
-                )
-                self.menu.add(rc_item)
-                self._refresh_countdown_item = rc_item
+            # (Rolling refresh continuously updates one account at a time; each
+            # account row shows its own "↻ <n> ago" freshness via
+            # format_account_label, so there is no single global refresh countdown.)
             # Auto-timer-start toggle: its own clickable line directly below the
             # Auto-swap header, mirroring on_toggle_autoswitch (flip -> save ->
             # rebuild, no restart). Keeps warming every idle account's 5h window.

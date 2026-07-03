@@ -87,20 +87,27 @@ _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads
 
 
 def _usage_cache_entry(value) -> dict:
-    """Normalize a usage-cache entry to ``{"usage", "fetchedAt"}``.
+    """Normalize a usage-cache entry to ``{"usage", "fetchedAt", "validAt"}``.
 
-    Current entries carry their own per-account freshness stamp. Legacy
-    entries (bare usage dict / sentinel string / null from before the stamp
-    format) normalize to ``fetchedAt=0`` — always stale — so they refresh on
-    the next round and upgrade on write. No migration pass needed.
+    ``fetchedAt`` stamps every attempt (rotation); ``validAt`` stamps only a
+    successful fetch (for "time since last valid refresh"). Legacy entries (bare
+    usage dict / sentinel / null, or entries without ``validAt``) normalize with
+    the missing stamps at ``0`` — always stale — so they refresh next round and
+    upgrade on write. No migration pass needed.
     """
     if (
         isinstance(value, dict)
-        and set(value.keys()) == {"usage", "fetchedAt"}
+        and "usage" in value
         and isinstance(value.get("fetchedAt"), (int, float))
+        and set(value.keys()) <= {"usage", "fetchedAt", "validAt"}
     ):
-        return value
-    return {"usage": value, "fetchedAt": 0.0}
+        va = value.get("validAt")
+        return {
+            "usage": value["usage"],
+            "fetchedAt": float(value["fetchedAt"]),
+            "validAt": float(va) if isinstance(va, (int, float)) else 0.0,
+        }
+    return {"usage": value, "fetchedAt": 0.0, "validAt": 0.0}
 
 
 def _usage_entry_fresh(entry: dict, ttl: float, now: float) -> bool:
@@ -206,6 +213,9 @@ class ClaudeAccountSwitcher:
         # read-only selection phase only — never active across ``_perform_switch``,
         # which captures fresh live state and writes.
         self._backup_read_cache: dict[tuple[str, str, str], str] | None = None
+        # Per-account "last valid usage fetch" epoch (num-str -> ts), populated by
+        # _collect_usage; the menu reads it to show "time since last valid refresh".
+        self._last_valid_at: dict[str, float] = {}
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
         # Optional swap notifier (cli.main wires this on macOS). Invoked from the
@@ -2190,41 +2200,63 @@ class ClaudeAccountSwitcher:
                 )
                 break
 
-        # Merge: a fresh usage dict wins; a DEFINITIVE failure this round
-        # (USAGE_TOKEN_EXPIRED / USAGE_NO_CREDENTIALS — the credential just
-        # failed) overrides any stale cached dict so account_headroom resolves
-        # to None ("unknown" → never auto-selected by best/next-available);
-        # TRANSIENT/ambiguous results (a bare None network blip, or
-        # USAGE_RATE_LIMITED) retain the prior good dict for display
-        # resilience. Every ATTEMPTED account is stamped ``now`` — even on
-        # failure — so ordering rotates and a broken account isn't hammered
-        # every tick; unattempted accounts keep their prior entry unchanged
-        # (their stamps keep aging, putting them first next round).
+        # Merge. ``fetchedAt`` stamps every ATTEMPT (even failures) so ordering
+        # rotates and a broken account isn't hammered every round; ``validAt``
+        # (embedded in the usage dict) advances ONLY on a successful fetch, so
+        # the menu can show "time since last valid refresh" per account.
+        #   * fresh usage dict  -> store it, stamp validAt=now.
+        #   * DEFINITIVE failure (USAGE_TOKEN_EXPIRED / USAGE_NO_CREDENTIALS —
+        #     the credential just failed) -> override any stale dict so
+        #     account_headroom resolves to None ("unknown", never auto-selected).
+        #   * TRANSIENT failure (429 / bare-None network blip) -> KEEP the last
+        #     valid usage dict (do NOT wipe it); its validAt shows how stale it
+        #     is. This is what keeps every account's % visible under rate limits.
+        # Unattempted accounts keep their prior entry unchanged (stamps keep
+        # aging, putting them first next round).
+        def _prior_valid_at(entry) -> float:
+            return entry.get("validAt", 0.0) if entry else 0.0
+
         result_entries: dict[str, dict] = {}
         for k in account_keys:
             prior_entry = prior.get(k)
             if k in fetched:
                 val = fetched[k]
-                if isinstance(val, dict) or val in (
-                    USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS, USAGE_RATE_LIMITED
-                ):
-                    # A 429 (USAGE_RATE_LIMITED) is now surfaced, not hidden
-                    # behind a stale cached dict — the user sees "rate limited".
-                    result_entries[k] = {"usage": val, "fetchedAt": now}
+                if isinstance(val, dict):
+                    # A valid refresh: advance validAt.
+                    result_entries[k] = {
+                        "usage": val, "fetchedAt": now, "validAt": now
+                    }
+                elif val in (USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS):
+                    result_entries[k] = {
+                        "usage": val, "fetchedAt": now,
+                        "validAt": _prior_valid_at(prior_entry),
+                    }
                 elif prior_entry is not None and isinstance(
                     prior_entry["usage"], dict
                 ):
+                    # 429 / transient blip: retain the last valid usage dict
+                    # (keeping its older validAt so the row shows the staleness)
+                    # rather than wiping it to a bare sentinel.
                     result_entries[k] = {
-                        "usage": prior_entry["usage"], "fetchedAt": now
+                        "usage": prior_entry["usage"], "fetchedAt": now,
+                        "validAt": _prior_valid_at(prior_entry),
                     }
                 else:
-                    result_entries[k] = {"usage": val, "fetchedAt": now}
+                    result_entries[k] = {
+                        "usage": val, "fetchedAt": now,
+                        "validAt": _prior_valid_at(prior_entry),
+                    }
             elif prior_entry is not None:
-                result_entries[k] = prior_entry
+                result_entries[k] = prior_entry  # unattempted: keeps its validAt
             else:
-                result_entries[k] = {"usage": None, "fetchedAt": 0.0}
+                result_entries[k] = {"usage": None, "fetchedAt": 0.0, "validAt": 0.0}
 
         write_cache(usage_cache_path, result_entries)
+        # Expose per-account "last valid fetch" so the menu can show its age
+        # (kept off the usage dict so CLI/JSON/headroom stay unpolluted).
+        self._last_valid_at = {
+            k: result_entries[k].get("validAt", 0.0) for k in account_keys
+        }
         return [result_entries[k]["usage"] for k in account_keys]
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
@@ -2451,7 +2483,14 @@ class ClaudeAccountSwitcher:
             latest = read_cache(usage_cache_path, _FOREVER, default=None)
             existing = latest if isinstance(latest, dict) else {}
             existing = {k: _usage_cache_entry(v) for k, v in existing.items()}
-            existing[account_num] = {"usage": usage, "fetchedAt": time.time()}
+            _now = time.time()
+            # Advance validAt only on a valid usage dict (mirrors _collect_usage),
+            # so this shared cache stays consistent for the menu's staleness age.
+            _prior_va = existing.get(account_num, {}).get("validAt", 0.0)
+            existing[account_num] = {
+                "usage": usage, "fetchedAt": _now,
+                "validAt": _now if isinstance(usage, dict) else _prior_va,
+            }
             write_cache(usage_cache_path, existing)
         return usage
 

@@ -93,6 +93,31 @@ def test_format_account_label():
     assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
+def test_format_refresh_age_units():
+    now = 1000.0
+    assert menubar.format_refresh_age(now - 5, now) == "5s ago"
+    assert menubar.format_refresh_age(now - 120, now) == "2m ago"
+    assert menubar.format_refresh_age(now - 7200, now) == "2h ago"
+
+
+def test_format_refresh_age_unknown_is_empty():
+    assert menubar.format_refresh_age(None, 1000.0) == ""
+    assert menubar.format_refresh_age(0.0, 1000.0) == ""
+
+
+def test_account_label_shows_time_since_last_valid_refresh():
+    # A stale (rate-limited) account keeps its % and shows how old it is.
+    usage = {"five_hour": {"pct": 45.0}, "validAt": 1000.0 - 180}
+    label = menubar.format_account_label(1, "a@x", usage, now=1000.0)
+    assert "45%" in label       # % retained
+    assert "3m ago" in label    # time since last valid refresh
+
+
+def test_account_label_no_age_without_validat():
+    label = menubar.format_account_label(1, "a@x", {"five_hour": {"pct": 45.0}}, now=1000.0)
+    assert "ago" not in label
+
+
 def test_auto_switch_strategy_label_known():
     assert menubar.auto_switch_strategy_label("reactive") == "Reactive"
     assert menubar.auto_switch_strategy_label("consume-first") == "Consume-first"

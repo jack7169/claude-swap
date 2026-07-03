@@ -76,10 +76,10 @@ class TestCollectUsageForceRefresh:
         assert out[0] == {"five_hour": {"pct": 33.0}}   # fresh values returned
         assert out[1] == {"five_hour": {"pct": 44.0}}
 
-    def test_force_true_fetches_and_surfaces_429(self, temp_home, monkeypatch):
+    def test_force_true_fetches_but_retains_usage_on_429(self, temp_home, monkeypatch):
         # There is no 429 backoff to block force: the round still fetches, and a
-        # rate-limited account is surfaced ("rate limited") rather than served as
-        # a frozen (stale) percentage.
+        # rate-limited account KEEPS its last-known % (retained, not wiped) rather
+        # than being replaced by a sentinel.
         s = self._setup(temp_home)
         monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
         self._seed_fresh_cache(s)
@@ -90,4 +90,4 @@ class TestCollectUsageForceRefresh:
         out = s._collect_usage(self._info(), force=True)
 
         assert "2" in calls                             # backup account was fetched
-        assert out[1] == "rate limited"                 # surfaced, not the stale 22.0
+        assert out[1] == {"five_hour": {"pct": 22.0}}   # retained, not wiped

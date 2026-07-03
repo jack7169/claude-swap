@@ -109,8 +109,9 @@ class TestPerAccountFreshness(_Base):
         assert out == [{"five_hour": {"pct": 33.0}}, {"five_hour": {"pct": 44.0}}]
         entries = self._cache_entries(s)
         for k in ("1", "2"):
-            assert set(entries[k]) == {"usage", "fetchedAt"}  # upgraded format
+            assert set(entries[k]) == {"usage", "fetchedAt", "validAt"}  # upgraded format
             assert entries[k]["fetchedAt"] == FROZEN
+            assert entries[k]["validAt"] == FROZEN  # fresh fetch stamps validAt
 
     def test_future_fetched_at_is_stale(self, temp_home, frozen_now, monkeypatch):
         """A stamp in the future (clock rollback, restored backup) must not
@@ -194,7 +195,7 @@ class TestPerAccountFreshness(_Base):
         # Stalest goes first; its 429 ends the round immediately (no backoff armed).
         assert calls == ["2"]
         assert out == [{"five_hour": {"pct": 11.0}},
-                       "rate limited",   # slot 2's 429 is SURFACED, not hidden as stale
+                       {"five_hour": {"pct": 22.0}},   # slot 2's 429 RETAINS its % (not wiped)
                        {"five_hour": {"pct": 33.0}}]
         entries = self._cache_entries(s)
         # Untouched accounts keep their old stamps (keep aging → first next
@@ -202,6 +203,29 @@ class TestPerAccountFreshness(_Base):
         assert entries["1"]["fetchedAt"] == FROZEN - 100
         assert entries["3"]["fetchedAt"] == FROZEN - 200
         assert entries["2"]["fetchedAt"] == FROZEN
+
+    def test_valid_at_holds_on_429_while_fetched_at_advances(
+        self, temp_home, monkeypatch
+    ):
+        """validAt (time of last VALID usage) holds across a 429 while the %
+        is retained; fetchedAt still advances (rotation). This is what powers
+        the menu's per-account 'time since last valid refresh'."""
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(_time, "time", lambda: clock["t"])
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 5.0}}}, [])
+        s._collect_usage(self._info(n=1))
+        assert s._last_valid_at["1"] == 1000.0
+
+        clock["t"] = 1100.0  # time moves on; next fetch is rate-limited
+        self._patch_fetch(monkeypatch, {"1": USAGE_RATE_LIMITED}, [])
+        out = s._collect_usage(self._info(n=1), force=True)
+
+        assert out[0] == {"five_hour": {"pct": 5.0}}              # % retained (not wiped)
+        assert s._last_valid_at["1"] == 1000.0                    # validAt HELD at last success
+        assert self._cache_entries(s)["1"]["fetchedAt"] == 1100.0  # fetchedAt advanced
 
     def test_chronic_429_rotates_attempts_instead_of_starving(
         self, temp_home, frozen_now, monkeypatch
@@ -399,6 +423,8 @@ class TestActiveAccountUsageFormat(_Base):
         assert out == {"five_hour": {"pct": 50.0}}
         entries = self._cache_entries(s)
         assert entries["2"] == {"usage": {"five_hour": {"pct": 22.0}},
-                                "fetchedAt": FROZEN - 30}  # survived the write
+                                "fetchedAt": FROZEN - 30,
+                                "validAt": 0.0}  # survived the write (legacy → validAt 0)
         assert entries["1"] == {"usage": {"five_hour": {"pct": 50.0}},
-                                "fetchedAt": FROZEN}  # new format, stamped
+                                "fetchedAt": FROZEN,
+                                "validAt": FROZEN}  # new format, valid fetch stamped
