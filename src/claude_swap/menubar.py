@@ -22,7 +22,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import login_item, notify, oauth
+from claude_swap import login_item, net_packets, notify, oauth
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.locking import FileLock
@@ -1093,6 +1093,23 @@ def _worker_impl(
             snap = _snapshot(app.switcher, full=full, force=force, max_fetch=max_fetch)
         app.snapshot = snap
         app._snapshot_at = time.time()
+        # Keep the packet-rate graph summing the right processes. One extra
+        # local read of the session/IDE lockfiles per refresh cycle (cheap,
+        # and independent of the usage snapshot). Guarded: no-op when no
+        # monitor is attached (e.g. in unit tests / off macOS).
+        monitor = getattr(app, "_packet_monitor", None)
+        if monitor is not None:
+            try:
+                sessions, ides = get_running_instances()
+                monitor.set_target_pids(
+                    {os.getpid()}
+                    | {s.pid for s in sessions}
+                    | {i.pid for i in ides}
+                )
+            except Exception:
+                app.switcher._logger.debug(
+                    "packet monitor pid update failed", exc_info=True
+                )
         # A full pass re-fetched over the network (there is no rate-limit backoff
         # to suppress it), so stamp it as the freshest full fetch — this is what
         # gates the auto-switch evaluation in plan_auto_tick.
@@ -1493,7 +1510,21 @@ def run(switcher) -> int:
         NSRunLoop,
         NSRunLoopCommonModes,
         NSTimer,
+        NSMakeRect,
+        NSMakePoint,
+        NSString,
     )
+    from AppKit import (  # pyobjc; only present with the [menubar] extra
+        NSView,
+        NSViewWidthSizable,
+        NSMenuItem,
+        NSColor,
+        NSBezierPath,
+        NSFont,
+        NSFontAttributeName,
+        NSForegroundColorAttributeName,
+    )
+    import objc
 
     _guard_against_terminal_suspend()
 
@@ -1513,6 +1544,99 @@ def run(switcher) -> int:
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
     state_path = switcher.backup_dir / "menubar_state.json"
+
+    # Packet-rate graph: one long-lived nettop stream, started before the app so
+    # the dropdown has data as soon as it opens. Seeded with cswap's own PID; the
+    # refresh worker adds the running Claude Code PIDs each cycle.
+    packet_monitor = net_packets.PacketRateMonitor()
+    packet_monitor.set_target_pids({os.getpid()})
+    packet_monitor.start()
+
+    _GRAPH_W, _GRAPH_H = 260.0, 64.0
+    _GRAPH_PAD = 8.0
+
+    class _PacketGraphView(NSView):
+        """Stats-style drawn area/line chart of packets/sec (reads the monitor)."""
+
+        def initWithMonitor_(self, monitor):
+            self = objc.super(_PacketGraphView, self).initWithFrame_(
+                NSMakeRect(0, 0, _GRAPH_W, _GRAPH_H)
+            )
+            if self is None:
+                return None
+            self._monitor = monitor
+            # The dropdown is as wide as its widest text row — wider than this
+            # view's initial frame. Flexible width makes AppKit stretch the view
+            # to the full menu width so the graph fills the row (no blank right
+            # half); drawRect_ reads self.bounds() so it follows the new width.
+            self.setAutoresizingMask_(NSViewWidthSizable)
+            return self
+
+        def drawRect_(self, _rect):
+            bounds = self.bounds()
+            w = bounds.size.width
+            h = bounds.size.height
+            # Smooth the raw per-second samples with the monitor's rolling
+            # window (≈2 s) so the line and the headline number aren't jumpy.
+            smoothed = net_packets.moving_average(
+                self._monitor.rates(), self._monitor.avg_window
+            )
+
+            # Label, top-left. Show the latest smoothed value.
+            cur = round(smoothed[-1]) if smoothed else 0
+            label = f"Claude · {cur} pkt/s" if smoothed else "Claude · —"
+            attrs = {
+                NSFontAttributeName: NSFont.systemFontOfSize_(11.0),
+                NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
+            }
+            NSString.stringWithString_(label).drawAtPoint_withAttributes_(
+                NSMakePoint(_GRAPH_PAD, h - 18.0), attrs
+            )
+
+            norm = net_packets.normalize(smoothed)
+            if not norm:
+                return
+
+            # Plot area below the label.
+            plot_bottom = _GRAPH_PAD
+            plot_top = h - 22.0
+            plot_h = max(1.0, plot_top - plot_bottom)
+            left = _GRAPH_PAD
+            right = w - _GRAPH_PAD
+            span = max(1.0, right - left)
+            n = len(norm)
+            step = span / max(1, n - 1) if n > 1 else span
+
+            def _pt(i, v):
+                x = left + (i * step if n > 1 else span)
+                y = plot_bottom + v * plot_h
+                return NSMakePoint(x, y)
+
+            accent = NSColor.systemBlueColor()
+
+            # Filled area (accent at low alpha) under the line.
+            area = NSBezierPath.bezierPath()
+            area.moveToPoint_(NSMakePoint(left, plot_bottom))
+            for i, v in enumerate(norm):
+                area.lineToPoint_(_pt(i, v))
+            area.lineToPoint_(
+                NSMakePoint(left + (n - 1) * step if n > 1 else right, plot_bottom)
+            )
+            area.closePath()
+            accent.colorWithAlphaComponent_(0.18).setFill()
+            area.fill()
+
+            # Stroked line on top.
+            line = NSBezierPath.bezierPath()
+            line.setLineWidth_(1.5)
+            for i, v in enumerate(norm):
+                pt = _pt(i, v)
+                if i == 0:
+                    line.moveToPoint_(pt)
+                else:
+                    line.lineToPoint_(pt)
+            accent.setStroke()
+            line.stroke()
 
     class _MenuObserver(NSObject):
         """NSMenu delegate + countdown timer target. ``app`` is set by the owner
@@ -1544,6 +1668,11 @@ def run(switcher) -> int:
             if app.settings.auto_switch_enabled:
                 app._auto_tick()  # run the check in common modes (works while open)
             app._update_live_rows()
+            # Animate the packet-rate graph ~1/s (kept out of _snapshot_signature
+            # so it never triggers a full menu rebuild).
+            graph_view = getattr(app, "_graph_view", None)
+            if graph_view is not None:
+                graph_view.setNeedsDisplay_(True)
 
     class MenuBarApp(rumps.App):
         def __init__(self):
@@ -1585,6 +1714,13 @@ def run(switcher) -> int:
             self._action_guard = _RefreshGuard()
             self._config_path = switcher._get_claude_config_path()
             self._config_mtime = 0.0
+            # Packet-rate graph: attach the monitor (started in run()) so the
+            # refresh worker can retarget it, and build the host view + menu
+            # item once. rebuild_menu re-inserts the item at the top each pass.
+            self._packet_monitor = packet_monitor
+            self._graph_view = _PacketGraphView.alloc().initWithMonitor_(packet_monitor)
+            self._graph_item = NSMenuItem.alloc().init()
+            self._graph_item.setView_(self._graph_view)
             self.rebuild_menu()
             # Observe the status-bar menu's open/close so background refreshes
             # don't tear it down while the user has it dropped down (flicker).
@@ -1915,6 +2051,18 @@ def run(switcher) -> int:
             self.menu.add(rumps.MenuItem("Refresh now", callback=self.on_refresh_now))
             self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
+            # Pin the packet-rate graph to the very top of the dropdown. The
+            # menu.clear() at the start of this method detached it, so re-insert
+            # the persistent view item (its 30 s history survives rebuilds) plus
+            # a separator. Inserted directly on the NSMenu (a view item has no
+            # useful title key for rumps' dict). Kept OUT of _snapshot_signature
+            # so redraws never force a rebuild.
+            graph_item = getattr(self, "_graph_item", None)
+            if graph_item is not None:
+                nsmenu = self.menu._menu
+                nsmenu.insertItem_atIndex_(graph_item, 0)
+                nsmenu.insertItem_atIndex_(NSMenuItem.separatorItem(), 1)
+
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
@@ -2239,5 +2387,12 @@ def run(switcher) -> int:
                 self._save_and_rebuild()
             return cb
 
-    MenuBarApp().run()
+    try:
+        MenuBarApp().run()
+    finally:
+        # Belt-and-suspenders for the graceful path. The real guarantee is in
+        # net_packets: nettop owns the pty as its controlling terminal, so it
+        # gets SIGHUP and dies whenever this process closes the master fd —
+        # including on SIGTERM/SIGKILL/crash, where this finally never runs.
+        packet_monitor.stop()
     return 0
