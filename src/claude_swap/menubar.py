@@ -1576,15 +1576,12 @@ def run(switcher) -> int:
             bounds = self.bounds()
             w = bounds.size.width
             h = bounds.size.height
-            # Smooth the raw per-second samples with the monitor's rolling
-            # window (≈2 s) so the line and the headline number aren't jumpy.
-            smoothed = net_packets.moving_average(
-                self._monitor.rates(), self._monitor.avg_window
-            )
+            # Raw per-second samples (no temporal averaging).
+            rates = self._monitor.rates()
 
-            # Label, top-left. Show the latest smoothed value.
-            cur = round(smoothed[-1]) if smoothed else 0
-            label = f"Claude · {cur} pkt/s" if smoothed else "Claude · —"
+            # Label, top-left. Show the latest raw value.
+            cur = rates[-1] if rates else 0
+            label = f"Claude · {cur} pkt/s" if rates else "Claude · —"
             attrs = {
                 NSFontAttributeName: NSFont.systemFontOfSize_(11.0),
                 NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
@@ -1595,7 +1592,7 @@ def run(switcher) -> int:
 
             # Plot heights on a log2 axis (log2(1+v)) so a few big spikes don't
             # flatten everything else; the headline number above stays linear.
-            norm = net_packets.normalize(net_packets.log2_scale(smoothed))
+            norm = net_packets.normalize(net_packets.log2_scale(rates))
             if not norm:
                 return
 

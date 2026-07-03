@@ -87,29 +87,6 @@ def test_normalize_scales_against_peak():
     assert net_packets.normalize([0, 50, 100]) == [0.0, 0.5, 1.0]
 
 
-# ---- moving_average -----------------------------------------------------
-
-def test_moving_average_empty_is_empty():
-    assert net_packets.moving_average([], 2) == []
-
-
-def test_moving_average_single_value():
-    assert net_packets.moving_average([10], 2) == [10.0]
-
-
-def test_moving_average_trailing_window():
-    # i0: mean[10]=10; i1: mean[10,20]=15
-    assert net_packets.moving_average([10, 20], 2) == [10.0, 15.0]
-
-
-def test_moving_average_window_of_two_smooths_spike():
-    assert net_packets.moving_average([0, 100, 100, 100], 2) == [0.0, 50.0, 100.0, 100.0]
-
-
-def test_moving_average_window_one_is_identity():
-    assert net_packets.moving_average([2, 4, 6], 1) == [2.0, 4.0, 6.0]
-
-
 # ---- scroll_fraction ----------------------------------------------------
 
 def test_scroll_fraction_none_last_sample_is_zero():

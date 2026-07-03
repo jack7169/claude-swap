@@ -95,24 +95,6 @@ def normalize(values: list[int]) -> list[float]:
     return [v / peak for v in values]
 
 
-def moving_average(values: list[int], window: int) -> list[float]:
-    """Trailing moving average: element ``i`` is the mean of the last ``window``
-    values up to and including ``i`` (fewer near the start).
-
-    Smooths the per-sample noise into a rolling window (e.g. a 2-sample window
-    over 1 Hz samples is a 2-second average). Empty input -> ``[]``.
-    """
-    if not values:
-        return []
-    window = max(1, window)
-    out: list[float] = []
-    for i in range(len(values)):
-        lo = max(0, i - window + 1)
-        chunk = values[lo:i + 1]
-        out.append(sum(chunk) / len(chunk))
-    return out
-
-
 def log2_scale(values: list[int]) -> list[float]:
     """Map rates onto a log2 axis: ``log2(1 + v)`` (so ``0 -> 0`` and there are
     no negatives). Compresses large spikes and expands the low end, matching a
@@ -238,13 +220,8 @@ class PacketRateMonitor:
     absent, the deque simply stops updating and the graph shows its empty state.
     """
 
-    def __init__(self, *, window: int = 30, avg_window: int = 2, interval: float = 1.0,
-                 sampler=None):
+    def __init__(self, *, window: int = 30, interval: float = 1.0, sampler=None):
         self._sampler = sampler or _spawn_nettop
-        # Samples to average for display. nettop samples at 1 Hz (its floor —
-        # it rejects sub-second ``-s``), so 2 samples ≈ a 2-second rolling
-        # average. Exposed so the graph view can smooth the plotted series.
-        self.avg_window = avg_window
         # Nominal seconds between samples (nettop -s 1) and the ring size, both
         # read by the graph view to position + scroll the plot.
         self.interval = interval
