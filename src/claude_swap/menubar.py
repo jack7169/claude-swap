@@ -1548,12 +1548,15 @@ def run(switcher) -> int:
     # Packet-rate graph: one long-lived nettop stream, started before the app so
     # the dropdown has data as soon as it opens. Seeded with cswap's own PID; the
     # refresh worker adds the running Claude Code PIDs each cycle.
-    packet_monitor = net_packets.PacketRateMonitor()
+    packet_monitor = net_packets.PacketRateMonitor(window=60)  # ~60 s span
     packet_monitor.set_target_pids({os.getpid()})
     packet_monitor.start()
 
-    _GRAPH_W, _GRAPH_H = 260.0, 64.0
+    _GRAPH_W, _GRAPH_H = 260.0, 128.0
     _GRAPH_PAD = 8.0
+    # Curve smoothing strength: 1.0 = full quadratic-midpoint curve, 0.0 =
+    # straight segments. 0.5 halves the curvature (per user request).
+    _GRAPH_SMOOTHING = 0.5
 
     class _PacketGraphView(NSView):
         """Stats-style drawn area/line chart of packets/sec (reads the monitor)."""
@@ -1576,12 +1579,17 @@ def run(switcher) -> int:
             bounds = self.bounds()
             w = bounds.size.width
             h = bounds.size.height
-            # Raw per-second samples (no temporal averaging).
-            rates = self._monitor.rates()
+            # One atomic read so the series lengths and the sample time can't be
+            # torn across a concurrent sample append (that caused a one-frame
+            # rightward jump). up = packets_out/s (up), down = packets_in/s.
+            up, down, last_at = self._monitor.snapshot()
+            has_data = bool(up or down)
 
-            # Label, top-left. Show the latest raw value.
-            cur = rates[-1] if rates else 0
-            label = f"Claude · {cur} pkt/s" if rates else "Claude · —"
+            # Header label, top-left: latest up/down (linear; log2 removed).
+            up_now = up[-1] if up else 0
+            down_now = down[-1] if down else 0
+            label = (f"Claude  ↑{up_now}  ↓{down_now} pkt/s" if has_data
+                     else "Claude  ↑—  ↓—")
             attrs = {
                 NSFontAttributeName: NSFont.systemFontOfSize_(11.0),
                 NSForegroundColorAttributeName: NSColor.secondaryLabelColor(),
@@ -1590,57 +1598,88 @@ def run(switcher) -> int:
                 NSMakePoint(_GRAPH_PAD, h - 18.0), attrs
             )
 
-            # Plot heights on a log2 axis (log2(1+v)) so a few big spikes don't
-            # flatten everything else; the headline number above stays linear.
-            norm = net_packets.normalize(net_packets.log2_scale(rates))
-            if not norm:
-                return
-
-            # Plot area below the label.
+            # Plot geometry — bipolar: zero line centered, up above, down below.
             plot_bottom = _GRAPH_PAD
             plot_top = h - 22.0
             plot_h = max(1.0, plot_top - plot_bottom)
+            mid_y = plot_bottom + plot_h / 2.0
+            half_h = plot_h / 2.0
             left = _GRAPH_PAD
             right = w - _GRAPH_PAD
             span = max(1.0, right - left)
-            n = len(norm)
+            window = max(2, self._monitor.window)
+            step = span / (window - 1)  # px per sample == px per second (1 Hz)
+
+            # Zero baseline + time-axis gridlines every 15 s. Fixed (the data
+            # scrolls behind them); the right edge is "now", so each line is
+            # labelled how many seconds ago it marks. Shown even before data.
+            NSColor.separatorColor().setStroke()
+            baseline = NSBezierPath.bezierPath()
+            baseline.moveToPoint_(NSMakePoint(left, mid_y))
+            baseline.lineToPoint_(NSMakePoint(right, mid_y))
+            baseline.setLineWidth_(0.5)
+            baseline.stroke()
+            grid_attrs = {
+                NSFontAttributeName: NSFont.systemFontOfSize_(9.0),
+                NSForegroundColorAttributeName: NSColor.tertiaryLabelColor(),
+            }
+            secs = 15
+            while secs < window:
+                gx = right - secs * step
+                if gx <= left:
+                    break
+                gridline = NSBezierPath.bezierPath()
+                gridline.moveToPoint_(NSMakePoint(gx, plot_bottom))
+                gridline.lineToPoint_(NSMakePoint(gx, plot_top))
+                gridline.setLineWidth_(0.5)
+                NSColor.separatorColor().setStroke()
+                gridline.stroke()
+                NSString.stringWithString_(f"{secs}s").drawAtPoint_withAttributes_(
+                    NSMakePoint(gx + 2.0, plot_bottom), grid_attrs)
+                secs += 15
+
+            if not has_data:
+                return
+
+            # Shared scale so up/down magnitudes are comparable about the zero
+            # line. All-zero window -> nothing to plot (just baseline/grid).
+            peak = max([0] + up + down)
+            if peak <= 0:
+                return
 
             # Continuous scroll: samples land at 1 Hz but we advance the plot
-            # every redraw. Fixed per-sample width (span over the full ring) so
-            # the graph fills from the right and scrolls uniformly; each sample
-            # sits `frac` of a step further left as time passes toward the next.
-            window = max(2, self._monitor.window)
-            step = span / (window - 1)
+            # every redraw; each sample sits `frac` of a step further left as
+            # time passes toward the next.
             frac = net_packets.scroll_fraction(
-                time.monotonic(), self._monitor.last_sample_at(),
-                self._monitor.interval,
+                time.monotonic(), last_at, self._monitor.interval,
             )
-            # i = 0 (oldest) .. n-1 (newest); newest sits at right - frac*step.
-            pts = [
-                (right - ((n - 1 - i) + frac) * step, plot_bottom + norm[i] * plot_h)
-                for i in range(n)
-            ]
-            # Hold the newest value flat out to the right edge (no gap while the
-            # next sample is still pending).
-            pts.append((right, pts[-1][1]))
 
             def _smooth(path, points):
-                # Quadratic-midpoint smoothing: the curve passes through the
-                # segment midpoints using each point as the control handle,
-                # expressed as cubic Béziers. `path` must already be at points[0].
+                # Quadratic-midpoint smoothing expressed as cubic Béziers.
+                # _GRAPH_SMOOTHING blends the control handles between the fully
+                # curved position (1.0) and the straight segment (0.0).
                 if len(points) < 3:
                     for p in points[1:]:
                         path.lineToPoint_(NSMakePoint(*p))
                     return
+                s = _GRAPH_SMOOTHING
                 cur = points[0]
                 for i in range(1, len(points) - 1):
                     ctrl = points[i]
                     end = ((points[i][0] + points[i + 1][0]) / 2.0,
                            (points[i][1] + points[i + 1][1]) / 2.0)
-                    cp1 = (cur[0] + 2.0 / 3.0 * (ctrl[0] - cur[0]),
-                           cur[1] + 2.0 / 3.0 * (ctrl[1] - cur[1]))
-                    cp2 = (end[0] + 2.0 / 3.0 * (ctrl[0] - end[0]),
-                           end[1] + 2.0 / 3.0 * (ctrl[1] - end[1]))
+                    cp1s = (cur[0] + 2.0 / 3.0 * (ctrl[0] - cur[0]),
+                            cur[1] + 2.0 / 3.0 * (ctrl[1] - cur[1]))
+                    cp2s = (end[0] + 2.0 / 3.0 * (ctrl[0] - end[0]),
+                            end[1] + 2.0 / 3.0 * (ctrl[1] - end[1]))
+                    cp1l = (cur[0] + (end[0] - cur[0]) / 3.0,
+                            cur[1] + (end[1] - cur[1]) / 3.0)
+                    cp2l = (cur[0] + 2.0 * (end[0] - cur[0]) / 3.0,
+                            cur[1] + 2.0 * (end[1] - cur[1]) / 3.0)
+                    cp1 = (cp1l[0] + s * (cp1s[0] - cp1l[0]),
+                           cp1l[1] + s * (cp1s[1] - cp1l[1]))
+                    cp2 = (cp2l[0] + s * (cp2s[0] - cp2l[0]),
+                           cp2l[1] + s * (cp2s[1] - cp2l[1]))
                     path.curveToPoint_controlPoint1_controlPoint2_(
                         NSMakePoint(*end), NSMakePoint(*cp1), NSMakePoint(*cp2))
                     cur = end
@@ -1652,25 +1691,35 @@ def run(switcher) -> int:
                 NSMakeRect(left, plot_bottom, span, plot_h)
             ).addClip()
 
-            accent = NSColor.systemBlueColor()
+            def _draw_series(values, color, sign):
+                m = len(values)
+                if m == 0:
+                    return
+                # i = 0 (oldest) .. m-1 (newest); newest sits at right-frac*step.
+                # sign +1 draws upward from the zero line, -1 downward.
+                pts = [
+                    (right - ((m - 1 - i) + frac) * step,
+                     mid_y + sign * (values[i] / peak) * half_h)
+                    for i in range(m)
+                ]
+                pts.append((right, pts[-1][1]))  # flat-hold to the right edge
+                area = NSBezierPath.bezierPath()
+                area.moveToPoint_(NSMakePoint(pts[0][0], mid_y))
+                area.lineToPoint_(NSMakePoint(*pts[0]))
+                _smooth(area, pts)
+                area.lineToPoint_(NSMakePoint(pts[-1][0], mid_y))
+                area.closePath()
+                color.colorWithAlphaComponent_(0.18).setFill()
+                area.fill()
+                line = NSBezierPath.bezierPath()
+                line.setLineWidth_(1.5)
+                line.moveToPoint_(NSMakePoint(*pts[0]))
+                _smooth(line, pts)
+                color.setStroke()
+                line.stroke()
 
-            # Filled area (accent at low alpha) under the smoothed line.
-            area = NSBezierPath.bezierPath()
-            area.moveToPoint_(NSMakePoint(pts[0][0], plot_bottom))
-            area.lineToPoint_(NSMakePoint(*pts[0]))
-            _smooth(area, pts)
-            area.lineToPoint_(NSMakePoint(pts[-1][0], plot_bottom))
-            area.closePath()
-            accent.colorWithAlphaComponent_(0.18).setFill()
-            area.fill()
-
-            # Stroked smoothed line on top.
-            line = NSBezierPath.bezierPath()
-            line.setLineWidth_(1.5)
-            line.moveToPoint_(NSMakePoint(*pts[0]))
-            _smooth(line, pts)
-            accent.setStroke()
-            line.stroke()
+            _draw_series(up, NSColor.systemBlueColor(), 1.0)     # upload, above
+            _draw_series(down, NSColor.systemGreenColor(), -1.0)  # download, below
 
     class _MenuObserver(NSObject):
         """NSMenu delegate + countdown timer target. ``app`` is set by the owner
@@ -2087,6 +2136,11 @@ def run(switcher) -> int:
                         f"    {format_instance_row(group)}", callback=None
                     )
 
+            # The packet-rate graph goes directly below the running-instances
+            # block (or where it would be, if none). Record that slot now; the
+            # view item is inserted onto the NSMenu at the end of the rebuild.
+            graph_index = self.menu._menu.numberOfItems()
+
             self.menu.add(None)
             self.menu.add(rumps.MenuItem("Rotate to next", callback=self._switch(None)))
             self.menu.add(rumps.MenuItem("Switch to best", callback=self._switch("best")))
@@ -2104,17 +2158,18 @@ def run(switcher) -> int:
             self.menu.add(rumps.MenuItem("Refresh now", callback=self.on_refresh_now))
             self.menu.add(rumps.MenuItem("Quit", callback=rumps.quit_application))
 
-            # Pin the packet-rate graph to the very top of the dropdown. The
-            # menu.clear() at the start of this method detached it, so re-insert
-            # the persistent view item (its 30 s history survives rebuilds) plus
-            # a separator. Inserted directly on the NSMenu (a view item has no
-            # useful title key for rumps' dict). Kept OUT of _snapshot_signature
-            # so redraws never force a rebuild.
+            # Insert the packet-rate graph directly below the running-instances
+            # block (index captured above), preceded by a section-break
+            # separator matching the rest of the menu. menu.clear() at the top
+            # detached the persistent view item (its history survives rebuilds),
+            # so re-insert it each rebuild. Inserted directly on the NSMenu (a
+            # view item has no useful title key for rumps' dict). Kept OUT of
+            # _snapshot_signature so redraws never force a rebuild.
             graph_item = getattr(self, "_graph_item", None)
             if graph_item is not None:
                 nsmenu = self.menu._menu
-                nsmenu.insertItem_atIndex_(graph_item, 0)
-                nsmenu.insertItem_atIndex_(NSMenuItem.separatorItem(), 1)
+                nsmenu.insertItem_atIndex_(NSMenuItem.separatorItem(), graph_index)
+                nsmenu.insertItem_atIndex_(graph_item, graph_index + 1)
 
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")

@@ -59,14 +59,20 @@ def parse_nettop_sample(block: str) -> dict[int, tuple[int, int]]:
     return result
 
 
-def sum_targets(sample: dict[int, tuple[int, int]], pids: set[int]) -> int:
-    """Cumulative in+out packets across the target PIDs present in the sample."""
-    total = 0
+def sum_targets(sample: dict[int, tuple[int, int]], pids: set[int]) -> tuple[int, int]:
+    """Cumulative ``(packets_in, packets_out)`` across the target PIDs present.
+
+    Kept separate (not summed) so the graph can plot download (in) and upload
+    (out) as two series.
+    """
+    total_in = 0
+    total_out = 0
     for pid in pids:
         counters = sample.get(pid)
         if counters is not None:
-            total += counters[0] + counters[1]
-    return total
+            total_in += counters[0]
+            total_out += counters[1]
+    return total_in, total_out
 
 
 def delta_rate(prev_total: int | None, cur_total: int) -> int:
@@ -226,8 +232,12 @@ class PacketRateMonitor:
         # read by the graph view to position + scroll the plot.
         self.interval = interval
         self.window = window
-        self._rates: collections.deque[int] = collections.deque(maxlen=window)
-        self._prev_total: int | None = None
+        # Two series: download (packets_in) and upload (packets_out), each a
+        # per-second delta ring.
+        self._down: collections.deque[int] = collections.deque(maxlen=window)
+        self._up: collections.deque[int] = collections.deque(maxlen=window)
+        self._prev_in: int | None = None
+        self._prev_out: int | None = None
         self._pids: set[int] = set()
         self._last_sample_at: float | None = None  # time.monotonic() of last append
         self._lock = threading.Lock()
@@ -243,7 +253,8 @@ class PacketRateMonitor:
                 # keeping it would make the next delta subtract different
                 # processes and emit a spurious spike. Re-baseline: the next
                 # sample reads 0, then deltas resume over the new set.
-                self._prev_total = None
+                self._prev_in = None
+                self._prev_out = None
                 self._pids = new
 
     def start(self) -> None:
@@ -263,13 +274,26 @@ class PacketRateMonitor:
             except Exception:
                 pass
 
-    def rates(self) -> list[int]:
+    def up_rates(self) -> list[int]:
+        """Per-second upload (packets_out) rates, oldest→newest."""
         with self._lock:
-            return list(self._rates)
+            return list(self._up)
 
-    def current(self) -> int:
+    def down_rates(self) -> list[int]:
+        """Per-second download (packets_in) rates, oldest→newest."""
         with self._lock:
-            return self._rates[-1] if self._rates else 0
+            return list(self._down)
+
+    def snapshot(self) -> tuple[list[int], list[int], float | None]:
+        """Atomic ``(up_rates, down_rates, last_sample_at)`` under one lock.
+
+        The graph must see the series lengths and the last-sample time from the
+        SAME instant. Reading them via separate locked calls lets the reader
+        thread append a sample in between, so the plot draws the old point count
+        with the just-reset scroll offset — a one-frame rightward jump.
+        """
+        with self._lock:
+            return list(self._up), list(self._down), self._last_sample_at
 
     def last_sample_at(self) -> float | None:
         """``time.monotonic()`` of the most recent sample, or ``None`` if none.
@@ -301,8 +325,9 @@ class PacketRateMonitor:
     def _consume(self, block_text: str) -> None:
         sample = parse_nettop_sample(block_text)
         with self._lock:
-            cur = sum_targets(sample, self._pids)
-            rate = delta_rate(self._prev_total, cur)
-            self._prev_total = cur
-            self._rates.append(rate)
+            cur_in, cur_out = sum_targets(sample, self._pids)
+            self._down.append(delta_rate(self._prev_in, cur_in))
+            self._up.append(delta_rate(self._prev_out, cur_out))
+            self._prev_in = cur_in
+            self._prev_out = cur_out
             self._last_sample_at = time.monotonic()

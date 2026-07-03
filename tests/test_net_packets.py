@@ -44,18 +44,19 @@ def test_parse_empty_block_is_empty_dict():
 
 # ---- sum_targets --------------------------------------------------------
 
-def test_sum_targets_adds_in_and_out_for_present_pids():
+def test_sum_targets_returns_in_and_out_separately():
     sample = {1: (10, 5), 2: (100, 50), 3: (1, 1)}
-    assert net_packets.sum_targets(sample, {1, 3}) == 10 + 5 + 1 + 1
+    # (sum_in, sum_out) over pids {1, 3}: in=10+1, out=5+1
+    assert net_packets.sum_targets(sample, {1, 3}) == (11, 6)
 
 
 def test_sum_targets_ignores_absent_pids():
     sample = {1: (10, 5)}
-    assert net_packets.sum_targets(sample, {2, 3}) == 0
+    assert net_packets.sum_targets(sample, {2, 3}) == (0, 0)
 
 
 def test_sum_targets_empty_pidset_is_zero():
-    assert net_packets.sum_targets({1: (10, 5)}, set()) == 0
+    assert net_packets.sum_targets({1: (10, 5)}, set()) == (0, 0)
 
 
 # ---- delta_rate ---------------------------------------------------------
@@ -141,23 +142,23 @@ def test_set_target_pids_change_rebaselines_to_avoid_spike():
     mon = net_packets.PacketRateMonitor()
     mon.set_target_pids({1})
     mon._consume("t,proc.1,100,0,\n")  # baseline for pid 1 (rate 0)
-    mon._consume("t,proc.1,150,0,\n")  # delta 50
-    assert mon.rates() == [0, 50]
-    # Set now includes pid 2 with a huge cumulative counter. A stale prev_total
+    mon._consume("t,proc.1,150,0,\n")  # in delta 50 (down)
+    assert mon.down_rates() == [0, 50]
+    # Set now includes pid 2 with a huge cumulative counter. A stale baseline
     # would make the next delta ~100k; re-baselining yields 0 instead.
     mon.set_target_pids({1, 2})
     mon._consume("t,proc.1,160,0,\nt,proc.2,99999,0,\n")
-    assert mon.rates() == [0, 50, 0]
+    assert mon.down_rates() == [0, 50, 0]
 
 
 def test_set_target_pids_same_set_keeps_baseline():
     mon = net_packets.PacketRateMonitor()
     mon.set_target_pids({1})
     mon._consume("t,proc.1,100,0,\n")  # baseline
-    mon._consume("t,proc.1,150,0,\n")  # delta 50
+    mon._consume("t,proc.1,150,0,\n")  # in delta 50 (down)
     mon.set_target_pids({1})  # unchanged set -> no re-baseline
-    mon._consume("t,proc.1,170,0,\n")  # delta 20
-    assert mon.rates() == [0, 50, 20]
+    mon._consume("t,proc.1,170,0,\n")  # in delta 20 (down)
+    assert mon.down_rates() == [0, 50, 20]
 
 
 # ---- PacketRateMonitor --------------------------------------------------
@@ -187,33 +188,47 @@ def _run_monitor(lines, pids):
     return mon
 
 
-def test_monitor_computes_per_second_deltas_for_target_pid():
-    # Three samples for pid 42: cumulative 100 -> 250 -> 400.
-    # First sample = baseline (rate 0), then deltas 150, 150.
+def test_monitor_splits_up_and_down_per_second_deltas():
+    # pid 42: in (down) 100->250->400 (deltas 150,150); out (up) 10->30->60
+    # (deltas 20,30). First sample is the baseline (0).
     lines = [
-        "time,,packets_in,packets_out,\n", _sample(42, 100, 0),
-        "time,,packets_in,packets_out,\n", _sample(42, 250, 0),
-        "time,,packets_in,packets_out,\n", _sample(42, 400, 0),
+        "time,,packets_in,packets_out,\n", _sample(42, 100, 10),
+        "time,,packets_in,packets_out,\n", _sample(42, 250, 30),
+        "time,,packets_in,packets_out,\n", _sample(42, 400, 60),
     ]
     mon = _run_monitor(lines, {42})
-    assert mon.rates() == [0, 150, 150]
-    assert mon.current() == 150
+    assert mon.down_rates() == [0, 150, 150]  # packets_in per sec
+    assert mon.up_rates() == [0, 20, 30]      # packets_out per sec
 
 
-def test_monitor_sums_in_and_out_and_ignores_other_pids():
+def test_monitor_sums_across_pids_and_ignores_others():
     lines = [
         "time,,packets_in,packets_out,\n", _sample(1, 10, 5), _sample(2, 999, 999),
-        "time,,packets_in,packets_out,\n", _sample(1, 40, 5), _sample(2, 999, 999),
+        "time,,packets_in,packets_out,\n", _sample(1, 40, 25), _sample(2, 999, 999),
     ]
     mon = _run_monitor(lines, {1})  # pid 2 excluded
-    # baseline 15, then cur 45 -> delta 30
-    assert mon.rates() == [0, 30]
+    assert mon.down_rates() == [0, 30]  # in: 10 -> 40
+    assert mon.up_rates() == [0, 20]    # out: 5 -> 25
 
 
 def test_monitor_empty_before_start():
     mon = net_packets.PacketRateMonitor()
-    assert mon.rates() == []
-    assert mon.current() == 0
+    assert mon.up_rates() == []
+    assert mon.down_rates() == []
+
+
+def test_snapshot_reads_series_and_time_atomically():
+    # One locked read of (up, down, last_sample_at) so the view can't see the
+    # series and the sample time from different instants (the torn-read glitch).
+    mon = net_packets.PacketRateMonitor()
+    assert mon.snapshot() == ([], [], None)
+    mon.set_target_pids({1})
+    mon._consume("t,proc.1,10,5,\n")   # baseline (both 0)
+    mon._consume("t,proc.1,40,25,\n")  # in +30 (down), out +20 (up)
+    up, down, last = mon.snapshot()
+    assert up == [0, 20]
+    assert down == [0, 30]
+    assert isinstance(last, float)
 
 
 def test_monitor_stop_closes_stream():
