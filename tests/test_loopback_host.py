@@ -1,17 +1,21 @@
-"""Phase 6.3: the loopback OAuth redirect_uri must use the literal IPv4 host.
+"""The loopback OAuth redirect_uri must use the literal host ``localhost``.
 
-The loopback server binds IPv4 ``("127.0.0.1", 0)`` but the redirect_uri was
-built with ``localhost``. On an IPv6-preferring host ``localhost`` can resolve to
-``::1``, so the browser's callback hits a port nothing is listening on and the
-sign-in silently times out. The redirect_uri must therefore be the literal
-``127.0.0.1`` to match the bind. These tests drive run_login_flow through its
-dependency-injection seam (no real socket) and assert the redirect_uri is
-``127.0.0.1`` everywhere it is used — the authorize URL given to the browser and
-the token exchange — and never ``localhost``.
+Anthropic's OAuth client allowlists loopback redirects by the literal host
+``localhost`` (with any port) and rejects ``127.0.0.1`` ("Redirect URI ... is
+not supported by client"). So the redirect_uri must be ``localhost`` everywhere
+it is used — the authorize URL given to the browser and the token exchange —
+and must match between the two (OAuth requires them identical).
+
+The earlier IPv6-vs-IPv4 reachability worry (``localhost`` can resolve to ``::1``
+where an IPv4-only bind isn't listening) is handled by :class:`LoopbackServer`
+binding BOTH ``127.0.0.1`` and ``::1`` on the same port, not by changing the
+redirect host. These tests drive run_login_flow through its dependency-injection
+seam (no real socket).
 """
 
 from __future__ import annotations
 
+import inspect
 from urllib.parse import parse_qs, urlparse
 
 from claude_swap import oauth_login
@@ -61,46 +65,44 @@ def _redirect_uri_from_authorize_url(url):
     return parse_qs(urlparse(url).query)["redirect_uri"][0]
 
 
-def test_authorize_redirect_uri_uses_ipv4_literal_not_localhost():
-    # The browser is sent an authorize URL whose redirect_uri host is the literal
-    # 127.0.0.1 (matching the IPv4 bind), never "localhost" (which can resolve to
-    # ::1 on an IPv6-preferring host and silently time the sign-in out).
+def test_authorize_redirect_uri_uses_localhost_not_ipv4_literal():
+    # The authorize URL's redirect_uri host is "localhost" (what the OAuth
+    # client allows), never the literal 127.0.0.1 (which it rejects).
     url, _ = _drive_flow(port=54321)
     redirect_uri = _redirect_uri_from_authorize_url(url)
-    assert redirect_uri == "http://127.0.0.1:54321/callback"
-    assert "127.0.0.1" in redirect_uri
-    assert "localhost" not in redirect_uri
+    assert redirect_uri == "http://localhost:54321/callback"
+    assert "127.0.0.1" not in redirect_uri
 
 
-def test_authorize_url_encoded_redirect_uri_carries_ipv4_literal():
-    # Guard the raw (percent-encoded) form in the authorize URL too, so a future
-    # refactor that bypasses redirect_uri parsing can't silently regress.
+def test_authorize_url_encoded_redirect_uri_carries_localhost():
+    # Guard the raw (percent-encoded) form too, so a future refactor that
+    # bypasses redirect_uri parsing can't silently regress to 127.0.0.1.
     url, _ = _drive_flow(port=54321)
-    assert "redirect_uri=http%3A%2F%2F127.0.0.1%3A54321%2Fcallback" in url
-    assert "localhost" not in url
+    assert "redirect_uri=http%3A%2F%2Flocalhost%3A54321%2Fcallback" in url
+    assert "127.0.0.1" not in url
 
 
-def test_token_exchange_redirect_uri_uses_ipv4_literal_not_localhost():
+def test_token_exchange_redirect_uri_uses_localhost():
     # The same redirect_uri must reach the token exchange: OAuth requires the
     # token-request redirect_uri to match the authorize-request one exactly.
     _, captured = _drive_flow(port=54321)
-    assert captured["redirect_uri"] == "http://127.0.0.1:54321/callback"
-    assert "localhost" not in captured["redirect_uri"]
+    assert captured["redirect_uri"] == "http://localhost:54321/callback"
+    assert "127.0.0.1" not in captured["redirect_uri"]
 
 
 def test_authorize_and_exchange_redirect_uri_are_consistent():
-    # Consistency: whatever host/port the authorize URL advertises is exactly what
-    # the token exchange replays. Mismatch would fail the real exchange.
+    # Consistency: whatever host/port the authorize URL advertises is exactly
+    # what the token exchange replays. Mismatch would fail the real exchange.
     url, captured = _drive_flow(port=12345)
     redirect_uri = _redirect_uri_from_authorize_url(url)
     assert redirect_uri == captured["redirect_uri"]
-    assert redirect_uri == "http://127.0.0.1:12345/callback"
+    assert redirect_uri == "http://localhost:12345/callback"
 
 
-def test_loopback_server_binds_ipv4_127_0_0_1():
-    # Document the bind the redirect_uri must match: the constant the server uses
-    # to construct its address is the IPv4 loopback literal, not a name.
-    import inspect
-
+def test_loopback_server_dual_binds_ipv4_and_ipv6():
+    # localhost may resolve to 127.0.0.1 or ::1; the server binds BOTH so the
+    # "localhost" redirect is reachable either way (the reason we can keep the
+    # required "localhost" host without an IPv6 timeout).
     src = inspect.getsource(oauth_login.LoopbackServer.__init__)
     assert '"127.0.0.1"' in src
+    assert '"::1"' in src

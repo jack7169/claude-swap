@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import os
+import socket
 import threading
 import time
 import urllib.error
@@ -218,11 +219,12 @@ def run_login_flow(
     state = gen_state()
     server = make_server()
     try:
-        # Literal 127.0.0.1 (not "localhost") to match the IPv4 bind in
-        # LoopbackServer.__init__. On an IPv6-preferring host "localhost" can
-        # resolve to ::1, where nothing is listening, and the sign-in silently
-        # times out. Claude's OAuth allows loopback redirect hosts.
-        redirect_uri = f"http://127.0.0.1:{server.port}{CALLBACK_PATH}"
+        # Host MUST be "localhost" (not "127.0.0.1"): Anthropic's OAuth client
+        # allowlists loopback redirects by that literal host (any port), and
+        # rejects "127.0.0.1" with "Redirect URI ... is not supported by
+        # client". LoopbackServer binds BOTH 127.0.0.1 and ::1, so "localhost"
+        # is reachable however it resolves (the earlier IPv6-timeout worry).
+        redirect_uri = f"http://localhost:{server.port}{CALLBACK_PATH}"
         url = build_authorize_url(
             redirect_uri=redirect_uri, state=state, code_challenge=challenge
         )
@@ -318,26 +320,51 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
-class LoopbackServer:
-    """Loopback HTTP server (127.0.0.1, ephemeral port) capturing one callback.
+class _V6HTTPServer(HTTPServer):
+    address_family = socket.AF_INET6
 
-    Thin glue around http.server; not unit-tested (the suite never binds a port).
+
+class LoopbackServer:
+    """Loopback HTTP server (ephemeral port) capturing one OAuth callback.
+
+    Binds the SAME port on BOTH 127.0.0.1 and ::1 so the ``http://localhost:…``
+    redirect is reachable however the browser resolves ``localhost`` (IPv4 or
+    IPv6). The redirect host must be ``localhost`` for Anthropic's OAuth client
+    to accept it; dual-binding removes the IPv6-vs-IPv4 reachability gap that
+    would otherwise tempt a switch to a literal ``127.0.0.1`` (which the client
+    rejects). Thin glue around http.server; not unit-tested (the suite never
+    binds a port).
     """
 
     def __init__(self) -> None:
         self.collector = CallbackCollector()
-        self._httpd = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
-        self._httpd.collector = self.collector  # type: ignore[attr-defined]
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
+        self._servers: list[HTTPServer] = []
+        # IPv4 first, on an ephemeral port we then reuse for IPv6.
+        v4 = HTTPServer(("127.0.0.1", 0), _CallbackHandler)
+        v4.collector = self.collector  # type: ignore[attr-defined]
+        self._port = v4.server_address[1]
+        self._servers.append(v4)
+        # Best-effort IPv6 loopback on the same port; skip if unavailable.
+        try:
+            v6 = _V6HTTPServer(("::1", self._port), _CallbackHandler)
+            v6.collector = self.collector  # type: ignore[attr-defined]
+            self._servers.append(v6)
+        except OSError:
+            pass
+        for srv in self._servers:
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
 
     @property
     def port(self) -> int:
-        return self._httpd.server_address[1]
+        return self._port
 
     def wait(self, timeout: float) -> str | None:
         return self.collector.wait(timeout)
 
     def shutdown(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
+        for srv in self._servers:
+            try:
+                srv.shutdown()
+                srv.server_close()
+            except Exception:
+                pass
