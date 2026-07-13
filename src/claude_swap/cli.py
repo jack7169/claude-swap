@@ -342,15 +342,23 @@ Examples:
             sys.exit(1)
         from claude_swap.menubar import install_startup, uninstall_startup
 
-        if args.install_startup:
-            path = install_startup()
-            print(f"Installed menu bar login item: {path}")
-            print("It now starts automatically at login and is running.")
-        else:
-            if uninstall_startup():
-                print("Removed the menu bar login item.")
+        # This dispatch runs before the main ClaudeSwitchError handler below, so
+        # present its own failures cleanly here — otherwise a refused install
+        # (e.g. the target interpreter lacks the [menubar] extra) or a launchctl
+        # bootstrap failure escapes as an uncaught traceback.
+        try:
+            if args.install_startup:
+                path = install_startup()
+                print(f"Installed menu bar login item: {path}")
+                print("It now starts automatically at login and is running.")
             else:
-                print("No menu bar login item was installed.")
+                if uninstall_startup():
+                    print("Removed the menu bar login item.")
+                else:
+                    print("No menu bar login item was installed.")
+        except ClaudeSwitchError as e:
+            error(f"Error: {e}")
+            sys.exit(1)
         sys.exit(0)
 
     # Initialize switcher and dispatch under a single error handler so

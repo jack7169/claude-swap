@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import plistlib
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -684,7 +686,18 @@ def _capture_launchctl(monkeypatch, returncode=0, stderr=b""):
     return calls
 
 
-def test_install_startup_writes_valid_plist_and_bootstraps(tmp_path, monkeypatch):
+@pytest.fixture
+def menubar_extra_present(monkeypatch):
+    """Make ``import rumps`` succeed so install_startup clears its dependency
+    guard. CI runs without the [menubar] extra, so tests exercising the
+    install/bootstrap path must declare rumps present rather than depend on the
+    ambient interpreter."""
+    monkeypatch.setitem(sys.modules, "rumps", types.ModuleType("rumps"))
+
+
+def test_install_startup_writes_valid_plist_and_bootstraps(
+    tmp_path, monkeypatch, menubar_extra_present
+):
     _fake_home(monkeypatch, tmp_path)
     calls = _capture_launchctl(monkeypatch)
 
@@ -698,7 +711,9 @@ def test_install_startup_writes_valid_plist_and_bootstraps(tmp_path, monkeypatch
     assert any("bootstrap" in c and any("gui/" in a for a in c) for c in calls)
 
 
-def test_uninstall_startup_unloads_and_removes_plist(tmp_path, monkeypatch):
+def test_uninstall_startup_unloads_and_removes_plist(
+    tmp_path, monkeypatch, menubar_extra_present
+):
     _fake_home(monkeypatch, tmp_path)
     calls = _capture_launchctl(monkeypatch)
 
@@ -720,7 +735,9 @@ def test_uninstall_startup_returns_false_when_not_installed(tmp_path, monkeypatc
 
 # --- Finding 1: install_startup must surface a launchctl bootstrap failure -----
 
-def test_install_startup_raises_when_bootstrap_fails(tmp_path, monkeypatch):
+def test_install_startup_raises_when_bootstrap_fails(
+    tmp_path, monkeypatch, menubar_extra_present
+):
     # Over SSH/headless or under an MDM/SIP policy, `launchctl bootstrap gui/$UID`
     # returns non-zero and nothing is loaded. install_startup must NOT report
     # success: it raises ClaudeSwitchError so the CLI can report the real failure
@@ -741,7 +758,9 @@ def test_install_startup_raises_when_bootstrap_fails(tmp_path, monkeypatch):
     assert "Could not find domain" in str(exc.value)
 
 
-def test_install_startup_retries_transient_bootstrap_failure(tmp_path, monkeypatch):
+def test_install_startup_retries_transient_bootstrap_failure(
+    tmp_path, monkeypatch, menubar_extra_present
+):
     # Re-installing over a running agent, the async bootout can leave the first
     # bootstrap racing ("already bootstrapped"). A transient failure that clears on
     # retry must NOT raise — the agent loads on a subsequent attempt.
@@ -764,7 +783,9 @@ def test_install_startup_retries_transient_bootstrap_failure(tmp_path, monkeypat
     assert seq["n"] >= 2  # retried past the transient failure
 
 
-def test_install_startup_succeeds_when_bootstrap_ok(tmp_path, monkeypatch):
+def test_install_startup_succeeds_when_bootstrap_ok(
+    tmp_path, monkeypatch, menubar_extra_present
+):
     # The common interactive-GUI path: bootstrap returns 0 -> no exception, and
     # the kickstart call still runs (install also launches the app immediately).
     _fake_home(monkeypatch, tmp_path)
@@ -774,9 +795,44 @@ def test_install_startup_succeeds_when_bootstrap_ok(tmp_path, monkeypatch):
     assert any("kickstart" in c for c in calls)
 
 
+# --- install_startup must refuse a rumps-less interpreter ---------------------
+
+def test_install_startup_refuses_when_menubar_extra_missing(tmp_path, monkeypatch):
+    # The plist pins ``sys.executable``. If THAT interpreter can't import rumps,
+    # the LaunchAgent crash-loops forever while --install-startup falsely reports
+    # "installed and running" (the real bug that shipped a plist pointing at a
+    # rumps-less dev venv). install_startup must refuse up front: raise, write no
+    # plist, and touch neither launchd nor the filesystem.
+    _fake_home(monkeypatch, tmp_path)
+    # None in sys.modules makes ``import rumps`` raise ImportError in-process,
+    # simulating an interpreter without the [menubar] extra — regardless of
+    # whether the ambient interpreter actually has rumps.
+    monkeypatch.setitem(sys.modules, "rumps", None)
+    ran: list[list[str]] = []
+    monkeypatch.setattr(
+        menubar.subprocess, "run",
+        lambda *a, **k: (ran.append(list(a[0])), _fake_completed())[1],
+    )
+
+    with pytest.raises(menubar.ClaudeSwitchError) as exc:
+        menubar.install_startup()
+
+    msg = str(exc.value)
+    assert "rumps" in msg
+    assert "menubar" in msg
+    # The message names the offending interpreter — the diagnostic that pinpoints
+    # which of several installs is the rumps-less one.
+    assert sys.executable in msg
+    # No half-installed state: no plist written, launchd never invoked.
+    assert not menubar.launch_agent_plist_path().exists()
+    assert ran == []
+
+
 # --- Finding 2: uninstall_startup must survive a unlink TOCTOU race ------------
 
-def test_uninstall_startup_tolerates_plist_vanishing_after_exists(tmp_path, monkeypatch):
+def test_uninstall_startup_tolerates_plist_vanishing_after_exists(
+    tmp_path, monkeypatch, menubar_extra_present
+):
     # Simulate the TOCTOU window: exists() returns True, then the plist is gone
     # before unlink() (a concurrent uninstall, manual rm, or external cleanup).
     # uninstall must not raise FileNotFoundError.

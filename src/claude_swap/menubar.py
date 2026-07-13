@@ -1318,7 +1318,28 @@ def install_startup() -> Path:
 
     Idempotent: re-running rewrites the plist and reloads the agent so a changed
     interpreter path or config takes effect. Returns the plist path.
+
+    Refuses up front if this interpreter can't import ``rumps``: the plist pins
+    ``sys.executable`` (see ``_menubar_program_args``), so a rumps-less
+    interpreter would produce a LaunchAgent that crash-loops on every launch
+    (``KeepAlive`` restarts it, it re-prints "menubar extra required", repeat)
+    while we'd otherwise report "installed and running". Better to fail loudly
+    before writing a plist that can never start the menu bar.
     """
+    try:
+        import rumps  # noqa: F401  presence check: the pinned interpreter must have it
+    except ImportError:
+        raise ClaudeSwitchError(
+            "The menu bar can't be installed: the interpreter the LaunchAgent "
+            "would launch\n"
+            f"    {sys.executable}\n"
+            "cannot import 'rumps' (the optional [menubar] extra), so the agent "
+            "would crash-loop instead of showing the menu bar. Install the extra "
+            "into that interpreter, or re-run --install-startup from one that "
+            "has it:\n"
+            "  uv tool install 'claude-swap[menubar]'"
+            "   (or: pip install 'claude-swap[menubar]')"
+        )
     log_dir = Path.home() / "Library" / "Logs" / "claude-swap"
     log_dir.mkdir(parents=True, exist_ok=True)
     plist_path = launch_agent_plist_path()

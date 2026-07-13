@@ -15,6 +15,7 @@ import pytest
 
 from claude_swap import __version__
 from claude_swap import cli
+from claude_swap.exceptions import ClaudeSwitchError
 
 # src layout: ensure subprocess can find claude_swap
 _SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
@@ -241,6 +242,22 @@ class TestCLI:
 
         assert excinfo.value.code == 0
         uninstall.assert_called_once_with()
+
+    def test_install_startup_reports_error_cleanly(self, capsys):
+        """A ClaudeSwitchError from install_startup (e.g. the target interpreter
+        lacks the [menubar] extra) is presented as a clean stderr line and
+        exit 1 — not an uncaught traceback."""
+        with patch.object(sys, "argv", ["claude-swap", "--install-startup"]), \
+             patch("sys.platform", "darwin"), \
+             patch("claude_swap.menubar.install_startup",
+                   side_effect=ClaudeSwitchError("cannot import 'rumps'")):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 1
+        err = capsys.readouterr().err
+        assert "cannot import 'rumps'" in err
+        assert "Traceback" not in err
 
     def test_install_startup_rejected_off_macos(self, capsys):
         """Startup items are macOS-only; other platforms get a clean error."""
