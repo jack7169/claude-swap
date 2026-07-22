@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from claude_swap import oauth as _oauth
 from claude_swap.cache import write_cache
@@ -154,6 +154,60 @@ class TestCollectUsageTransientFailure:
         # A 429 does NOT wipe the last usage — the prior % dict is retained (its
         # validAt records how stale it is) rather than replaced by a sentinel.
         assert out[1] == {"five_hour": {"pct": 20.0}}
+
+
+class TestCollectUsageDeadBackupEndToEnd:
+    """End-to-end (no fetch_usage_for_account mock): a dead BACKUP refresh token
+    must produce USAGE_TOKEN_EXPIRED through the real oauth path — proving the
+    backup path now classifies a dead token instead of returning bare None that
+    the merge would retain as a stale dict forever (the account-4 bug)."""
+
+    def test_dead_backup_token_overrides_stale_dict_via_real_oauth(
+        self, temp_home, monkeypatch
+    ):
+        import urllib.error
+
+        s = _make_switcher()
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        _seed_prior_cache(s)  # slot 2 has a stale {pct: 20} dict
+
+        far_future = 9_999_999_999_000
+        creds1 = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-1", "refreshToken": "rt1", "expiresAt": far_future,
+        }})
+        creds2 = json.dumps({"claudeAiOauth": {  # expired -> proactive refresh
+            "accessToken": "sk-2", "refreshToken": "rt2-dead", "expiresAt": 0,
+        }})
+        info = [
+            (1, "a@x.com", "", "", False, creds1),
+            (2, "b@x.com", "", "", False, creds2),
+        ]
+
+        def mock_urlopen(req, timeout=0):
+            # Slot 2's dead refresh token -> token endpoint 400 (invalid_grant).
+            if "oauth/token" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 400, "Bad", None, None)
+            # Only slot 1 (healthy) reaches the usage endpoint; slot 2 short-circuits.
+            if "oauth/usage" in req.full_url:
+                resp = MagicMock()
+                resp.read.return_value = json.dumps(
+                    {"five_hour": {"utilization": 15.0, "resets_at": None}}
+                ).encode()
+                resp.__enter__ = lambda s: s
+                resp.__exit__ = lambda *a: False
+                return resp
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            out = s._collect_usage(info, only={"1", "2"})
+
+        # Dead backup -> sentinel wins over the stale {pct: 20} dict; headroom None.
+        assert out[1] == USAGE_TOKEN_EXPIRED
+        assert out[0] == {"five_hour": {"pct": 15.0}}
+        assert _oauth.account_headroom(out[1]) is None
+        # And the on-disk cache stores the sentinel, not the old dict.
+        written = json.loads((s.backup_dir / "cache" / "usage.json").read_text())
+        assert written["data"]["2"]["usage"] == USAGE_TOKEN_EXPIRED
 
 
 class TestBestStrategySkipsDefinitivelyFailed:

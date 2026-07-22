@@ -16,6 +16,27 @@ OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000
 OAUTH_TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 RATE_LIMITED = "rate limited"
+# Definitive "this credential is dead" sentinel for the usage path. The string
+# value MUST equal json_output.USAGE_TOKEN_EXPIRED so the switcher merge's
+# ``val in (USAGE_TOKEN_EXPIRED, …)`` comparison matches without importing it
+# (mirrors how RATE_LIMITED / USAGE_RATE_LIMITED already interoperate).
+TOKEN_EXPIRED = "token expired"
+
+# Why a refresh failed. Only a 400/401 from the token endpoint (invalid_grant)
+# proves the refresh token is dead; everything else (other HTTP status, network
+# blip, timeout, malformed 200) is transient and must NOT wipe good usage.
+REFRESH_AUTH_FAILED = "auth"
+REFRESH_TRANSIENT = "transient"
+
+# The usage endpoint buckets rate limits on User-Agent, PER ACCESS TOKEN.
+# ``claude-code/<version>`` is the safe bucket (fine at ~180s intervals); any
+# other UA (e.g. the old ``claude-swap/1.0``) lands in an aggressively-throttled
+# bucket that returns persistent 429s. Confirmed live: every account returned
+# HTTP 200 with this UA while the fleet was 429-storming under claude-swap/1.0.
+# The bucket keys on the ``claude-code/`` prefix, so the exact version is not
+# load-bearing — just bump it occasionally.
+CLAUDE_CODE_VERSION = "2.1.204"
+CLAUDE_CODE_UA = f"claude-code/{CLAUDE_CODE_VERSION}"
 
 _logger = logging.getLogger("claude-swap")
 
@@ -48,17 +69,26 @@ def is_oauth_token_expired(expires_at: object) -> bool:
     return now_ms + OAUTH_EXPIRY_BUFFER_MS >= int(expires_at)
 
 
-def refresh_oauth_credentials(credentials: str) -> str | None:
-    """Refresh an OAuth access token via direct token endpoint POST."""
+def _refresh_with_reason(credentials: str) -> tuple[str | None, str]:
+    """Refresh an OAuth access token, and report WHY it failed.
+
+    Returns ``(new_credentials, "ok")`` on success, ``(None, REFRESH_AUTH_FAILED)``
+    when the token endpoint returns 400/401 (a dead/revoked refresh token —
+    ``invalid_grant``), and ``(None, REFRESH_TRANSIENT)`` for every other failure
+    (other HTTP status, network/timeout, malformed 200, or a missing/unparseable
+    refresh token). The usage path uses the auth/transient split to surface a
+    definitively-dead credential (TOKEN_EXPIRED) without wiping good usage data
+    on a mere network blip.
+    """
     try:
         data = json.loads(credentials)
         oauth = data.get("claudeAiOauth")
         if not isinstance(oauth, dict):
-            return None
+            return None, REFRESH_TRANSIENT
 
         refresh_token = oauth.get("refreshToken")
         if not refresh_token:
-            return None
+            return None, REFRESH_TRANSIENT
 
         body = json.dumps({
             "grant_type": "refresh_token",
@@ -71,7 +101,7 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": "claude-swap/1.0",
+                "User-Agent": CLAUDE_CODE_UA,
             },
             method="POST",
         )
@@ -79,14 +109,14 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
             resp_data = json.loads(resp.read().decode())
 
         # A 200 response missing access_token/expires_in must not half-update the
-        # local oauth dict — validate BEFORE mutating, then bail with None.
+        # local oauth dict — validate BEFORE mutating, then bail (transient).
         new_access = resp_data.get("access_token")
         new_expires_in = resp_data.get("expires_in")
         if not new_access or not isinstance(new_expires_in, (int, float)):
             _logger.debug(
                 "OAuth refresh got a 200 with missing access_token/expires_in"
             )
-            return None
+            return None, REFRESH_TRANSIENT
 
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         oauth["accessToken"] = new_access
@@ -97,14 +127,24 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
             oauth["scopes"] = resp_data["scope"].split()
 
         data["claudeAiOauth"] = oauth
-        return json.dumps(data)
+        return json.dumps(data), "ok"
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
-        return None
+        reason = REFRESH_AUTH_FAILED if e.code in (400, 401) else REFRESH_TRANSIENT
+        return None, reason
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
-        return None
+        return None, REFRESH_TRANSIENT
+
+
+def refresh_oauth_credentials(credentials: str) -> str | None:
+    """Refresh an OAuth access token via direct token endpoint POST.
+
+    Thin wrapper over :func:`_refresh_with_reason` preserving the ``str | None``
+    contract that ``session.py`` and other callers depend on.
+    """
+    return _refresh_with_reason(credentials)[0]
 
 
 
@@ -171,7 +211,7 @@ def request_usage_data(access_token: str) -> dict:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
-        "User-Agent": "claude-swap/1.0",
+        "User-Agent": CLAUDE_CODE_UA,
     }
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=5) as resp:
@@ -202,7 +242,7 @@ def send_warm_message(
         # HTTP 400 ("anthropic-version: header is required") without this header.
         # Confirmed against the live endpoint; the stable version suffices.
         "anthropic-version": "2023-06-01",
-        "User-Agent": "claude-swap/1.0",
+        "User-Agent": CLAUDE_CODE_UA,
         "Content-Type": "application/json",
     }
     body = json.dumps({
@@ -263,6 +303,39 @@ def build_usage_result(data: dict) -> dict | None:
             except (TypeError, ValueError) as e:
                 _logger.debug("extra_usage parse failed: %r", e)
 
+    # Model-scoped weekly limits (e.g. the Fable-5 weekly cap) live in a
+    # ``limits`` array as ``weekly_scoped`` entries, NOT top-level seven_day_*
+    # keys (which the API returns null). Parse every model-scoped weekly entry
+    # generically into ``model_weekly`` keyed by the model's display name, so the
+    # menubar/auto-swap pick up Fable — and any future model limit — automatically.
+    # Defensive throughout: a missing/non-list ``limits`` or malformed entry is
+    # skipped rather than voiding the whole account's usage.
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        model_weekly: dict = {}
+        for entry in limits:
+            if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+                continue
+            scope = entry.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            name = model.get("display_name") if isinstance(model, dict) else None
+            pct = entry.get("percent")
+            if not name or pct is None:
+                continue
+            m_entry = {
+                "pct": pct,
+                "is_active": bool(entry.get("is_active")),
+                "severity": entry.get("severity"),
+            }
+            if entry.get("resets_at"):
+                m_entry["resets_at"] = entry["resets_at"]
+                m_entry["countdown"], m_entry["clock"] = format_reset(
+                    entry["resets_at"]
+                )
+            model_weekly[name] = m_entry
+        if model_weekly:
+            result["model_weekly"] = model_weekly
+
     return result if result else None
 
 
@@ -321,12 +394,19 @@ def fetch_usage_for_account(
         and oauth.get("refreshToken")
         and is_oauth_token_expired(oauth.get("expiresAt"))
     ):
-        refreshed = refresh_oauth_credentials(working_credentials)
+        refreshed, reason = _refresh_with_reason(working_credentials)
         if refreshed:
             working_credentials = refreshed
             _persist(persist_credentials, account_num, email, working_credentials)
             oauth = extract_oauth_data(working_credentials) or oauth
             access_token = oauth.get("accessToken") or access_token
+        elif reason == REFRESH_AUTH_FAILED:
+            # Dead/revoked refresh token — definitive, not a transient blip.
+            # Skip the usage call entirely: it would only 401 and (under a bad
+            # UA bucket) add to the 429 storm. Surfaces as TOKEN_EXPIRED so the
+            # switcher merge overrides any stale retained usage.
+            return TOKEN_EXPIRED
+        # transient -> fall through with the stale token (may 401 -> retry below)
 
     try:
         data = request_usage_data(access_token)
@@ -345,9 +425,11 @@ def fetch_usage_for_account(
             return None
 
         # Retry once after refreshing on 401 (inactive accounts only).
-        refreshed = refresh_oauth_credentials(working_credentials)
+        refreshed, reason = _refresh_with_reason(working_credentials)
         if not refreshed:
-            return None
+            # A dead refresh token here is definitive -> TOKEN_EXPIRED; a
+            # transient blip stays None so the merge retains last-known-good.
+            return TOKEN_EXPIRED if reason == REFRESH_AUTH_FAILED else None
 
         working_credentials = refreshed
         _persist(persist_credentials, account_num, email, working_credentials)

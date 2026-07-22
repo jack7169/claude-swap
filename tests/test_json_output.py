@@ -56,6 +56,17 @@ class TestJsonHelpers:
         assert usage_fields(USAGE_RATE_LIMITED) == ("rate_limited", None)
         assert usage_fields(None) == ("unavailable", None)
 
+    def test_backup_dead_token_json_status(self):
+        """Contract-lock: a backup account whose credential is dead serializes as
+        usageStatus 'token_expired' with usage null (scripts key off this) under
+        the unchanged schema — not a stale 'ok' row with fake percentages."""
+        from claude_swap.json_output import USAGE_TOKEN_EXPIRED, account_row
+
+        row = account_row(4, "b@x.com", "", "", False, USAGE_TOKEN_EXPIRED)
+        assert row["usageStatus"] == "token_expired"
+        assert row["usage"] is None
+        assert row["active"] is False
+
     def test_error_envelope_shape(self):
         env = error_envelope(SwitchError("boom"))
         assert env == {

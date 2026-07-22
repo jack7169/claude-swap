@@ -278,6 +278,83 @@ class TestFetchUsage:
         assert "spend" not in result
 
 
+class TestBuildUsageModelWeekly:
+    """The weekly Fable-5 limit is a ``weekly_scoped`` entry in the ``limits``
+    array (scope.model.display_name == 'Fable') — NOT a top-level seven_day_fable
+    key (which is null). Confirmed against the live usage API."""
+
+    @staticmethod
+    def _fable_limits(percent, *, severity="normal", is_active=True, resets_at=None):
+        return [
+            {"kind": "session", "group": "session", "percent": 8,
+             "severity": "normal", "resets_at": None, "scope": None,
+             "is_active": False},
+            {"kind": "weekly_all", "group": "weekly", "percent": 27,
+             "severity": "normal", "resets_at": None, "scope": None,
+             "is_active": False},
+            {"kind": "weekly_scoped", "group": "weekly", "percent": percent,
+             "severity": severity, "resets_at": resets_at,
+             "scope": {"model": {"id": None, "display_name": "Fable"},
+                       "surface": None},
+             "is_active": is_active},
+        ]
+
+    def test_build_usage_parses_fable_weekly_from_limits(self):
+        from datetime import timedelta
+        future = datetime.now(timezone.utc) + timedelta(hours=5)
+        data = {
+            "five_hour": {"utilization": 8.0, "resets_at": None},
+            "seven_day": {"utilization": 27.0, "resets_at": None},
+            "limits": self._fable_limits(46.0, resets_at=future.isoformat()),
+        }
+        result = oauth.build_usage_result(data)
+        fable = result["model_weekly"]["Fable"]
+        assert fable["pct"] == 46.0
+        assert fable["is_active"] is True
+        assert fable["resets_at"] == future.isoformat()
+        assert "countdown" in fable and "clock" in fable
+        # Existing windows are unaffected by the new parsing.
+        assert result["five_hour"]["pct"] == 8.0
+        assert result["seven_day"]["pct"] == 27.0
+
+    def test_build_usage_no_limits_key_is_backcompat(self):
+        data = {
+            "five_hour": {"utilization": 8.0, "resets_at": None},
+            "seven_day": {"utilization": 27.0, "resets_at": None},
+        }
+        result = oauth.build_usage_result(data)
+        assert "model_weekly" not in result
+        assert result["five_hour"]["pct"] == 8.0
+
+    def test_fable_exhausted_percent_100(self):
+        data = {
+            "five_hour": {"utilization": 5.0, "resets_at": None},
+            "limits": self._fable_limits(100.0, severity="critical"),
+        }
+        result = oauth.build_usage_result(data)
+        fable = result["model_weekly"]["Fable"]
+        assert fable["pct"] == 100.0
+        assert fable["severity"] == "critical"
+        assert fable["is_active"] is True
+
+    def test_limits_non_list_is_ignored(self):
+        data = {"five_hour": {"utilization": 5.0, "resets_at": None}, "limits": "nope"}
+        result = oauth.build_usage_result(data)
+        assert "model_weekly" not in result
+
+    def test_weekly_scoped_without_model_name_skipped(self):
+        data = {
+            "five_hour": {"utilization": 5.0, "resets_at": None},
+            "limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 50,
+                 "severity": "normal", "resets_at": None,
+                 "scope": {"model": None, "surface": None}, "is_active": True},
+            ],
+        }
+        result = oauth.build_usage_result(data)
+        assert "model_weekly" not in result
+
+
 class TestRefreshOAuthCredentials:
     """Test direct OAuth refresh requests."""
 
@@ -499,8 +576,11 @@ class TestFetchUsageForAccount:
         assert result is not None
         assert result["five_hour"]["pct"] == 10.0
 
-    def test_refresh_failure_returns_none_gracefully(self):
-        """If token refresh fails (e.g. revoked), usage returns None."""
+    def test_dead_refresh_token_returns_token_expired(self):
+        """A backup whose refresh token is dead/revoked (token endpoint 400 =
+        invalid_grant) must surface the TOKEN_EXPIRED sentinel — NOT bare None,
+        which the merge would treat as a transient blip and retain a stale usage
+        dict forever. A dead token is definitive."""
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         credentials = self._make_credentials(expires_at=now_ms - 1_000)
 
@@ -508,10 +588,6 @@ class TestFetchUsageForAccount:
             if "oauth/token" in req.full_url:
                 raise urllib.error.HTTPError(
                     req.full_url, 400, "Bad Request", hdrs=None, fp=None,
-                )
-            if "oauth/usage" in req.full_url:
-                raise urllib.error.HTTPError(
-                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
                 )
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
@@ -521,7 +597,78 @@ class TestFetchUsageForAccount:
                 is_active=False,
             )
 
+        assert result == oauth.TOKEN_EXPIRED
+
+    def test_dead_token_makes_no_usage_call(self):
+        """A proactively-detected dead token short-circuits: one token POST, and
+        ZERO usage calls (so a dead backup stops contributing to the 429 storm)."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+        usage_calls = 0
+
+        def mock_urlopen(req, timeout=0):
+            nonlocal usage_calls
+            if "oauth/token" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                )
+            if "oauth/usage" in req.full_url:
+                usage_calls += 1
+                raise AssertionError("dead token must not reach the usage endpoint")
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, is_active=False,
+            )
+
+        assert result == oauth.TOKEN_EXPIRED
+        assert usage_calls == 0
+
+    def test_transient_refresh_failure_returns_none(self):
+        """A network blip on refresh (URLError, not a 400/401) must NOT be
+        classified as a dead token — it stays transient (None), so the merge
+        retains the last-known-good usage rather than wiping it. This guards the
+        offline-laptop case: an expired token during an outage is not 'dead'."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/token" in req.full_url:
+                raise urllib.error.URLError("connection refused")
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.URLError("connection refused")
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, is_active=False,
+            )
+
         assert result is None
+
+    def test_401_retry_dead_refresh_returns_token_expired(self):
+        """Non-expired token that 401s, then the retry-refresh 400s (dead token):
+        surface TOKEN_EXPIRED, not None."""
+        credentials = self._make_credentials()  # not expired -> no proactive refresh
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                )
+            if "oauth/token" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 400, "Bad Request", hdrs=None, fp=None,
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, is_active=False,
+            )
+
+        assert result == oauth.TOKEN_EXPIRED
 
     def test_refreshes_when_scopes_are_missing(self):
         """Refresh should work even when stored credentials have no scopes."""
@@ -664,6 +811,89 @@ def _http_error(code):
     return urllib.error.HTTPError("https://x", code, "err", {}, None)
 
 
+class TestRefreshWithReason:
+    """_refresh_with_reason splits the failure into auth (dead token) vs transient.
+
+    Only a 400/401 from the token endpoint (invalid_grant) is 'auth' (definitively
+    dead); every other failure is 'transient' so good usage is never wiped on a blip.
+    """
+
+    @staticmethod
+    def _creds():
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "old", "refreshToken": "rt",
+        }})
+
+    def _run(self, urlopen_side_effect):
+        with patch("claude_swap.oauth.urllib.request.urlopen",
+                   side_effect=urlopen_side_effect):
+            return oauth._refresh_with_reason(self._creds())
+
+    def test_success_returns_ok(self):
+        def ok(req, timeout=0):
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(
+                {"access_token": "new", "expires_in": 3600}
+            ).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        creds, reason = self._run(ok)
+        assert reason == "ok"
+        assert json.loads(creds)["claudeAiOauth"]["accessToken"] == "new"
+
+    def test_http_400_is_auth(self):
+        creds, reason = self._run(
+            lambda req, timeout=0: (_ for _ in ()).throw(
+                urllib.error.HTTPError(req.full_url, 400, "Bad", None, None)))
+        assert (creds, reason) == (None, oauth.REFRESH_AUTH_FAILED)
+
+    def test_http_401_is_auth(self):
+        creds, reason = self._run(
+            lambda req, timeout=0: (_ for _ in ()).throw(
+                urllib.error.HTTPError(req.full_url, 401, "Unauth", None, None)))
+        assert (creds, reason) == (None, oauth.REFRESH_AUTH_FAILED)
+
+    def test_http_500_is_transient(self):
+        creds, reason = self._run(
+            lambda req, timeout=0: (_ for _ in ()).throw(
+                urllib.error.HTTPError(req.full_url, 500, "Err", None, None)))
+        assert (creds, reason) == (None, oauth.REFRESH_TRANSIENT)
+
+    def test_urlerror_is_transient(self):
+        creds, reason = self._run(
+            lambda req, timeout=0: (_ for _ in ()).throw(
+                urllib.error.URLError("boom")))
+        assert (creds, reason) == (None, oauth.REFRESH_TRANSIENT)
+
+    def test_malformed_200_is_transient(self):
+        def bad(req, timeout=0):
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"expires_in": 3600}).encode()  # no access_token
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        assert self._run(bad) == (None, oauth.REFRESH_TRANSIENT)
+
+    def test_refresh_oauth_credentials_delegates_and_returns_str_or_none(self):
+        # Back-compat: the thin wrapper keeps its str|None contract (session.py).
+        def ok(req, timeout=0):
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(
+                {"access_token": "new", "expires_in": 3600}
+            ).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=ok):
+            out = oauth.refresh_oauth_credentials(self._creds())
+        assert isinstance(out, str)
+        assert json.loads(out)["claudeAiOauth"]["accessToken"] == "new"
+
+
 def test_fetch_usage_returns_rate_limited_on_429():
     with patch.object(oauth, "request_usage_data", side_effect=_http_error(429)):
         result = oauth.fetch_usage_for_account("1", "a@x.com", _creds(), is_active=True)
@@ -690,11 +920,80 @@ def test_fetch_usage_returns_rate_limited_on_429_after_refresh():
         "expiresAt": 9999999999000,  # far future ms -> not proactively refreshed
     }})
     refreshed = json.dumps({"claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt"}})
+    # fetch_usage_for_account refreshes via the _refresh_with_reason seam (which
+    # carries the auth/transient reason); patch that, not the thin wrapper.
     with patch.object(oauth, "request_usage_data",
                       side_effect=[_http_error(401), _http_error(429)]), \
-         patch.object(oauth, "refresh_oauth_credentials", return_value=refreshed):
+         patch.object(oauth, "_refresh_with_reason", return_value=(refreshed, "ok")):
         result = oauth.fetch_usage_for_account("1", "a@x.com", creds, is_active=False)
     assert result == oauth.RATE_LIMITED
+
+
+class TestUserAgent:
+    """The usage endpoint buckets rate limits on User-Agent, per access token.
+
+    ``claude-code/<version>`` is the safe bucket (fine at ~180s intervals);
+    anything else hits an aggressively-throttled bucket -> persistent 429s.
+    Confirmed live: all accounts returned HTTP 200 with claude-code/2.1.204
+    while the fleet was 429-storming under claude-swap/1.0. So every
+    authenticated request cswap makes must send the claude-code UA.
+    """
+
+    def test_ua_constant_is_claude_code_prefixed(self):
+        assert oauth.CLAUDE_CODE_UA.startswith("claude-code/")
+
+    def test_usage_request_sends_claude_code_user_agent(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=0):
+            captured["req"] = req
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({}).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            oauth.request_usage_data("tok123")
+
+        assert captured["req"].get_header("User-agent") == oauth.CLAUDE_CODE_UA
+
+    def test_refresh_request_sends_claude_code_user_agent(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=0):
+            captured["req"] = req
+            resp = MagicMock()
+            resp.read.return_value = json.dumps(
+                {"access_token": "a", "expires_in": 3600}
+            ).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        creds = json.dumps({"claudeAiOauth": {
+            "accessToken": "old", "refreshToken": "rt",
+        }})
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            oauth.refresh_oauth_credentials(creds)
+
+        assert captured["req"].get_header("User-agent") == oauth.CLAUDE_CODE_UA
+
+    def test_warm_request_sends_claude_code_user_agent(self):
+        captured = {}
+
+        def fake_urlopen(req, timeout=0):
+            captured["req"] = req
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"content": []}).encode()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
+            oauth.send_warm_message("tok", "claude-haiku-4-5", 8, 5.0)
+
+        assert captured["req"].get_header("User-agent") == oauth.CLAUDE_CODE_UA
 
 
 class TestSendWarmMessage:

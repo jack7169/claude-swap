@@ -84,6 +84,7 @@ _USAGE_CACHE_TTL = 15  # seconds an ACTIVE account's usage entry stays fresh
 _BACKUP_USAGE_TTL = 60  # seconds a backup account's usage entry stays fresh
 _USAGE_ROUND_BUDGET = 20  # seconds of wall clock a sequential fetch round may take
 _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
+_DEAD_REPROBE = 900  # seconds a known-dead credential is skipped before re-probing
 
 
 def _usage_cache_entry(value) -> dict:
@@ -144,6 +145,18 @@ def _format_usage_lines(usage: dict) -> list[str]:
             lines.append(f"7d: {d7['pct']:>3.0f}%   resets {d7['clock']:<12}  in {d7['countdown']}")
         else:
             lines.append(f"7d: {d7['pct']:>3.0f}%")
+    # Model-scoped weekly limits (Fable-5 today), labelled by model name.
+    model_weekly = usage.get("model_weekly")
+    if isinstance(model_weekly, dict):
+        for name, window in model_weekly.items():
+            if not isinstance(window, dict) or window.get("pct") is None:
+                continue
+            if "clock" in window:
+                lines.append(
+                    f"{name}: {window['pct']:>3.0f}%   resets {window['clock']:<12}  in {window['countdown']}"
+                )
+            else:
+                lines.append(f"{name}: {window['pct']:>3.0f}%")
     return lines
 
 
@@ -216,6 +229,16 @@ class ClaudeAccountSwitcher:
         # Per-account "last valid usage fetch" epoch (num-str -> ts), populated by
         # _collect_usage; the menu reads it to show "time since last valid refresh".
         self._last_valid_at: dict[str, float] = {}
+        # Per-account usage HEALTH (num-str -> "HEALTHY"/"DEAD"/"RATE_LIMITED"), so
+        # _collect_usage can log state TRANSITIONS (edge-only) instead of spamming a
+        # line per attempt — a chronically-dead credential logs one WARNING, not
+        # thousands of DEBUG lines nobody sees at the INFO the app runs at.
+        self._usage_health: dict[str, str] = {}
+        # Per-account "don't re-probe a known-dead credential until" epoch. Set on a
+        # -> DEAD edge; excludes that account from the next fetch rounds (per-account
+        # only — never a global stall) so cswap stops hammering a revoked token every
+        # ~60s. Cleared on recovery; bypassed by force=True ("Refresh now").
+        self._usage_dead_until: dict[str, float] = {}
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
         # Optional swap notifier (cli.main wires this on macOS). Invoked from the
@@ -2103,6 +2126,7 @@ class ClaudeAccountSwitcher:
         """
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         account_keys = [str(info[0]) for info in accounts_info]
+        email_by_key = {str(info[0]): info[1] for info in accounts_info}
 
         # Last-known-good cache, ignoring file age (for retention/backoff).
         # Entries are normalized to {"usage", "fetchedAt"}; legacy bare values
@@ -2154,11 +2178,19 @@ class ClaudeAccountSwitcher:
             ttl = _USAGE_CACHE_TTL if info[4] else _BACKUP_USAGE_TTL
             return not _usage_entry_fresh(entry, ttl, now)
 
+        def is_dead_backed_off(info) -> bool:
+            # A credential classified DEAD last round is skipped until its reprobe
+            # window elapses — per-account only, so healthy accounts keep fetching.
+            return now < self._usage_dead_until.get(str(info[0]), 0.0)
+
         in_scope = (
             accounts_info if only is None
             else [info for info in accounts_info if str(info[0]) in only]
         )
-        to_fetch = list(in_scope) if force else [i for i in in_scope if is_stale(i)]
+        to_fetch = (
+            list(in_scope) if force
+            else [i for i in in_scope if is_stale(i) and not is_dead_backed_off(i)]
+        )
         # Strictly stalest-first — the active account gets NO priority. With
         # stop-on-first-429 below, prioritizing the active account (stale
         # nearly every round via its short TTL) would let a chronically
@@ -2193,11 +2225,9 @@ class ClaudeAccountSwitcher:
             if res == USAGE_RATE_LIMITED:
                 # Stop this round (further calls would only chain 429s), but do
                 # NOT arm a cross-round backoff — the next round still fetches on
-                # the user's cadence. Surface it so the failure is never silent.
-                self._logger.info(
-                    "Usage API rate-limited (429) for account %s; will retry next refresh",
-                    info[0],
-                )
+                # the user's cadence. The rate-limit is surfaced as a per-account
+                # HEALTHY->RATE_LIMITED transition in the merge below (edge-only),
+                # not a per-attempt line, so the log isn't flooded at ~720 calls/h.
                 break
 
         # Merge. ``fetchedAt`` stamps every ATTEMPT (even failures) so ordering
@@ -2221,6 +2251,19 @@ class ClaudeAccountSwitcher:
             prior_entry = prior.get(k)
             if k in fetched:
                 val = fetched[k]
+                # Health TRANSITIONS drive both edge-only logging (B3) and the
+                # dead-reprobe backoff (B4). A bare-None transient blip carries no
+                # health signal, so it does not churn the recorded state.
+                new_health = (
+                    "HEALTHY" if isinstance(val, dict)
+                    else "DEAD" if val in (USAGE_TOKEN_EXPIRED, USAGE_NO_CREDENTIALS)
+                    else "RATE_LIMITED" if val == USAGE_RATE_LIMITED
+                    else None
+                )
+                if new_health is not None:
+                    self._record_usage_health(
+                        k, email_by_key.get(k, ""), new_health, now
+                    )
                 if isinstance(val, dict):
                     # A valid refresh: advance validAt.
                     result_entries[k] = {
@@ -2258,6 +2301,46 @@ class ClaudeAccountSwitcher:
             k: result_entries[k].get("validAt", 0.0) for k in account_keys
         }
         return [result_entries[k]["usage"] for k in account_keys]
+
+    def _record_usage_health(
+        self, key: str, email: str, new_health: str, now: float
+    ) -> None:
+        """Record an account's usage health and log EDGES only.
+
+        Called once per fetched account per round with its classified state
+        (``HEALTHY`` / ``DEAD`` / ``RATE_LIMITED``). A dead credential arms the
+        per-account reprobe backoff and logs a single WARNING on the way in; a
+        recovery clears it and logs one INFO; a rate-limit logs one INFO on the
+        way in. Repeats within a state are silent, so a chronically-dead or
+        chronically-limited account never floods the log. In-process state only —
+        no lock, no persistence (a fresh process re-derives it on its first round).
+        """
+        prev = self._usage_health.get(key)
+        if new_health == "DEAD":
+            # Re-arm every round we still see it dead so the backoff keeps
+            # extending; log only on the entering edge.
+            self._usage_dead_until[key] = now + _DEAD_REPROBE
+            if prev != "DEAD":
+                self._logger.warning(
+                    "Account %s (%s) credentials DEAD (token expired); will not "
+                    "update until re-auth (cswap --add-account)",
+                    key, email,
+                )
+        elif new_health == "HEALTHY":
+            self._usage_dead_until.pop(key, None)
+            if prev in ("DEAD", "RATE_LIMITED"):
+                self._logger.info(
+                    "Account %s (%s) usage recovered (%s -> healthy)",
+                    key, email, prev.lower(),
+                )
+        elif new_health == "RATE_LIMITED":
+            if prev != "RATE_LIMITED":
+                self._logger.info(
+                    "Account %s (%s) usage API rate-limited (429); retained "
+                    "last-known usage, will retry next refresh",
+                    key, email,
+                )
+        self._usage_health[key] = new_health
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → usage entry (cache-first) for managed accounts."""
@@ -2392,7 +2475,10 @@ class ClaudeAccountSwitcher:
             else:
                 print(f"  {num}: {email} {muted(f'[{tag}]')}")
             if usage == USAGE_TOKEN_EXPIRED:
-                print(f"     {dimmed('token expired — Claude Code refreshes the active account')}")
+                if is_active:
+                    print(f"     {dimmed('token expired — Claude Code refreshes the active account')}")
+                else:
+                    print(f"     {dimmed('token expired — sign in again: cswap --add-account')}")
             elif usage == USAGE_API_KEY:
                 print(f"     {dimmed('API key (no quota)')}")
             elif isinstance(usage, str):

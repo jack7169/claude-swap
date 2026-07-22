@@ -24,6 +24,7 @@ from pathlib import Path
 
 from claude_swap import login_item, net_packets, notify, oauth
 from claude_swap.credentials import looks_like_api_key
+from claude_swap.json_output import USAGE_TOKEN_EXPIRED
 from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.locking import FileLock
 from claude_swap.printer import abbreviate_path, entrypoint_label, ide_short_name
@@ -329,14 +330,11 @@ def account_detail_lines(usage: dict | str | None) -> list[str]:
     """
     if not isinstance(usage, dict):
         return []
-    lines: list[str] = []
-    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
-        window = usage.get(key)
-        if not isinstance(window, dict):
-            continue
+
+    def _row(label: str, window: dict) -> str | None:
         pct = window.get("pct")
         if not isinstance(pct, (int, float)):
-            continue
+            return None
         row = f"{label}: {pct:>2.0f}%"
         resets_at = window.get("resets_at")
         if isinstance(resets_at, str):
@@ -346,7 +344,24 @@ def account_detail_lines(usage: dict | str | None) -> list[str]:
                 pass  # unparseable -> show the percent without a reset segment
             else:
                 row += f"   resets {clock}   in {countdown}"
-        lines.append(row)
+        return row
+
+    lines: list[str] = []
+    for key, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = usage.get(key)
+        if isinstance(window, dict):
+            row = _row(label, window)
+            if row is not None:
+                lines.append(row)
+    # Model-scoped weekly limits (Fable-5 today; any future model limit) render
+    # as their own rows labelled by model name, after the 5h/7d windows.
+    model_weekly = usage.get("model_weekly")
+    if isinstance(model_weekly, dict):
+        for name, window in model_weekly.items():
+            if isinstance(window, dict):
+                row = _row(name, window)
+                if row is not None:
+                    lines.append(row)
     return lines
 
 
@@ -449,6 +464,28 @@ def _worst_pct(usage: dict | str | None) -> float | None:
     return max(five, seven)
 
 
+def fable_exhausted(usage: dict | str | None) -> bool:
+    """True when this account's weekly Fable-5 limit is spent (pct >= 100).
+
+    Unknown Fable usage (no ``model_weekly`` / no ``Fable`` entry / non-numeric
+    pct) is NOT exhausted — auto-swap never penalizes an account on missing data
+    (mirrors the "unknown headroom is never auto-skipped" invariant). Used only as
+    a last-resort tiebreak: a Fable-exhausted account is avoided as a switch target
+    unless every candidate is Fable-exhausted. Fable is deliberately kept OUT of
+    ``_worst_pct``/headroom — it must never, by itself, block a switch.
+    """
+    if not isinstance(usage, dict):
+        return False
+    mw = usage.get("model_weekly")
+    if not isinstance(mw, dict):
+        return False
+    fable = mw.get("Fable")
+    if not isinstance(fable, dict):
+        return False
+    pct = fable.get("pct")
+    return isinstance(pct, (int, float)) and pct >= 100
+
+
 def next_blocked(
     limiting_by_account: dict[str, float | None],
     threshold: float,
@@ -522,7 +559,7 @@ def decide_auto_switch(
     if active_worst < threshold:
         return ("none", None)
 
-    candidates: list[tuple[float, float, float, int]] = []
+    candidates: list[tuple[float, float, float, int, bool]] = []
     any_unverifiable = False
     for num, _email, is_active, usage in accounts:
         if is_active:
@@ -536,11 +573,17 @@ def decide_auto_switch(
             continue
         seven = _window_pct(usage, "seven_day")
         five = _window_pct(usage, "five_hour")
-        candidates.append((worst, seven, five, num))
+        candidates.append((worst, seven, five, num, fable_exhausted(usage)))
     if not candidates:
         return ("no_candidate_unverifiable", None) if any_unverifiable else ("no_candidate", None)
     candidates.sort(key=lambda c: (c[0], c[1], c[2]))
-    return ("switch", candidates[0][3])
+    # Last-resort Fable avoidance: prefer a Fable-healthy candidate (in the ranked
+    # order); fall back to a Fable-exhausted one only if EVERY candidate is
+    # exhausted (never stall). Fable is not in the sort key, so the primary 5h/7d
+    # ranking is unchanged within each group.
+    fable_ok = [c for c in candidates if not c[4]]
+    chosen = fable_ok[0] if fable_ok else candidates[0]
+    return ("switch", chosen[3])
 
 
 def decide_consume_first(
@@ -574,7 +617,7 @@ def decide_consume_first(
     # displaces a healthy active account just because the API omitted its resets_at.
     active_reset = _resets_at_ts(active[3].get("five_hour"))
 
-    eligible: list[tuple[float, float, int, int, bool]] = []
+    eligible: list[tuple[float, float, int, int, int, bool]] = []
     any_unverifiable = False
     any_weekly_room = False
     for idx, (num, _email, is_active, usage) in enumerate(accounts):
@@ -594,7 +637,11 @@ def decide_consume_first(
             # active's (inf) so only headroom/rotation can distinguish them.
             if not is_active and active_reset == float("inf"):
                 reset = active_reset
-            eligible.append((reset, _worst_pct(usage), not is_active, idx, num))
+            # A Fable-exhausted PEER is a last-resort target; the active account is
+            # never demoted for Fable (the goal is to avoid switching TO an
+            # exhausted account, not to switch AWAY from an exhausted active one).
+            fable_bad = fable_exhausted(usage) and not is_active
+            eligible.append((reset, _worst_pct(usage), not is_active, idx, num, fable_bad))
     if not eligible:
         if any_unverifiable:
             return ("no_candidate_unverifiable", None)
@@ -605,7 +652,11 @@ def decide_consume_first(
     # (not is_active == False sorts first), then rotation index. The is_active
     # term makes an equally-optimal active account always win.
     eligible.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
-    best_num = eligible[0][4]
+    # Last-resort Fable avoidance (peers only): prefer a Fable-healthy candidate;
+    # fall back to a Fable-exhausted one only if every candidate is exhausted.
+    fable_ok = [e for e in eligible if not e[5]]
+    chosen = fable_ok[0] if fable_ok else eligible[0]
+    best_num = chosen[4]
     if best_num == active[0]:
         return ("none", None)
     return ("switch", best_num)
@@ -955,15 +1006,53 @@ def _usage_signature(usage: dict | str | None):
     dict ordering or unhashable nested values.
     """
     if isinstance(usage, dict):
-        return tuple(
-            (
-                key,
-                window.get("pct") if isinstance(window, dict) else None,
-                window.get("resets_at") if isinstance(window, dict) else None,
-            )
-            for key, window in sorted(usage.items())
-        )
+        parts: list[tuple] = []
+        for key, window in sorted(usage.items()):
+            # model_weekly is a dict-of-windows (per model), not a single window;
+            # project each so a Fable-only pct/reset change alters the signature
+            # and the menu rebuilds to show it.
+            if key == "model_weekly" and isinstance(window, dict):
+                for name, w in sorted(window.items()):
+                    parts.append((
+                        f"model_weekly:{name}",
+                        w.get("pct") if isinstance(w, dict) else None,
+                        w.get("resets_at") if isinstance(w, dict) else None,
+                    ))
+            else:
+                parts.append((
+                    key,
+                    window.get("pct") if isinstance(window, dict) else None,
+                    window.get("resets_at") if isinstance(window, dict) else None,
+                ))
+        return tuple(parts)
     return usage  # str sentinel ("no credentials" / "rate limited") or None
+
+
+def detect_dead_credential_edges(
+    prev: dict[str, str], accounts
+) -> tuple[list[tuple[int, str]], dict[str, str]]:
+    """Backup credentials that transitioned to DEAD since the last snapshot.
+
+    ``accounts`` are the snapshot's ``(num, email, is_active, usage)`` rows. A
+    *backup* (non-active) account whose usage is the ``USAGE_TOKEN_EXPIRED``
+    sentinel is dead — its refresh token is revoked/expired and cswap can't renew
+    it. Returns ``(newly_dead, new_map)`` where ``newly_dead`` is the ``(num,
+    email)`` list that was NOT dead in ``prev`` but is now (so the caller notifies
+    exactly once per transition), and ``new_map`` is the current dead set (num-str
+    -> email) to carry forward. A recovery drops the account from the map, so a
+    later re-death is a fresh edge. The ACTIVE account is never included — Claude
+    Code owns its refresh, so nagging the user to re-auth it would be wrong.
+    Pure / import-safe (no rumps) so it unit-tests without the menu-bar extra.
+    """
+    new_map: dict[str, str] = {}
+    newly: list[tuple[int, str]] = []
+    for num, email, is_active, usage in accounts:
+        if usage == USAGE_TOKEN_EXPIRED and not is_active:
+            key = str(num)
+            new_map[key] = email
+            if key not in prev:
+                newly.append((num, email))
+    return newly, new_map
 
 
 def _maybe_rebuild_on_dirty(app) -> bool:
@@ -1093,6 +1182,24 @@ def _worker_impl(
             snap = _snapshot(app.switcher, full=full, force=force, max_fetch=max_fetch)
         app.snapshot = snap
         app._snapshot_at = time.time()
+        # Tell the user (once) when a BACKUP credential goes dead — otherwise a
+        # revoked refresh token is invisible: the row just reads "token expired".
+        # notify.notify (osascript) works from the non-bundled LaunchAgent, where
+        # rumps.notification would raise. Guarded: a notify hiccup never aborts
+        # the refresh.
+        try:
+            newly_dead, app._dead_cred_map = detect_dead_credential_edges(
+                getattr(app, "_dead_cred_map", {}), snap.get("accounts", [])
+            )
+            for num, email in newly_dead:
+                notify.notify(
+                    "claude-swap",
+                    f"Account {num} ({email}): sign in again — refresh token expired",
+                )
+        except Exception:
+            app.switcher._logger.debug(
+                "dead-credential notify failed", exc_info=True
+            )
         # Keep the packet-rate graph summing the right processes. One extra
         # local read of the session/IDE lockfiles per refresh cycle (cheap,
         # and independent of the usage snapshot). Guarded: no-op when no
@@ -1811,6 +1918,9 @@ def run(switcher) -> int:
             self._adopt_seen_at = 0.0
             self._adopt_retry_at = 0.0
             self._adopt_notified_identity = None
+            # Currently-dead backup credentials (num-str -> email). Diffed each
+            # refresh so a credential going dead posts exactly one re-auth banner.
+            self._dead_cred_map: dict[str, str] = {}
             # Thread-safe in-flight guard: the compare-and-set that admits at
             # most one worker, plus the lock that confines the keychain-
             # capability-cache mutation to one thread at a time.

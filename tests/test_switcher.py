@@ -1039,6 +1039,40 @@ class TestActiveAccountRefresh:
         output = capsys.readouterr().out
         assert "token expired — Claude Code refreshes the active account" in output
 
+    def test_list_backup_token_expired_prints_reauth_wording(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        """A BACKUP account whose credential is dead must tell the user to sign in
+        again (cswap --add-account), NOT the active-account 'Claude Code refreshes
+        it' wording (which is only true for the active slot)."""
+        from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+
+        switcher = self._switcher(sample_sequence_data)
+        with patch.object(
+            switcher, "_build_accounts_info",
+            return_value=[(2, "b@x.com", "", "", False, "{}")],
+        ), patch.object(switcher, "_collect_usage", return_value=[USAGE_TOKEN_EXPIRED]):
+            switcher.list_accounts()
+
+        output = capsys.readouterr().out
+        assert "token expired" in output
+        assert "cswap --add-account" in output
+        assert "Claude Code refreshes the active account" not in output
+
+
+def test_format_usage_lines_includes_fable_weekly():
+    """CLI --list mirrors the menu: a model-scoped weekly limit (Fable) renders
+    its own row alongside 5h/7d."""
+    from claude_swap.switcher import _format_usage_lines
+
+    lines = _format_usage_lines({
+        "five_hour": {"pct": 8.0},
+        "model_weekly": {
+            "Fable": {"pct": 46.0, "clock": "22:00", "countdown": "5d 2h"},
+        },
+    })
+    assert any(line.startswith("Fable:") and "46%" in line for line in lines)
+
 
 class TestPerformSwitchPostDisplay:
     """Regression tests for the post-switch display running outside the lock."""
@@ -1196,8 +1230,11 @@ class TestPerformSwitchPostDisplay:
 
         try:
             with patch(
-                "claude_swap.oauth.refresh_oauth_credentials",
-                return_value=rotated_creds,
+                # fetch_usage_for_account refreshes via the _refresh_with_reason
+                # seam; patch that (the thin refresh_oauth_credentials wrapper is
+                # no longer the call site inside the usage path).
+                "claude_swap.oauth._refresh_with_reason",
+                return_value=(rotated_creds, "ok"),
             ), patch(
                 "claude_swap.oauth.request_usage_data",
                 return_value={

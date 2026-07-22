@@ -1197,3 +1197,146 @@ def test_login_item_menu_state_checked_only_when_enabled():
     assert menubar.login_item_menu_state("not-registered") == 0
     assert menubar.login_item_menu_state("requires-approval") == 0
     assert menubar.login_item_menu_state("unavailable") == 0
+
+
+# ---------------------------------------------------------------------------
+# Dead-credential edge detection (drives the one-time re-auth notification)
+# ---------------------------------------------------------------------------
+
+_DEAD = "token expired"  # == json_output.USAGE_TOKEN_EXPIRED
+
+
+def test_dead_credential_edge_detected_once():
+    # A backup account going dead is reported once; the same dead state on the
+    # next snapshot is NOT re-reported (edge-only, so the user gets one banner).
+    accounts = [
+        (1, "a@x.com", True, {"five_hour": {"pct": 5.0}}),   # active, healthy
+        (4, "b@x.com", False, _DEAD),                        # backup, DEAD
+    ]
+    newly, m = menubar.detect_dead_credential_edges({}, accounts)
+    assert newly == [(4, "b@x.com")]
+    assert "4" in m
+
+    newly2, m2 = menubar.detect_dead_credential_edges(m, accounts)
+    assert newly2 == []            # still dead -> no new banner
+    assert "4" in m2
+
+
+def test_active_token_expired_never_flagged():
+    # The active account's token expiring is Claude Code's job to refresh, so it
+    # must never trigger a re-auth banner.
+    accounts = [(1, "a@x.com", True, _DEAD)]
+    newly, m = menubar.detect_dead_credential_edges({}, accounts)
+    assert newly == []
+    assert m == {}
+
+
+def test_dead_recovery_then_dead_re_notifies():
+    dead = [(4, "b@x.com", False, _DEAD)]
+    healthy = [(4, "b@x.com", False, {"five_hour": {"pct": 5.0}})]
+
+    newly, m = menubar.detect_dead_credential_edges({}, dead)
+    assert newly == [(4, "b@x.com")]
+
+    # Recovered: dropped from the map (so a later re-death is a fresh edge).
+    newly, m = menubar.detect_dead_credential_edges(m, healthy)
+    assert newly == [] and m == {}
+
+    # Dead again -> a new edge -> re-notified.
+    newly, m = menubar.detect_dead_credential_edges(m, dead)
+    assert newly == [(4, "b@x.com")]
+
+
+# ---------------------------------------------------------------------------
+# Fable-5 weekly limit display
+# ---------------------------------------------------------------------------
+
+
+def test_account_detail_lines_includes_fable_row():
+    usage = {
+        "five_hour": {"pct": 8.0},
+        "model_weekly": {"Fable": {"pct": 46.0, "is_active": True, "severity": "normal"}},
+    }
+    lines = menubar.account_detail_lines(usage)
+    assert any(line.startswith("Fable: 46%") for line in lines)
+    # existing windows still render
+    assert any(line.startswith("5h:") for line in lines)
+
+
+def test_account_detail_lines_no_fable_when_absent():
+    usage = {"five_hour": {"pct": 8.0}, "seven_day": {"pct": 27.0}}
+    lines = menubar.account_detail_lines(usage)
+    assert not any("Fable" in line for line in lines)
+
+
+def test_usage_signature_reflects_fable_change():
+    # A Fable-only pct change must alter the render signature so the menu rebuilds
+    # to show the new value (otherwise a Fable-only update would be invisible).
+    a = {"five_hour": {"pct": 8.0}, "model_weekly": {"Fable": {"pct": 46.0}}}
+    b = {"five_hour": {"pct": 8.0}, "model_weekly": {"Fable": {"pct": 99.0}}}
+    assert menubar._usage_signature(a) != menubar._usage_signature(b)
+
+
+# ---------------------------------------------------------------------------
+# Last-resort Fable avoidance in auto-swap
+# ---------------------------------------------------------------------------
+
+
+def _acct_fable(num, pct5, pct7, fable_pct=None, active=False):
+    usage = {"five_hour": {"pct": pct5}, "seven_day": {"pct": pct7}}
+    if fable_pct is not None:
+        usage["model_weekly"] = {"Fable": {"pct": fable_pct}}
+    return (num, f"a{num}@x.com", active, usage)
+
+
+def test_fable_exhausted_helper():
+    assert menubar.fable_exhausted({"model_weekly": {"Fable": {"pct": 100.0}}}) is True
+    assert menubar.fable_exhausted({"model_weekly": {"Fable": {"pct": 99.0}}}) is False
+    assert menubar.fable_exhausted({"five_hour": {"pct": 5.0}}) is False  # unknown -> ok
+    assert menubar.fable_exhausted("rate limited") is False
+
+
+def test_auto_switch_prefers_fable_healthy_over_fable_exhausted():
+    # Exhausted peer 3 ranks BETTER on 5h/7d, but is skipped for the Fable-healthy
+    # peer 2 (last-resort avoidance never picks a Fable-exhausted target first).
+    accts = [
+        _acct_fable(1, 99, 99, active=True),
+        _acct_fable(2, 20, 20, fable_pct=None),   # healthy, worse primary
+        _acct_fable(3, 5, 5, fable_pct=100.0),     # exhausted, better primary
+    ]
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+
+
+def test_auto_switch_falls_back_when_all_fable_exhausted():
+    accts = [
+        _acct_fable(1, 99, 99, active=True),
+        _acct_fable(2, 20, 20, fable_pct=100.0),
+        _acct_fable(3, 5, 5, fable_pct=100.0),     # better primary
+    ]
+    # All peers Fable-exhausted -> don't stall; pick the best by existing order.
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 3)
+
+
+def test_auto_switch_unknown_fable_treated_as_ok():
+    accts = [
+        _acct_fable(1, 99, 99, active=True),
+        _acct_fable(2, 5, 5, fable_pct=None),      # unknown fable -> ok, best primary
+        _acct_fable(3, 20, 20, fable_pct=50.0),
+    ]
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+
+
+def test_consume_first_avoids_fable_exhausted_peer():
+    soon = "2026-07-23T00:00:00+00:00"
+    late = "2026-07-24T00:00:00+00:00"
+    accts = [
+        (1, "a1", True, {"five_hour": {"pct": 99, "resets_at": soon},
+                         "seven_day": {"pct": 10}}),
+        (2, "a2", False, {"five_hour": {"pct": 10, "resets_at": late},
+                          "seven_day": {"pct": 10}}),
+        (3, "a3", False, {"five_hour": {"pct": 10, "resets_at": soon},
+                          "seven_day": {"pct": 10},
+                          "model_weekly": {"Fable": {"pct": 100.0}}}),
+    ]
+    # Peer 3 resets soonest (would win) but is Fable-exhausted -> peer 2 chosen.
+    assert menubar.decide_consume_first(accts, 95) == ("switch", 2)
