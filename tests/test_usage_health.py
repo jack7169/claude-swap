@@ -138,3 +138,32 @@ class TestDeadReprobeBackoff:
         h.round({"2": {"five_hour": {"pct": 2.0}}}, force=True)
 
         assert (h.now, "2") in h.calls                      # forced -> fetched anyway
+
+    def test_clear_usage_health_pops_dead_and_health(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": USAGE_TOKEN_EXPIRED})                 # arms dead_until + DEAD
+        assert "2" in s._usage_dead_until
+        assert s._usage_health.get("2") == "DEAD"
+
+        s.clear_usage_health("2")
+
+        assert "2" not in s._usage_dead_until
+        assert "2" not in s._usage_health
+
+    def test_cleared_account_refetched_without_force(self, temp_home, monkeypatch):
+        # The re-auth bug: after a DEAD classification the account is backed off, so
+        # even a full (non-forced) refresh skips it — leaving the stale "login
+        # expired" in the menu. Clearing the health (as re-auth does) un-blocks it.
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": USAGE_TOKEN_EXPIRED})                 # dead -> backed off
+        h.now += 61                                         # stale, but within backoff
+        h.round({"2": {"five_hour": {"pct": 5.0}}})         # non-forced
+        assert (h.now, "2") not in h.calls                  # skipped (still backed off)
+
+        s.clear_usage_health("2")                           # what re-auth now does
+        h.now += 1
+        out = h.round({"2": {"five_hour": {"pct": 5.0}}})   # non-forced
+        assert (h.now, "2") in h.calls                      # re-fetched now
+        assert out[1] == {"five_hour": {"pct": 5.0}}

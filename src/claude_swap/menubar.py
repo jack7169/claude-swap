@@ -2545,9 +2545,15 @@ def run(switcher) -> int:
                         org_uuid=result.identity.org_uuid,
                         account_uuid=result.identity.account_uuid,
                     )
+                    # The just-signed-in account may be sitting in the dead-reprobe
+                    # backoff (armed while it showed "login expired"): clear its
+                    # health so it's eligible again, and FORCE the refresh so it is
+                    # actually re-fetched now (a non-forced refresh would skip a
+                    # backed-off account and leave the stale "login expired" up).
+                    self.switcher.clear_usage_health(str(num))
                     # Refresh first so a notification failure can never skip the
                     # UI refresh and leave the just-added account missing.
-                    self.refresh_async(full=True)
+                    self.refresh_async(full=True, force=True)
                     # notify.notify (osascript) works from this non-bundled process
                     # and never raises; rumps.notification would raise here.
                     if target is not None:

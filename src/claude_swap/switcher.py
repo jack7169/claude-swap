@@ -2371,6 +2371,18 @@ class ClaudeAccountSwitcher:
                 )
         self._usage_health[key] = new_health
 
+    def clear_usage_health(self, account_num: str) -> None:
+        """Reset an account's usage-health state after its credentials change.
+
+        Called when an account is re-authenticated (or its credentials are
+        otherwise replaced): the prior DEAD verdict + dead-reprobe backoff are
+        stale now that a fresh token exists, so drop them. Otherwise the account
+        would stay excluded from fetches for up to ``_DEAD_REPROBE`` seconds and
+        keep rendering "login expired" even though the login was just fixed.
+        """
+        self._usage_dead_until.pop(str(account_num), None)
+        self._usage_health.pop(str(account_num), None)
+
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → usage entry (cache-first) for managed accounts."""
         accounts_info = self._build_accounts_info()
