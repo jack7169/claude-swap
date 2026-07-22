@@ -24,8 +24,13 @@ OPTIONS = {
     # Lazily imported at runtime -> py2app won't auto-detect it; include explicitly.
     "includes": ["ServiceManagement"],
     "plist": {
+        # CFBundleName stays "claude-swap" so the built bundle is claude-swap.app
+        # (py2app names the bundle after it) — keeps the /Applications path and the
+        # make-app.sh mv stable. Only the user-visible DISPLAY name is rebranded.
         "CFBundleName": "claude-swap",
-        "CFBundleDisplayName": "claude-swap",
+        "CFBundleDisplayName": "claude-swap 2",
+        # Bundle id UNCHANGED so the existing SMAppService Login Item registration
+        # (keyed on the id) keeps working across the rename.
         "CFBundleIdentifier": "com.claude-swap.menubar",
         "CFBundleShortVersionString": VERSION,
         "CFBundleVersion": VERSION,

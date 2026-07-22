@@ -1055,7 +1055,7 @@ class TestActiveAccountRefresh:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "token expired" in output
+        assert "login expired" in output
         assert "cswap --add-account" in output
         assert "Claude Code refreshes the active account" not in output
 

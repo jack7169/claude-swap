@@ -40,6 +40,7 @@ AUTO_STRATEGY_CHOICES: tuple[str, ...] = ("reactive", "consume-first")
 AUTO_HYSTERESIS = 5.0  # dead band (percent) that prevents auto-switch thrash
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 _FULL_REFRESH_EVERY = 300  # seconds between full (all-account) usage refreshes
+APP_TITLE = "claude-swap 2"  # user-visible app name (notification banner title)
 
 
 @dataclass
@@ -169,6 +170,10 @@ def _live_countdown(window: dict | str | None, now: float) -> str | None:
 def usage_summary(usage: dict | str | None, now: float | None = None) -> str:
     """One-line usage summary for an account row (reset countdown computed live)."""
     if isinstance(usage, str):
+        # The token-expired sentinel is shown to the user as "login expired"
+        # (the row invites a re-sign-in); other sentinels pass through verbatim.
+        if usage == USAGE_TOKEN_EXPIRED:
+            return "login expired"
         return usage
     if usage is None:
         return "usage unavailable"
@@ -879,14 +884,14 @@ def run_warm_cycle(
                 success += 1
             else:
                 notify_fn(
-                    "claude-swap",
+                    APP_TITLE,
                     f"Account-{num} timer start failed: {reason}",
                 )
         except Exception:
             # A single account's failure can never break the whole cycle.
-            notify_fn("claude-swap", f"Account-{num} timer start failed")
+            notify_fn(APP_TITLE, f"Account-{num} timer start failed")
     if success > 0:
-        notify_fn("claude-swap", f"Started timers for {success} account(s)")
+        notify_fn(APP_TITLE, f"Started timers for {success} account(s)")
     return success
 
 
@@ -1055,6 +1060,24 @@ def detect_dead_credential_edges(
     return newly, new_map
 
 
+def reauth_outcome_message(
+    target_num: int, target_email: str, result_email: str | None
+) -> str:
+    """Banner text after a click-to-reauth browser sign-in for a specific account.
+
+    ``add_account_from_oauth`` updates by identity, so signing in as the target
+    account re-authenticates it in place; signing in as a *different* account must
+    not claim the target was fixed. Pure / import-safe.
+    """
+    if result_email and target_email and result_email.lower() == target_email.lower():
+        return f"Account {target_num} re-authenticated — {target_email}."
+    who = result_email or "a different account"
+    return (
+        f"Signed in as {who} — account {target_num} ({target_email}) "
+        f"still needs its own sign-in."
+    )
+
+
 def _maybe_rebuild_on_dirty(app) -> bool:
     """Rebuild the menu only when the rendered-state signature actually changed.
 
@@ -1193,7 +1216,7 @@ def _worker_impl(
             )
             for num, email in newly_dead:
                 notify.notify(
-                    "claude-swap",
+                    APP_TITLE,
                     f"Account {num} ({email}): sign in again — refresh token expired",
                 )
         except Exception:
@@ -1324,7 +1347,7 @@ def _maybe_adopt_unmanaged(app) -> tuple[str, str] | None:
         if identity != getattr(app, "_adopt_notified_identity", None):
             app._adopt_notified_identity = identity
             notify.notify(
-                "claude-swap",
+                APP_TITLE,
                 f"Couldn't add {identity[0]}: {e}",
             )
         return None
@@ -1332,7 +1355,7 @@ def _maybe_adopt_unmanaged(app) -> tuple[str, str] | None:
         return None
     num, email = adopted
     notify.notify(
-        "claude-swap",
+        APP_TITLE,
         f"Added Account-{num}: {email} (from current login)",
     )
     return adopted
@@ -1667,7 +1690,7 @@ def run(switcher) -> int:
         switcher._logger.info(
             "menu bar already running; not starting a second copy (single-instance guard)"
         )
-        notify.notify("claude-swap", "Menu bar is already running.")
+        notify.notify(APP_TITLE, "Menu bar is already running.")
         return 0
 
     settings_path = switcher.backup_dir / "menubar_settings.json"
@@ -2154,7 +2177,7 @@ def run(switcher) -> int:
                         self.switcher._logger.warning("auto-switch failed: %s", e)
                         # notify.notify (osascript) works from this non-bundled
                         # LaunchAgent process; rumps.notification would raise here.
-                        notify.notify("claude-swap", f"Auto-switch failed: {e}")
+                        notify.notify(APP_TITLE, f"Auto-switch failed: {e}")
                         return
                     # No rumps.notification here: the swap notification is posted
                     # by the unified notifier (switch_to -> _perform_switch ->
@@ -2170,7 +2193,7 @@ def run(switcher) -> int:
                 # notify.notify (osascript) works from this non-bundled process and
                 # never raises; rumps.notification would raise here.
                 notify.notify(
-                    "claude-swap",
+                    APP_TITLE,
                     f"Claude limit — no fresh account. Active account is at its "
                     f"limit (≥{self.settings.auto_switch_threshold}%) but no other "
                     "account has headroom.",
@@ -2248,6 +2271,18 @@ def run(switcher) -> int:
                     d = rumps.MenuItem(f"    {line}", callback=None)
                     self.menu[f"detail-{num}-{i}"] = d
                     detail_items.append(d)
+                # A non-active login-expired account gets a CLICKABLE re-auth row:
+                # clicking runs the browser sign-in for THIS account (no switch, no
+                # terminal), re-authenticating it in place. Static title, so it's
+                # left out of detail_items (the in-place sync-tick refresh only
+                # touches usage %/countdowns); the signature change on entering the
+                # state already forces a full rebuild that creates/destroys it.
+                if usage == USAGE_TOKEN_EXPIRED and not is_active:
+                    reauth = rumps.MenuItem(
+                        "    ⚠ Login expired — click to sign in",
+                        callback=self._make_reauth(num, email),
+                    )
+                    self.menu[f"reauth-{num}"] = reauth
                 # Keep references so the common-modes timer can refresh each
                 # row's reset countdowns + usage % in place (no rebuild).
                 self._account_rows.append((num, item, detail_items))
@@ -2398,7 +2433,7 @@ def run(switcher) -> int:
                     # notify.notify (osascript) works from this non-bundled
                     # process and never raises; rumps.alert would need the main
                     # thread and isn't safe here.
-                    notify.notify("claude-swap", str(e))
+                    notify.notify(APP_TITLE, str(e))
                     return
                 if record_switch:
                     self.state.last_switch_at = time.time()
@@ -2473,8 +2508,22 @@ def run(switcher) -> int:
             ))
 
         def on_add_browser_login(self, _sender):
-            # Bring the accessory app forward so any future dialogs render, then run the
-            # OAuth login off the main thread (it blocks until the browser callback).
+            self._browser_login(target=None)
+
+        def _make_reauth(self, num, email):
+            """Callback for a login-expired row: re-auth THIS account via browser."""
+            def cb(_sender):
+                self._browser_login(target=(num, email))
+            return cb
+
+        def _browser_login(self, target=None):
+            """Run the browser OAuth flow off the main thread (it blocks on the
+            callback). ``target=(num, email)`` re-authenticates that existing
+            account in place — ``add_account_from_oauth`` updates by identity, so a
+            sign-in matching the target refreshes its stored credentials without a
+            switch; a mismatched sign-in touches its own slot and the target is
+            reported as still needing sign-in. ``target=None`` is the add-account
+            entry point."""
             import webbrowser
 
             import AppKit
@@ -2496,26 +2545,35 @@ def run(switcher) -> int:
                         org_uuid=result.identity.org_uuid,
                         account_uuid=result.identity.account_uuid,
                     )
-                    self.switcher._logger.info("browser sign-in added account %s", num)
                     # Refresh first so a notification failure can never skip the
                     # UI refresh and leave the just-added account missing.
                     self.refresh_async(full=True)
-                    # Confirm the add (this is not a swap, so it doesn't go through
-                    # the unified swap notifier — post a distinct "added" alert).
                     # notify.notify (osascript) works from this non-bundled process
                     # and never raises; rumps.notification would raise here.
-                    notify.notify(
-                        "claude-swap",
-                        f"Account added — signed in and added "
-                        f"{result.identity.email or f'Account-{num}'}. "
-                        "Switch to it from the menu when ready.",
-                    )
+                    if target is not None:
+                        t_num, t_email = target
+                        self.switcher._logger.info(
+                            "browser re-auth for account %s (signed in as %s)",
+                            t_num, result.identity.email,
+                        )
+                        notify.notify(
+                            APP_TITLE,
+                            reauth_outcome_message(t_num, t_email, result.identity.email),
+                        )
+                    else:
+                        self.switcher._logger.info("browser sign-in added account %s", num)
+                        notify.notify(
+                            APP_TITLE,
+                            f"Account added — signed in and added "
+                            f"{result.identity.email or f'Account-{num}'}. "
+                            "Switch to it from the menu when ready.",
+                        )
                 except ClaudeSwitchError as e:
                     self.switcher._logger.warning("browser sign-in failed: %s", e)
-                    notify.notify("claude-swap", f"Sign-in failed: {e}")
+                    notify.notify(APP_TITLE, f"Sign-in failed: {e}")
                 except Exception:
                     self.switcher._logger.debug("browser sign-in error", exc_info=True)
-                    notify.notify("claude-swap",
+                    notify.notify(APP_TITLE,
                                   "Sign-in failed: an unexpected error occurred "
                                   "during sign-in.")
 
@@ -2523,7 +2581,7 @@ def run(switcher) -> int:
 
         def on_refresh_creds(self, _sender):
             if self.switcher._get_current_account() is None:
-                rumps.alert(title="claude-swap",
+                rumps.alert(title=APP_TITLE,
                             message="No active Claude Code login detected. Log in first.")
                 return
 
@@ -2538,7 +2596,7 @@ def run(switcher) -> int:
                     # active credential lives in the macOS Keychain, which a
                     # background agent can't read (the security call times out).
                     notify.notify(
-                        "claude-swap",
+                        APP_TITLE,
                         "Couldn't read the active credential. If the menu bar is "
                         "running as a background/login agent, macOS blocks its "
                         "Keychain access — quit and relaunch it from a Terminal "
@@ -2546,7 +2604,7 @@ def run(switcher) -> int:
                     )
                     return
                 except ClaudeSwitchError as e:
-                    notify.notify("claude-swap", str(e))
+                    notify.notify(APP_TITLE, str(e))
                     return
                 self.refresh_async(full=True)
 
@@ -2593,7 +2651,7 @@ def run(switcher) -> int:
             # flip the registration and repaint the checkmark from its status.
             ok, err = login_item.toggle()
             if not ok:
-                notify.notify("claude-swap", f"Start-at-login change failed: {err}")
+                notify.notify(APP_TITLE, f"Start-at-login change failed: {err}")
             self.rebuild_menu()
 
         def _make_strategy(self, name):

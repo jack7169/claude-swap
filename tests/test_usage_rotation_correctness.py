@@ -210,6 +210,68 @@ class TestCollectUsageDeadBackupEndToEnd:
         assert written["data"]["2"]["usage"] == USAGE_TOKEN_EXPIRED
 
 
+class TestCollectUsageLoginExpired:
+    """A non-active account whose STORED token is expired and whose refresh keeps
+    failing (dead OR a persistent token-endpoint 429 like acct 4) is 'login
+    expired': surface USAGE_TOKEN_EXPIRED instead of retaining a stale % that
+    reads as healthy and feeds auto-swap. Gated on a stale validAt so a one-round
+    blip on a just-expired token doesn't flicker."""
+
+    @staticmethod
+    def _expired_creds():
+        return json.dumps({"claudeAiOauth": {
+            "accessToken": "sk", "refreshToken": "rt", "expiresAt": 0,
+        }})
+
+    def _seed(self, s, *, validAt_ago):
+        import time
+        now = time.time()
+        write_cache(s.backup_dir / "cache" / "usage.json", {
+            "2": {"usage": {"five_hour": {"pct": 43.0}},
+                  "fetchedAt": now - validAt_ago, "validAt": now - validAt_ago},
+        })
+
+    def test_expired_token_stale_validAt_overrides_to_sentinel(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        self._seed(s, validAt_ago=400)          # last valid refresh well past the window
+        _patch_fetch(monkeypatch, {"2": None})    # refresh failing (e.g. token-endpoint 429)
+        info = [(2, "b@x.com", "", "", False, self._expired_creds())]
+
+        out = s._collect_usage(info, only={"2"})
+
+        assert out[0] == USAGE_TOKEN_EXPIRED
+        assert _oauth.account_headroom(out[0]) is None
+
+    def test_expired_token_fresh_validAt_retains_dict(self, temp_home, monkeypatch):
+        # Anti-flicker: a just-expired token with a one-round refresh blip keeps its
+        # % (validAt still fresh) until the failures persist past the window.
+        s = _make_switcher()
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        self._seed(s, validAt_ago=61)             # stale enough to fetch, fresh enough to keep
+        _patch_fetch(monkeypatch, {"2": None})
+        info = [(2, "b@x.com", "", "", False, self._expired_creds())]
+
+        out = s._collect_usage(info, only={"2"})
+
+        assert out[0] == {"five_hour": {"pct": 43.0}}
+
+    def test_valid_token_never_login_expired(self, temp_home, monkeypatch):
+        # A non-expired stored token is never login-expired even if refresh blips.
+        s = _make_switcher()
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        self._seed(s, validAt_ago=400)
+        _patch_fetch(monkeypatch, {"2": None})
+        valid = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk", "refreshToken": "rt", "expiresAt": 9_999_999_999_000,
+        }})
+        info = [(2, "b@x.com", "", "", False, valid)]
+
+        out = s._collect_usage(info, only={"2"})
+
+        assert out[0] == {"five_hour": {"pct": 43.0}}
+
+
 class TestBestStrategySkipsDefinitivelyFailed:
     """5.1 — a best/next-available switch must not select an account whose
     credential definitively failed this round (even though stale cache had a

@@ -25,7 +25,7 @@ CACHE_TTL = 24 * 3600  # 24 hours
 # A *failed* PyPI fetch is cached for only this long, so a single transient
 # network error can't suppress every update check for the full CACHE_TTL.
 NEGATIVE_CACHE_TTL = 15 * 60  # 15 minutes
-PYPI_URL = "https://pypi.org/pypi/claude-swap/json"
+PYPI_URL = "https://pypi.org/pypi/claude-swap-2/json"
 
 
 def _parse_version(v: str) -> Version | None:
@@ -111,8 +111,8 @@ def check_for_update(current_version: str) -> str | None:
         ):
             method = _detect_install_method()
             direct = {
-                "uv": "uv tool upgrade claude-swap",
-                "pipx": "pipx upgrade claude-swap",
+                "uv": "uv tool upgrade claude-swap-2",
+                "pipx": "pipx upgrade claude-swap-2",
             }.get(method or "")
             if direct and sys.platform != "win32":
                 # cswap --upgrade actually performs the upgrade here.
@@ -124,7 +124,7 @@ def check_for_update(current_version: str) -> str | None:
                 # Unknown install method: cswap --upgrade shows manual instructions.
                 hint = "Run `cswap --upgrade` for upgrade instructions."
             return (
-                f"A newer version of claude-swap is available ({latest_version}). "
+                f"A newer version of claude-swap-2 is available ({latest_version}). "
                 f"You are using {current_version}. {hint}"
             )
         return None
@@ -142,8 +142,8 @@ def run_self_upgrade() -> int:
 
     method = _detect_install_method()
     commands = {
-        "uv": ["uv", "tool", "upgrade", "claude-swap"],
-        "pipx": ["pipx", "upgrade", "claude-swap"],
+        "uv": ["uv", "tool", "upgrade", "claude-swap-2"],
+        "pipx": ["pipx", "upgrade", "claude-swap-2"],
     }
     cmd = commands.get(method or "")
     if cmd is None:
@@ -152,9 +152,9 @@ def run_self_upgrade() -> int:
             f"  sys.prefix:     {sys.prefix}\n"
             f"  sys.executable: {sys.executable}\n"
             "To upgrade manually, run one of:\n"
-            "  uv tool upgrade claude-swap\n"
-            "  pipx upgrade claude-swap\n"
-            f"  {sys.executable} -m pip install --upgrade claude-swap\n"
+            "  uv tool upgrade claude-swap-2\n"
+            "  pipx upgrade claude-swap-2\n"
+            f"  {sys.executable} -m pip install --upgrade claude-swap-2\n"
             "If you installed with `pip install -e .`, use `git pull` instead."
         )
         return 1

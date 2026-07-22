@@ -1340,3 +1340,27 @@ def test_consume_first_avoids_fable_exhausted_peer():
     ]
     # Peer 3 resets soonest (would win) but is Fable-exhausted -> peer 2 chosen.
     assert menubar.decide_consume_first(accts, 95) == ("switch", 2)
+
+
+def test_usage_summary_renders_login_expired():
+    # The token-expired sentinel renders as the user-facing "login expired"
+    # (the account row's one-liner), not the raw internal string.
+    from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+    assert menubar.usage_summary(USAGE_TOKEN_EXPIRED) == "login expired"
+    # other sentinels pass through unchanged
+    assert menubar.usage_summary("rate limited") == "rate limited"
+
+
+def test_reauth_outcome_message_identity_match():
+    m = menubar.reauth_outcome_message(4, "b@x.com", "b@x.com")
+    assert "4" in m and "re-authenticated" in m.lower()
+
+def test_reauth_outcome_message_identity_mismatch():
+    # Signing in as a different account must NOT claim the target was fixed.
+    m = menubar.reauth_outcome_message(4, "b@x.com", "other@x.com")
+    assert "other@x.com" in m
+    assert "4" in m and "still needs" in m.lower()
+
+def test_reauth_outcome_message_no_email():
+    m = menubar.reauth_outcome_message(4, "b@x.com", None)
+    assert "4" in m and "still needs" in m.lower()

@@ -85,6 +85,10 @@ _BACKUP_USAGE_TTL = 60  # seconds a backup account's usage entry stays fresh
 _USAGE_ROUND_BUDGET = 20  # seconds of wall clock a sequential fetch round may take
 _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
 _DEAD_REPROBE = 900  # seconds a known-dead credential is skipped before re-probing
+_LOGIN_EXPIRED_STALE = 300  # a non-active account with an expired stored token AND
+# a last-valid-refresh older than this is "login expired" (refresh persistently
+# failing — dead token OR a token-endpoint 429); the guard avoids flagging a token
+# that just expired on a single-round blip.
 
 
 def _usage_cache_entry(value) -> dict:
@@ -2127,6 +2131,16 @@ class ClaudeAccountSwitcher:
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         account_keys = [str(info[0]) for info in accounts_info]
         email_by_key = {str(info[0]): info[1] for info in accounts_info}
+        is_active_by_key = {str(info[0]): info[4] for info in accounts_info}
+
+        def _stored_token_expired(info) -> bool:
+            creds = info[5]
+            data = oauth.extract_oauth_data(creds) if creds else None
+            return bool(data) and oauth.is_oauth_token_expired(data.get("expiresAt"))
+
+        token_expired_by_key = {
+            str(info[0]): _stored_token_expired(info) for info in accounts_info
+        }
 
         # Last-known-good cache, ignoring file age (for retention/backoff).
         # Entries are normalized to {"usage", "fetchedAt"}; legacy bare values
@@ -2251,6 +2265,21 @@ class ClaudeAccountSwitcher:
             prior_entry = prior.get(k)
             if k in fetched:
                 val = fetched[k]
+                # Login-expired upgrade: a non-active account whose STORED token is
+                # expired and whose refresh keeps failing (val is not a fresh dict)
+                # with a stale last-valid refresh is surfaced as token-expired
+                # ("login expired") rather than retaining a stale % that reads as
+                # healthy and feeds auto-swap. This also drives DEAD health -> a
+                # WARNING + dead-reprobe backoff, so a persistently-refresh-429'd
+                # account stops being hammered. The validAt-stale guard prevents
+                # flagging a token that just expired on a single-round blip.
+                if (
+                    not isinstance(val, dict)
+                    and not is_active_by_key.get(k, False)
+                    and token_expired_by_key.get(k, False)
+                    and (now - _prior_valid_at(prior_entry)) > _LOGIN_EXPIRED_STALE
+                ):
+                    val = USAGE_TOKEN_EXPIRED
                 # Health TRANSITIONS drive both edge-only logging (B3) and the
                 # dead-reprobe backoff (B4). A bare-None transient blip carries no
                 # health signal, so it does not churn the recorded state.
@@ -2478,7 +2507,7 @@ class ClaudeAccountSwitcher:
                 if is_active:
                     print(f"     {dimmed('token expired — Claude Code refreshes the active account')}")
                 else:
-                    print(f"     {dimmed('token expired — sign in again: cswap --add-account')}")
+                    print(f"     {dimmed('login expired — sign in again: cswap --add-account')}")
             elif usage == USAGE_API_KEY:
                 print(f"     {dimmed('API key (no quota)')}")
             elif isinstance(usage, str):

@@ -194,7 +194,7 @@ class TestCheckForUpdateMessage:
         result = check_for_update("0.3.2")
 
         assert result is not None
-        assert "pipx upgrade claude-swap" in result
+        assert "pipx upgrade claude-swap-2" in result
         assert "cswap --upgrade" not in result
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
@@ -223,7 +223,7 @@ class TestRunSelfUpgrade:
 
         assert run_self_upgrade() == 0
         mock_run.assert_called_once_with(
-            ["uv", "tool", "upgrade", "claude-swap"], check=False
+            ["uv", "tool", "upgrade", "claude-swap-2"], check=False
         )
 
     @patch("claude_swap.update_check.subprocess.run")
@@ -233,7 +233,7 @@ class TestRunSelfUpgrade:
 
         assert run_self_upgrade() == 0
         mock_run.assert_called_once_with(
-            ["pipx", "upgrade", "claude-swap"], check=False
+            ["pipx", "upgrade", "claude-swap-2"], check=False
         )
 
     @patch("claude_swap.update_check.subprocess.run")
@@ -251,9 +251,9 @@ class TestRunSelfUpgrade:
         assert run_self_upgrade() == 1
         mock_run.assert_not_called()
         err = capsys.readouterr().err
-        assert "uv tool upgrade claude-swap" in err
-        assert "pipx upgrade claude-swap" in err
-        assert "pip install --upgrade claude-swap" in err
+        assert "uv tool upgrade claude-swap-2" in err
+        assert "pipx upgrade claude-swap-2" in err
+        assert "pip install --upgrade claude-swap-2" in err
 
     @patch(
         "claude_swap.update_check.subprocess.run", side_effect=FileNotFoundError
@@ -276,7 +276,7 @@ class TestRunSelfUpgradeWindows:
         assert run_self_upgrade() == 1
         mock_run.assert_not_called()
         out = capsys.readouterr().out
-        assert "uv tool upgrade claude-swap" in out
+        assert "uv tool upgrade claude-swap-2" in out
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value="pipx")
@@ -284,7 +284,7 @@ class TestRunSelfUpgradeWindows:
         assert run_self_upgrade() == 1
         mock_run.assert_not_called()
         out = capsys.readouterr().out
-        assert "pipx upgrade claude-swap" in out
+        assert "pipx upgrade claude-swap-2" in out
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check._detect_install_method", return_value=None)
@@ -292,6 +292,6 @@ class TestRunSelfUpgradeWindows:
         assert run_self_upgrade() == 1
         mock_run.assert_not_called()
         err = capsys.readouterr().err
-        assert "uv tool upgrade claude-swap" in err
-        assert "pipx upgrade claude-swap" in err
-        assert "pip install --upgrade claude-swap" in err
+        assert "uv tool upgrade claude-swap-2" in err
+        assert "pipx upgrade claude-swap-2" in err
+        assert "pip install --upgrade claude-swap-2" in err
