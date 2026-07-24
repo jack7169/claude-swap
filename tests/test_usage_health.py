@@ -18,6 +18,7 @@ import json
 import logging
 
 from claude_swap import oauth as _oauth
+from claude_swap import switcher as _switcher
 from claude_swap.json_output import USAGE_RATE_LIMITED, USAGE_TOKEN_EXPIRED
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -167,3 +168,68 @@ class TestDeadReprobeBackoff:
         out = h.round({"2": {"five_hour": {"pct": 5.0}}})   # non-forced
         assert (h.now, "2") in h.calls                      # re-fetched now
         assert out[1] == {"five_hour": {"pct": 5.0}}
+
+
+class TestRefreshRateLimitBackoff:
+    """A token-endpoint (refresh) 429 must arm a GLOBAL back-off so cswap stops
+    hammering the shared per-IP token limit. Otherwise every expired-token backup
+    retries its refresh every round, keeping the limit pinned so no token ever
+    refreshes — the 'usage unavailable' storm. Distinct from a usage-endpoint 429
+    (RATE_LIMITED), which the roll spreads and must NOT trigger a back-off."""
+
+    def test_token_rate_limited_arms_backoff_and_renders_rate_limited(
+        self, temp_home, monkeypatch
+    ):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        out = h.round({"2": _oauth.TOKEN_RATE_LIMITED})
+        # The internal signal is rendered as the ordinary rate-limited sentinel.
+        assert out[1] == USAGE_RATE_LIMITED
+        # Global refresh back-off armed for the window.
+        assert s._refresh_rl_until == h.now + _switcher._REFRESH_RL_BACKOFF
+
+    def test_backed_off_non_active_skipped_within_window(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": _oauth.TOKEN_RATE_LIMITED})           # arm at t=1000
+        h.now += 30                                         # within the window
+        out = h.round({"2": {"five_hour": {"pct": 5.0}}})   # would recover IF fetched
+        assert [c for c in h.calls if c[0] == h.now] == []  # not re-fetched
+        assert out[1] == USAGE_RATE_LIMITED                 # retains rate-limited
+
+    def test_backed_off_account_refetched_after_window(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": _oauth.TOKEN_RATE_LIMITED})
+        h.now += _switcher._REFRESH_RL_BACKOFF + 1          # past the window
+        out = h.round({"2": {"five_hour": {"pct": 7.0}}})
+        assert (h.now, "2") in h.calls                      # re-probed
+        assert out[1] == {"five_hour": {"pct": 7.0}}        # recovered
+
+    def test_force_bypasses_refresh_backoff(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": _oauth.TOKEN_RATE_LIMITED})
+        h.now += 5                                          # well within the window
+        h.round({"2": {"five_hour": {"pct": 2.0}}}, force=True)
+        assert (h.now, "2") in h.calls                      # forced -> fetched anyway
+
+    def test_active_account_not_skipped_during_refresh_backoff(
+        self, temp_home, monkeypatch
+    ):
+        # An ACTIVE account never refreshes via cswap (Claude Code owns its token),
+        # so the shared token limit doesn't apply — it must keep fetching during
+        # the back-off, routed through _fetch_active_usage (not fetch_usage...).
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": _oauth.TOKEN_RATE_LIMITED})           # arm global back-off
+        active_calls = []
+        monkeypatch.setattr(
+            s, "_fetch_active_usage",
+            lambda num, email, creds: active_calls.append(str(num))
+            or {"five_hour": {"pct": 3.0}},
+        )
+        h.now += 10
+        out = s._collect_usage([(1, "a@x.com", "", "", True, _CREDS)], only={"1"})
+        assert active_calls == ["1"]                        # active fetched anyway
+        assert out[0] == {"five_hour": {"pct": 3.0}}

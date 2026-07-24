@@ -21,12 +21,21 @@ RATE_LIMITED = "rate limited"
 # ``val in (USAGE_TOKEN_EXPIRED, …)`` comparison matches without importing it
 # (mirrors how RATE_LIMITED / USAGE_RATE_LIMITED already interoperate).
 TOKEN_EXPIRED = "token expired"
+# fetch_usage_for_account signal: the TOKEN endpoint (refresh) is rate-limited
+# (429), distinct from RATE_LIMITED (the USAGE endpoint). The token limit is
+# per-IP and shared across every account, so continuing to refresh only keeps it
+# pinned; the switcher intercepts this to arm a global refresh back-off, then
+# renders it like RATE_LIMITED. Kept a DISTINCT string so a usage-429 (which must
+# NOT back off — the roll spreads it) is never confused with a refresh-429.
+TOKEN_RATE_LIMITED = "token rate limited"
 
-# Why a refresh failed. Only a 400/401 from the token endpoint (invalid_grant)
-# proves the refresh token is dead; everything else (other HTTP status, network
-# blip, timeout, malformed 200) is transient and must NOT wipe good usage.
+# Why a refresh failed. A 400/401 from the token endpoint (invalid_grant) proves
+# the refresh token is dead; a 429 is a shared per-IP rate limit (back off, don't
+# hammer); everything else (other HTTP status, network blip, timeout, malformed
+# 200) is transient and must NOT wipe good usage.
 REFRESH_AUTH_FAILED = "auth"
 REFRESH_TRANSIENT = "transient"
+REFRESH_RATE_LIMITED = "rate_limited"
 
 # The usage endpoint buckets rate limits on User-Agent, PER ACCESS TOKEN.
 # ``claude-code/<version>`` is the safe bucket (fine at ~180s intervals); any
@@ -131,7 +140,11 @@ def _refresh_with_reason(credentials: str) -> tuple[str | None, str]:
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
-        reason = REFRESH_AUTH_FAILED if e.code in (400, 401) else REFRESH_TRANSIENT
+        reason = (
+            REFRESH_AUTH_FAILED if e.code in (400, 401)
+            else REFRESH_RATE_LIMITED if e.code == 429
+            else REFRESH_TRANSIENT
+        )
         return None, reason
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
@@ -406,6 +419,11 @@ def fetch_usage_for_account(
             # UA bucket) add to the 429 storm. Surfaces as TOKEN_EXPIRED so the
             # switcher merge overrides any stale retained usage.
             return TOKEN_EXPIRED
+        elif reason == REFRESH_RATE_LIMITED:
+            # Token endpoint is rate-limited (shared per-IP). Falling through to a
+            # doomed usage 401 would only add load; signal the switcher to back off
+            # refreshes so the shared limit can reset.
+            return TOKEN_RATE_LIMITED
         # transient -> fall through with the stale token (may 401 -> retry below)
 
     try:
@@ -427,9 +445,14 @@ def fetch_usage_for_account(
         # Retry once after refreshing on 401 (inactive accounts only).
         refreshed, reason = _refresh_with_reason(working_credentials)
         if not refreshed:
-            # A dead refresh token here is definitive -> TOKEN_EXPIRED; a
-            # transient blip stays None so the merge retains last-known-good.
-            return TOKEN_EXPIRED if reason == REFRESH_AUTH_FAILED else None
+            # A dead refresh token here is definitive -> TOKEN_EXPIRED; a rate-
+            # limited token endpoint -> TOKEN_RATE_LIMITED (back off); a transient
+            # blip stays None so the merge retains last-known-good.
+            if reason == REFRESH_AUTH_FAILED:
+                return TOKEN_EXPIRED
+            if reason == REFRESH_RATE_LIMITED:
+                return TOKEN_RATE_LIMITED
+            return None
 
         working_credentials = refreshed
         _persist(persist_credentials, account_num, email, working_credentials)

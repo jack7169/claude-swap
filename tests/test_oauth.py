@@ -670,6 +670,57 @@ class TestFetchUsageForAccount:
 
         assert result == oauth.TOKEN_EXPIRED
 
+    def test_refresh_429_returns_token_rate_limited_no_usage_call(self):
+        """A proactively-detected token-endpoint 429 on refresh short-circuits to
+        the TOKEN_RATE_LIMITED signal with ZERO usage calls: the caller backs off
+        rather than hammering the shared per-IP token limit (or 401ing usage)."""
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        credentials = self._make_credentials(expires_at=now_ms - 1_000)
+        usage_calls = 0
+
+        def mock_urlopen(req, timeout=0):
+            nonlocal usage_calls
+            if "oauth/token" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "Too Many", hdrs=None, fp=None,
+                )
+            if "oauth/usage" in req.full_url:
+                usage_calls += 1
+                raise AssertionError("rate-limited refresh must not reach usage")
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, is_active=False,
+            )
+
+        assert result == oauth.TOKEN_RATE_LIMITED
+        assert usage_calls == 0
+
+    def test_401_retry_refresh_429_returns_token_rate_limited(self):
+        """Non-expired token that 401s, then the retry-refresh is 429'd (token
+        endpoint rate-limited): surface TOKEN_RATE_LIMITED (a back-off signal),
+        not None (which would just keep retrying and hammering the limit)."""
+        credentials = self._make_credentials()  # not expired -> no proactive refresh
+
+        def mock_urlopen(req, timeout=0):
+            if "oauth/usage" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                )
+            if "oauth/token" in req.full_url:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "Too Many", hdrs=None, fp=None,
+                )
+            raise AssertionError(f"Unexpected URL: {req.full_url}")
+
+        with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
+            result = oauth.fetch_usage_for_account(
+                "1", "test@example.com", credentials, is_active=False,
+            )
+
+        assert result == oauth.TOKEN_RATE_LIMITED
+
     def test_refreshes_when_scopes_are_missing(self):
         """Refresh should work even when stored credentials have no scopes."""
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
@@ -876,6 +927,15 @@ class TestRefreshWithReason:
             return resp
 
         assert self._run(bad) == (None, oauth.REFRESH_TRANSIENT)
+
+    def test_http_429_is_rate_limited(self):
+        # A token-endpoint 429 is neither a dead token (auth) nor a generic blip
+        # (transient): it is a distinct rate-limit signal the caller uses to BACK
+        # OFF refreshes so it stops hammering the shared per-IP token limit.
+        creds, reason = self._run(
+            lambda req, timeout=0: (_ for _ in ()).throw(
+                urllib.error.HTTPError(req.full_url, 429, "Too Many", None, None)))
+        assert (creds, reason) == (None, oauth.REFRESH_RATE_LIMITED)
 
     def test_refresh_oauth_credentials_delegates_and_returns_str_or_none(self):
         # Back-compat: the thin wrapper keeps its str|None contract (session.py).

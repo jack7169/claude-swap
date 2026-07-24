@@ -85,10 +85,9 @@ _BACKUP_USAGE_TTL = 60  # seconds a backup account's usage entry stays fresh
 _USAGE_ROUND_BUDGET = 20  # seconds of wall clock a sequential fetch round may take
 _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
 _DEAD_REPROBE = 900  # seconds a known-dead credential is skipped before re-probing
-_LOGIN_EXPIRED_STALE = 300  # a non-active account with an expired stored token AND
-# a last-valid-refresh older than this is "login expired" (refresh persistently
-# failing — dead token OR a token-endpoint 429); the guard avoids flagging a token
-# that just expired on a single-round blip.
+_REFRESH_RL_BACKOFF = 600  # seconds to pause BACKUP token refreshes after a token-
+# endpoint 429 (shared per-IP) so the limit can reset and refreshes succeed again.
+# Global (not per-account): the token limit is one bucket for the whole IP.
 
 
 def _usage_cache_entry(value) -> dict:
@@ -243,6 +242,11 @@ class ClaudeAccountSwitcher:
         # only — never a global stall) so cswap stops hammering a revoked token every
         # ~60s. Cleared on recovery; bypassed by force=True ("Refresh now").
         self._usage_dead_until: dict[str, float] = {}
+        # Epoch until which BACKUP token refreshes are paused after a token-endpoint
+        # 429 (oauth.TOKEN_RATE_LIMITED). The token limit is shared per-IP, so this is
+        # global (all backups at once), not per-account; the active account never
+        # refreshes via cswap so it keeps fetching. Bypassed by force=True.
+        self._refresh_rl_until: float = 0.0
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
         # Optional swap notifier (cli.main wires this on macOS). Invoked from the
@@ -2131,16 +2135,6 @@ class ClaudeAccountSwitcher:
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         account_keys = [str(info[0]) for info in accounts_info]
         email_by_key = {str(info[0]): info[1] for info in accounts_info}
-        is_active_by_key = {str(info[0]): info[4] for info in accounts_info}
-
-        def _stored_token_expired(info) -> bool:
-            creds = info[5]
-            data = oauth.extract_oauth_data(creds) if creds else None
-            return bool(data) and oauth.is_oauth_token_expired(data.get("expiresAt"))
-
-        token_expired_by_key = {
-            str(info[0]): _stored_token_expired(info) for info in accounts_info
-        }
 
         # Last-known-good cache, ignoring file age (for retention/backoff).
         # Entries are normalized to {"usage", "fetchedAt"}; legacy bare values
@@ -2197,13 +2191,25 @@ class ClaudeAccountSwitcher:
             # window elapses — per-account only, so healthy accounts keep fetching.
             return now < self._usage_dead_until.get(str(info[0]), 0.0)
 
+        def is_refresh_backed_off(info) -> bool:
+            # After a token-endpoint 429 (shared per-IP), pause BACKUP refreshes so
+            # the limit can reset — otherwise every expired-token backup retries its
+            # refresh every round and keeps the limit pinned. The active account
+            # never refreshes via cswap, so it is exempt and keeps fetching.
+            return not info[4] and now < self._refresh_rl_until
+
         in_scope = (
             accounts_info if only is None
             else [info for info in accounts_info if str(info[0]) in only]
         )
         to_fetch = (
             list(in_scope) if force
-            else [i for i in in_scope if is_stale(i) and not is_dead_backed_off(i)]
+            else [
+                i for i in in_scope
+                if is_stale(i)
+                and not is_dead_backed_off(i)
+                and not is_refresh_backed_off(i)
+            ]
         )
         # Strictly stalest-first — the active account gets NO priority. With
         # stop-on-first-429 below, prioritizing the active account (stale
@@ -2235,6 +2241,20 @@ class ClaudeAccountSwitcher:
             if fetched and time.time() - round_start > _USAGE_ROUND_BUDGET:
                 break
             res = fetch(info)
+            if res == oauth.TOKEN_RATE_LIMITED:
+                # The TOKEN endpoint is rate-limited (shared per-IP). Arm a GLOBAL
+                # back-off so cswap stops hammering it: otherwise every expired-token
+                # backup retries its refresh every round, keeping the limit pinned so
+                # no token ever refreshes (the 'usage unavailable' storm). Render it
+                # as the ordinary rate-limited sentinel for the merge/display.
+                if now >= self._refresh_rl_until:  # edge: newly rate-limited
+                    self._logger.info(
+                        "Account %s (%s) token refresh rate-limited (429); pausing "
+                        "backup refreshes %ds so the shared per-IP limit can reset",
+                        info[0], info[1], _REFRESH_RL_BACKOFF,
+                    )
+                self._refresh_rl_until = now + _REFRESH_RL_BACKOFF
+                res = USAGE_RATE_LIMITED
             fetched[str(info[0])] = res
             if res == USAGE_RATE_LIMITED:
                 # Stop this round (further calls would only chain 429s), but do
@@ -2265,21 +2285,12 @@ class ClaudeAccountSwitcher:
             prior_entry = prior.get(k)
             if k in fetched:
                 val = fetched[k]
-                # Login-expired upgrade: a non-active account whose STORED token is
-                # expired and whose refresh keeps failing (val is not a fresh dict)
-                # with a stale last-valid refresh is surfaced as token-expired
-                # ("login expired") rather than retaining a stale % that reads as
-                # healthy and feeds auto-swap. This also drives DEAD health -> a
-                # WARNING + dead-reprobe backoff, so a persistently-refresh-429'd
-                # account stops being hammered. The validAt-stale guard prevents
-                # flagging a token that just expired on a single-round blip.
-                if (
-                    not isinstance(val, dict)
-                    and not is_active_by_key.get(k, False)
-                    and token_expired_by_key.get(k, False)
-                    and (now - _prior_valid_at(prior_entry)) > _LOGIN_EXPIRED_STALE
-                ):
-                    val = USAGE_TOKEN_EXPIRED
+                # A dead credential is surfaced as USAGE_TOKEN_EXPIRED by the oauth
+                # layer itself (fetch_usage_for_account, on a token-endpoint 400/401
+                # = invalid_grant). _collect_usage does NOT re-derive "login expired"
+                # from stored-token expiry: a backup's stored access token is expired
+                # as its normal resting state between refreshes, so that proxy would
+                # falsely flag every healthy-but-rate-limited backup in turn.
                 # Health TRANSITIONS drive both edge-only logging (B3) and the
                 # dead-reprobe backoff (B4). A bare-None transient blip carries no
                 # health signal, so it does not churn the recorded state.

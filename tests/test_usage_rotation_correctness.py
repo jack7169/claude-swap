@@ -210,66 +210,76 @@ class TestCollectUsageDeadBackupEndToEnd:
         assert written["data"]["2"]["usage"] == USAGE_TOKEN_EXPIRED
 
 
-class TestCollectUsageLoginExpired:
-    """A non-active account whose STORED token is expired and whose refresh keeps
-    failing (dead OR a persistent token-endpoint 429 like acct 4) is 'login
-    expired': surface USAGE_TOKEN_EXPIRED instead of retaining a stale % that
-    reads as healthy and feeds auto-swap. Gated on a stale validAt so a one-round
-    blip on a just-expired token doesn't flicker."""
+class TestHealthyBackupNeverFalselyExpired:
+    """Regression (the 'every backup shows login expired' cascade): a HEALTHY
+    backup whose STORED access token is expired — the normal resting state of a
+    backup between refreshes — must NEVER be flagged 'login expired' merely
+    because a usage fetch transiently fails (429 / network blip) while its last
+    good refresh is stale. Only a genuine dead refresh token (token-endpoint
+    400/401, surfaced by fetch_usage_for_account as USAGE_TOKEN_EXPIRED) is
+    'login expired'.
+
+    Before the fix, a (stored-token-expired + non-dict fetch + validAt>300s)
+    heuristic in _collect_usage upgraded these transient failures to the sentinel;
+    under the usage endpoint's routine per-IP 429s every backup satisfied all
+    three conditions in turn and got stuck DEAD one by one."""
 
     @staticmethod
     def _expired_creds():
+        # Expired stored ACCESS token but a valid REFRESH token: a perfectly
+        # healthy backup that just needs a routine refresh.
         return json.dumps({"claudeAiOauth": {
             "accessToken": "sk", "refreshToken": "rt", "expiresAt": 0,
         }})
 
-    def _seed(self, s, *, validAt_ago):
+    def _seed_stale(self, s):
         import time
         now = time.time()
         write_cache(s.backup_dir / "cache" / "usage.json", {
             "2": {"usage": {"five_hour": {"pct": 43.0}},
-                  "fetchedAt": now - validAt_ago, "validAt": now - validAt_ago},
+                  "fetchedAt": now - 400, "validAt": now - 400},  # >300s stale
         })
 
-    def test_expired_token_stale_validAt_overrides_to_sentinel(self, temp_home, monkeypatch):
+    def test_rate_limited_stale_backup_retains_dict_not_expired(self, temp_home, monkeypatch):
         s = _make_switcher()
         monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
-        self._seed(s, validAt_ago=400)          # last valid refresh well past the window
-        _patch_fetch(monkeypatch, {"2": None})    # refresh failing (e.g. token-endpoint 429)
+        self._seed_stale(s)
+        _patch_fetch(monkeypatch, {"2": USAGE_RATE_LIMITED})   # the live trigger
+        info = [(2, "b@x.com", "", "", False, self._expired_creds())]
+
+        out = s._collect_usage(info, only={"2"})
+
+        assert out[0] == {"five_hour": {"pct": 43.0}}          # retained, NOT sentinel
+        assert out[0] != USAGE_TOKEN_EXPIRED
+        assert s._usage_health.get("2") != "DEAD"              # not falsely dead
+        assert "2" not in s._usage_dead_until                  # no dead-reprobe backoff
+
+    def test_none_blip_stale_backup_retains_dict_not_expired(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        self._seed_stale(s)
+        _patch_fetch(monkeypatch, {"2": None})                 # a bare network blip
+        info = [(2, "b@x.com", "", "", False, self._expired_creds())]
+
+        out = s._collect_usage(info, only={"2"})
+
+        assert out[0] == {"five_hour": {"pct": 43.0}}
+        assert out[0] != USAGE_TOKEN_EXPIRED
+        assert "2" not in s._usage_dead_until
+
+    def test_genuine_dead_token_still_surfaces_expired(self, temp_home, monkeypatch):
+        # Contrast: when fetch_usage_for_account itself returns the sentinel (a real
+        # token-endpoint 400/401), the account IS surfaced as login-expired + DEAD.
+        s = _make_switcher()
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        self._seed_stale(s)
+        _patch_fetch(monkeypatch, {"2": USAGE_TOKEN_EXPIRED})
         info = [(2, "b@x.com", "", "", False, self._expired_creds())]
 
         out = s._collect_usage(info, only={"2"})
 
         assert out[0] == USAGE_TOKEN_EXPIRED
-        assert _oauth.account_headroom(out[0]) is None
-
-    def test_expired_token_fresh_validAt_retains_dict(self, temp_home, monkeypatch):
-        # Anti-flicker: a just-expired token with a one-round refresh blip keeps its
-        # % (validAt still fresh) until the failures persist past the window.
-        s = _make_switcher()
-        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
-        self._seed(s, validAt_ago=61)             # stale enough to fetch, fresh enough to keep
-        _patch_fetch(monkeypatch, {"2": None})
-        info = [(2, "b@x.com", "", "", False, self._expired_creds())]
-
-        out = s._collect_usage(info, only={"2"})
-
-        assert out[0] == {"five_hour": {"pct": 43.0}}
-
-    def test_valid_token_never_login_expired(self, temp_home, monkeypatch):
-        # A non-expired stored token is never login-expired even if refresh blips.
-        s = _make_switcher()
-        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
-        self._seed(s, validAt_ago=400)
-        _patch_fetch(monkeypatch, {"2": None})
-        valid = json.dumps({"claudeAiOauth": {
-            "accessToken": "sk", "refreshToken": "rt", "expiresAt": 9_999_999_999_000,
-        }})
-        info = [(2, "b@x.com", "", "", False, valid)]
-
-        out = s._collect_usage(info, only={"2"})
-
-        assert out[0] == {"five_hour": {"pct": 43.0}}
+        assert s._usage_health.get("2") == "DEAD"
 
 
 class TestBestStrategySkipsDefinitivelyFailed:
