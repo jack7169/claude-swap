@@ -535,8 +535,16 @@ def test_plan_auto_tick_evaluates_when_full_fetch_is_fresh():
 # so a burst never trips the usage endpoint's per-IP 429.
 
 def test_roll_interval_spreads_across_refresh_period():
-    # 5 accounts over a 30s refresh interval -> one every 6s.
-    assert menubar._roll_interval(30, 5) == 6.0
+    # 4 accounts over a 120s refresh interval -> one every 30s (the division
+    # dominates the floor, so this exercises the "spread across the period" path).
+    assert menubar._roll_interval(120, 4) == 30.0
+
+
+def test_roll_interval_floor_is_15s():
+    # The floor matches the usage endpoint's observed ~1-success/15s per-IP
+    # tolerance, so a full account list can't re-trip the 429 storm.
+    assert menubar._ROLL_MIN_INTERVAL == 15.0
+    assert menubar._roll_interval(30, 8) == 15.0   # 30/8 = 3.75 -> floored to 15
 
 
 def test_roll_interval_single_account_uses_full_period():

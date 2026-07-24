@@ -220,7 +220,9 @@ def auto_switch_countdown_text(seconds_to_next: float, cadence: int) -> str:
     return f"Next check: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
 
 
-_ROLL_MIN_INTERVAL = 5.0  # never fetch faster than this, however many accounts
+_ROLL_MIN_INTERVAL = 15.0  # never fetch faster than this, however many accounts:
+# matches the usage endpoint's observed ~1-success/15s per-IP tolerance so a full
+# account list doesn't re-trip the 429 storm (a 5s floor let 8 accounts flap 429s).
 
 
 def _roll_interval(refresh_interval: float, n_accounts: int) -> float:
