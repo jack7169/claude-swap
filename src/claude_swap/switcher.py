@@ -85,9 +85,6 @@ _BACKUP_USAGE_TTL = 60  # seconds a backup account's usage entry stays fresh
 _USAGE_ROUND_BUDGET = 20  # seconds of wall clock a sequential fetch round may take
 _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
 _DEAD_REPROBE = 900  # seconds a known-dead credential is skipped before re-probing
-_REFRESH_RL_BACKOFF = 600  # seconds to pause BACKUP token refreshes after a token-
-# endpoint 429 (shared per-IP) so the limit can reset and refreshes succeed again.
-# Global (not per-account): the token limit is one bucket for the whole IP.
 
 
 def _usage_cache_entry(value) -> dict:
@@ -242,11 +239,6 @@ class ClaudeAccountSwitcher:
         # only — never a global stall) so cswap stops hammering a revoked token every
         # ~60s. Cleared on recovery; bypassed by force=True ("Refresh now").
         self._usage_dead_until: dict[str, float] = {}
-        # Epoch until which BACKUP token refreshes are paused after a token-endpoint
-        # 429 (oauth.TOKEN_RATE_LIMITED). The token limit is shared per-IP, so this is
-        # global (all backups at once), not per-account; the active account never
-        # refreshes via cswap so it keeps fetching. Bypassed by force=True.
-        self._refresh_rl_until: float = 0.0
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
         # Optional swap notifier (cli.main wires this on macOS). Invoked from the
@@ -2191,25 +2183,13 @@ class ClaudeAccountSwitcher:
             # window elapses — per-account only, so healthy accounts keep fetching.
             return now < self._usage_dead_until.get(str(info[0]), 0.0)
 
-        def is_refresh_backed_off(info) -> bool:
-            # After a token-endpoint 429 (shared per-IP), pause BACKUP refreshes so
-            # the limit can reset — otherwise every expired-token backup retries its
-            # refresh every round and keeps the limit pinned. The active account
-            # never refreshes via cswap, so it is exempt and keeps fetching.
-            return not info[4] and now < self._refresh_rl_until
-
         in_scope = (
             accounts_info if only is None
             else [info for info in accounts_info if str(info[0]) in only]
         )
         to_fetch = (
             list(in_scope) if force
-            else [
-                i for i in in_scope
-                if is_stale(i)
-                and not is_dead_backed_off(i)
-                and not is_refresh_backed_off(i)
-            ]
+            else [i for i in in_scope if is_stale(i) and not is_dead_backed_off(i)]
         )
         # Strictly stalest-first — the active account gets NO priority. With
         # stop-on-first-429 below, prioritizing the active account (stale
@@ -2241,27 +2221,25 @@ class ClaudeAccountSwitcher:
             if fetched and time.time() - round_start > _USAGE_ROUND_BUDGET:
                 break
             res = fetch(info)
-            if res == oauth.TOKEN_RATE_LIMITED:
-                # The TOKEN endpoint is rate-limited (shared per-IP). Arm a GLOBAL
-                # back-off so cswap stops hammering it: otherwise every expired-token
-                # backup retries its refresh every round, keeping the limit pinned so
-                # no token ever refreshes (the 'usage unavailable' storm). Render it
-                # as the ordinary rate-limited sentinel for the merge/display.
-                if now >= self._refresh_rl_until:  # edge: newly rate-limited
-                    self._logger.info(
-                        "Account %s (%s) token refresh rate-limited (429); pausing "
-                        "backup refreshes %ds so the shared per-IP limit can reset",
-                        info[0], info[1], _REFRESH_RL_BACKOFF,
-                    )
-                self._refresh_rl_until = now + _REFRESH_RL_BACKOFF
-                res = USAGE_RATE_LIMITED
+            token_rl = res == oauth.TOKEN_RATE_LIMITED
+            if token_rl:
+                # The TOKEN endpoint is rate-limited (shared per-IP). Surface as
+                # "login expired": a refresh-rate-limited backup cannot recover on its
+                # own until the shared limit resets, and a browser re-auth (a fresh
+                # token) sidesteps it entirely. Showing it as token-expired gives the
+                # menu its click-to-sign-in affordance, so the user can renew the login
+                # WITHOUT switching the active account — the only in-place recovery.
+                # The resulting DEAD health arms the per-account dead-reprobe backoff
+                # (900s, in the merge below), so cswap stops hammering the shared limit
+                # instead of retrying every round. (account_headroom -> None, so the
+                # account is still never auto-selected.)
+                res = USAGE_TOKEN_EXPIRED
             fetched[str(info[0])] = res
-            if res == USAGE_RATE_LIMITED:
-                # Stop this round (further calls would only chain 429s), but do
-                # NOT arm a cross-round backoff — the next round still fetches on
-                # the user's cadence. The rate-limit is surfaced as a per-account
-                # HEALTHY->RATE_LIMITED transition in the merge below (edge-only),
-                # not a per-attempt line, so the log isn't flooded at ~720 calls/h.
+            if token_rl or res == USAGE_RATE_LIMITED:
+                # Stop this round (further calls would only chain 429s). A usage-
+                # endpoint 429 (USAGE_RATE_LIMITED) surfaces as a per-account
+                # HEALTHY->RATE_LIMITED transition in the merge below (edge-only), not
+                # a per-attempt line, so the log isn't flooded at ~720 calls/h.
                 break
 
         # Merge. ``fetchedAt`` stamps every ATTEMPT (even failures) so ordering
