@@ -56,6 +56,11 @@ class MenuBarSettings:
     auto_switch_interval: int = 0  # 0 == evaluate with each display refresh
     auto_switch_strategy: str = "reactive"  # one of AUTO_STRATEGY_CHOICES
     auto_timer_start_enabled: bool = False
+    # Point size for every dropdown row. Smaller than the macOS default (14pt) so
+    # the menu — 8 accounts x (row + detail lines + Fable + sign-in), plus the
+    # graph — still fits the screen height. int (not float) so a plain JSON number
+    # survives load()'s isinstance type check.
+    menu_font_size: int = 11
 
     @classmethod
     def load(cls, path: Path) -> "MenuBarSettings":
@@ -1062,6 +1067,93 @@ def detect_dead_credential_edges(
     return newly, new_map
 
 
+MENU_FONT_CHOICES = (9, 10, 11, 12, 13, 14)
+_MENU_FONT_MIN, _MENU_FONT_MAX = 8.0, 18.0
+_MENU_FONT_DEFAULT = 11.0
+
+
+def menu_font_size(settings) -> float:
+    """Point size for every dropdown row, clamped to a usable range.
+
+    The whole menu is drawn at this size so a long account list (each account
+    contributing a row, detail lines, a Fable row and a sign-in row) plus the
+    packet graph still fits the screen. A missing/garbage value falls back to the
+    default rather than rendering an unreadable or oversized menu. Pure /
+    import-safe.
+    """
+    try:
+        size = float(getattr(settings, "menu_font_size", _MENU_FONT_DEFAULT))
+    except (TypeError, ValueError):
+        return _MENU_FONT_DEFAULT
+    return min(max(size, _MENU_FONT_MIN), _MENU_FONT_MAX)
+
+
+USAGE_ALERT_THRESHOLDS = (75, 90, 95)
+
+
+def detect_usage_alerts(
+    prev: dict[str, int], accounts, thresholds=USAGE_ALERT_THRESHOLDS
+) -> tuple[list[tuple[int, str]], dict[str, int]]:
+    """Threshold crossings for the ACTIVE account, so the user can swap in time.
+
+    ``accounts`` are the snapshot's ``(num, email, is_active, usage)`` rows. Two
+    independent axes are watched on the active account: ``usage`` — the binding
+    window (worst of 5h/7d, via :func:`_worst_pct`) — and ``fable``, its weekly
+    Fable limit. Returns ``(alerts, new_state)`` where ``alerts`` is a list of
+    ``(num, message)`` and ``new_state`` maps ``"<num>:<axis>" -> highest threshold
+    already alerted``.
+
+    Edge-only: a crossing fires ONE alert naming the highest threshold reached (a
+    70 -> 96% jump alerts "95%", not three times), staying above re-alerts nothing,
+    and dropping back below clears the axis so a later crossing (after the window
+    resets) alerts again. Unknown usage — ``None``, a sentinel string, or a dict
+    without the window — never alerts. Pure / import-safe (no rumps).
+    """
+    new_state: dict[str, int] = {}
+    alerts: list[tuple[int, str]] = []
+    ordered = sorted(thresholds)
+    for num, email, is_active, usage in accounts:
+        if not is_active or not isinstance(usage, dict):
+            continue
+        fable = usage.get("model_weekly", {}).get("Fable") or {}
+        axes = (
+            ("usage", _worst_pct(usage), "usage"),
+            ("fable", fable.get("pct"), "Fable weekly"),
+        )
+        for axis, pct, label in axes:
+            if not isinstance(pct, (int, float)):
+                continue
+            crossed = [t for t in ordered if pct >= t]
+            if not crossed:
+                continue  # below every threshold -> axis re-arms (dropped from state)
+            highest = crossed[-1]
+            key = f"{num}:{axis}"
+            new_state[key] = highest
+            if highest > prev.get(key, 0):
+                alerts.append(
+                    (num, f"Account {num} ({email}): {label} at {highest}% "
+                          f"(now {pct:.0f}%)")
+                )
+    return alerts, new_state
+
+
+def reauth_menu_title(usage: dict | str | None, is_active: bool) -> str | None:
+    """Title for an account's in-place sign-in row, or ``None`` for no row.
+
+    Every NON-ACTIVE account gets one, whatever its usage state — gating this on
+    "login expired" stranded the user whenever an account showed anything else
+    (rate limited / usage unavailable), leaving switching the active account as the
+    only way to renew a login. An expired login keeps the loud warning; every other
+    state gets a quiet entry. The active account has none: Claude Code owns that
+    credential and prompts for itself. Pure / import-safe.
+    """
+    if is_active:
+        return None
+    if usage == USAGE_TOKEN_EXPIRED:
+        return "    ⚠ Login expired — click to sign in"
+    return "    Sign in again…"
+
+
 def reauth_outcome_message(
     target_num: int, target_email: str, result_email: str | None
 ) -> str:
@@ -1225,6 +1317,17 @@ def _worker_impl(
             app.switcher._logger.debug(
                 "dead-credential notify failed", exc_info=True
             )
+        # Usage threshold alerts (75/90/95%) for the ACTIVE account — the whole point
+        # of the app is catching a window before it runs out. Edge-only, same guarded
+        # osascript path. Two axes (binding 5h/7d window + weekly Fable).
+        try:
+            usage_alerts, app._usage_alert_state = detect_usage_alerts(
+                getattr(app, "_usage_alert_state", {}), snap.get("accounts", [])
+            )
+            for _num, message in usage_alerts:
+                notify.notify(APP_TITLE, message)
+        except Exception:
+            app.switcher._logger.debug("usage-alert notify failed", exc_info=True)
         # Keep the packet-rate graph summing the right processes. One extra
         # local read of the session/IDE lockfiles per refresh cycle (cheap,
         # and independent of the usage snapshot). Guarded: no-op when no
@@ -1946,6 +2049,9 @@ def run(switcher) -> int:
             # Currently-dead backup credentials (num-str -> email). Diffed each
             # refresh so a credential going dead posts exactly one re-auth banner.
             self._dead_cred_map: dict[str, str] = {}
+            # Highest usage threshold already alerted per "<num>:<axis>", so a
+            # crossing notifies once and re-arms after the window resets.
+            self._usage_alert_state: dict[str, int] = {}
             # Thread-safe in-flight guard: the compare-and-set that admits at
             # most one worker, plus the lock that confines the keychain-
             # capability-cache mutation to one thread at a time.
@@ -2273,16 +2379,17 @@ def run(switcher) -> int:
                     d = rumps.MenuItem(f"    {line}", callback=None)
                     self.menu[f"detail-{num}-{i}"] = d
                     detail_items.append(d)
-                # A non-active login-expired account gets a CLICKABLE re-auth row:
-                # clicking runs the browser sign-in for THIS account (no switch, no
-                # terminal), re-authenticating it in place. Static title, so it's
-                # left out of detail_items (the in-place sync-tick refresh only
-                # touches usage %/countdowns); the signature change on entering the
-                # state already forces a full rebuild that creates/destroys it.
-                if usage == USAGE_TOKEN_EXPIRED and not is_active:
+                # Every non-active account gets a CLICKABLE re-auth row: clicking
+                # runs the browser sign-in for THIS account (no switch, no terminal),
+                # re-authenticating it in place. Loud when the login is expired, quiet
+                # otherwise — but ALWAYS present, so no account state can strand the
+                # user without a way to renew its login. Static title, so it's left
+                # out of detail_items (the in-place sync-tick refresh only touches
+                # usage %/countdowns).
+                reauth_title = reauth_menu_title(usage, is_active)
+                if reauth_title is not None:
                     reauth = rumps.MenuItem(
-                        "    ⚠ Login expired — click to sign in",
-                        callback=self._make_reauth(num, email),
+                        reauth_title, callback=self._make_reauth(num, email)
                     )
                     self.menu[f"reauth-{num}"] = reauth
                 # Keep references so the common-modes timer can refresh each
@@ -2335,6 +2442,43 @@ def run(switcher) -> int:
                 nsmenu.insertItem_atIndex_(NSMenuItem.separatorItem(), graph_index)
                 nsmenu.insertItem_atIndex_(graph_item, graph_index + 1)
 
+            # Render every row at the configured point size (last, so it catches
+            # every item this rebuild added).
+            self._apply_menu_font()
+
+        def _apply_menu_font(self):
+            """Draw the whole dropdown at the configured point size.
+
+            Set on the NSMenu (and recursively on every submenu) rather than per
+            item, so it covers rows rumps created as well as ones inserted
+            directly. Shorter rows = a menu that still fits the screen when many
+            accounts are managed. Guarded: a font failure must never break the menu.
+            """
+            try:
+                font = NSFont.menuFontOfSize_(menu_font_size(self.settings))
+            except Exception:
+                return
+            seen = set()
+
+            def _walk(nsmenu):
+                if nsmenu is None or id(nsmenu) in seen:
+                    return
+                seen.add(id(nsmenu))
+                nsmenu.setFont_(font)
+                for i in range(nsmenu.numberOfItems()):
+                    _walk(nsmenu.itemAtIndex_(i).submenu())
+
+            try:
+                _walk(self.menu._menu)
+            except Exception:
+                self.switcher._logger.debug("menu font apply failed", exc_info=True)
+
+        def _make_font_size(self, size):
+            def cb(_sender):
+                self.settings.menu_font_size = size
+                self._save_and_rebuild()
+            return cb
+
         def _add_menu(self, rumps):
             menu = rumps.MenuItem("Add account")
             menu.add(rumps.MenuItem("From current login", callback=self.on_add_login))
@@ -2373,6 +2517,15 @@ def run(switcher) -> int:
                 choice.state = 1 if self.settings.refresh_interval == secs else 0
                 interval.add(choice)
             menu.add(interval)
+
+            # Text size: the dropdown grows with the account list, so let the user
+            # shrink every row until it fits their screen height.
+            text_size = rumps.MenuItem("Text size")
+            for pt in MENU_FONT_CHOICES:
+                choice = rumps.MenuItem(f"{pt} pt", callback=self._make_font_size(pt))
+                choice.state = 1 if self.settings.menu_font_size == pt else 0
+                text_size.add(choice)
+            menu.add(text_size)
 
             # The auto-switch ON/OFF toggle lives on the main menu (the header's
             # "Auto-swap: ON/OFF" line), not here. Settings keeps only the

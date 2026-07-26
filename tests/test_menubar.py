@@ -1364,3 +1364,131 @@ def test_reauth_outcome_message_identity_mismatch():
 def test_reauth_outcome_message_no_email():
     m = menubar.reauth_outcome_message(4, "b@x.com", None)
     assert "4" in m and "still needs" in m.lower()
+
+
+class TestMenuFontSize:
+    """The dropdown must fit the screen: with 8 accounts (each carrying detail rows,
+    a Fable row and a sign-in row) plus the graph, the menu grew taller than the
+    display. The menu text is rendered at a configurable point size, defaulting
+    smaller than the macOS default (14pt), and settable live from the menu.
+    """
+
+    def test_default_is_smaller_than_the_macos_default(self):
+        assert menubar.menu_font_size(menubar.MenuBarSettings()) < 14.0
+
+    def test_reads_the_configured_size(self):
+        s = menubar.MenuBarSettings(menu_font_size=13)
+        assert menubar.menu_font_size(s) == 13.0
+
+    def test_clamped_to_a_usable_range(self):
+        assert menubar.menu_font_size(menubar.MenuBarSettings(menu_font_size=1)) >= 8.0
+        assert menubar.menu_font_size(menubar.MenuBarSettings(menu_font_size=99)) <= 18.0
+
+    def test_bad_value_falls_back_to_the_default(self):
+        class _Bad:
+            menu_font_size = "huge"
+        assert menubar.menu_font_size(_Bad()) == menubar.menu_font_size(
+            menubar.MenuBarSettings()
+        )
+
+    def test_choices_are_offered_and_include_the_default(self):
+        assert menubar.MenuBarSettings().menu_font_size in menubar.MENU_FONT_CHOICES
+
+    def test_size_survives_a_save_load_round_trip(self, tmp_path):
+        p = tmp_path / "settings.json"
+        menubar.MenuBarSettings(menu_font_size=10).save(p)
+        assert menubar.MenuBarSettings.load(p).menu_font_size == 10
+
+
+class TestUsageThresholdAlerts:
+    """Notify when the ACTIVE account crosses 75/90/95% so the user can swap in time.
+
+    Two independent axes: the binding window (worst of 5h/7d) and the weekly Fable
+    limit. Edge-only — one alert per upward crossing, naming the highest threshold
+    reached — and it re-arms once usage falls back (a window reset), so the next
+    cycle alerts again. Pure / import-safe.
+    """
+
+    @staticmethod
+    def _acct(pct, *, fable=None, num=4, active=True):
+        usage = {"five_hour": {"pct": pct}, "seven_day": {"pct": 0.0}}
+        if fable is not None:
+            usage["model_weekly"] = {"Fable": {"pct": fable}}
+        return [(num, "a@x.com", active, usage)]
+
+    def test_crossing_a_threshold_alerts_once(self):
+        alerts, state = menubar.detect_usage_alerts({}, self._acct(76.0))
+        assert len(alerts) == 1
+        assert "75" in alerts[0][1] and "a@x.com" in alerts[0][1]
+        # Staying above the same threshold does NOT re-alert.
+        again, state2 = menubar.detect_usage_alerts(state, self._acct(80.0))
+        assert again == []
+
+    def test_each_higher_threshold_alerts_again(self):
+        _, state = menubar.detect_usage_alerts({}, self._acct(76.0))
+        alerts, state = menubar.detect_usage_alerts(state, self._acct(91.0))
+        assert len(alerts) == 1 and "90" in alerts[0][1]
+        alerts, _ = menubar.detect_usage_alerts(state, self._acct(96.0))
+        assert len(alerts) == 1 and "95" in alerts[0][1]
+
+    def test_jump_past_several_fires_one_alert_for_the_highest(self):
+        alerts, _ = menubar.detect_usage_alerts({}, self._acct(96.0))
+        assert len(alerts) == 1
+        assert "95" in alerts[0][1] and "75" not in alerts[0][1]
+
+    def test_below_threshold_is_silent_and_rearms_after_reset(self):
+        assert menubar.detect_usage_alerts({}, self._acct(74.9))[0] == []
+        _, state = menubar.detect_usage_alerts({}, self._acct(96.0))
+        # Window resets -> usage drops -> state clears -> crossing alerts again.
+        _, state = menubar.detect_usage_alerts(state, self._acct(2.0))
+        alerts, _ = menubar.detect_usage_alerts(state, self._acct(76.0))
+        assert len(alerts) == 1 and "75" in alerts[0][1]
+
+    def test_backup_accounts_never_alert(self):
+        alerts, _ = menubar.detect_usage_alerts({}, self._acct(99.0, active=False))
+        assert alerts == []
+
+    def test_fable_is_an_independent_axis(self):
+        # Low 5h/7d but high Fable -> exactly one Fable-labelled alert.
+        alerts, state = menubar.detect_usage_alerts({}, self._acct(10.0, fable=91.0))
+        assert len(alerts) == 1
+        assert "fable" in alerts[0][1].lower() and "90" in alerts[0][1]
+        # Both axes can alert in the same round, one each.
+        alerts, _ = menubar.detect_usage_alerts(state, self._acct(96.0, fable=96.0))
+        assert len(alerts) == 2
+        assert sum("fable" in m.lower() for _, m in alerts) == 1
+
+    def test_unknown_usage_never_alerts(self):
+        for usage in (None, "rate limited", menubar.USAGE_TOKEN_EXPIRED, {}):
+            alerts, _ = menubar.detect_usage_alerts({}, [(4, "a@x.com", True, usage)])
+            assert alerts == []
+
+
+class TestReauthAlwaysAvailable:
+    """Every non-active account offers an in-place sign-in, whatever its state.
+
+    Gating the re-auth row on "login expired" left the user stuck when an account
+    showed anything else (rate limited / usage unavailable): the only way to renew a
+    login was to switch the active account. Sign-in must always be reachable.
+    """
+
+    def test_expired_account_gets_the_prominent_warning(self):
+        title = menubar.reauth_menu_title(menubar.USAGE_TOKEN_EXPIRED, False)
+        assert title is not None
+        assert "sign in" in title.lower() and "expired" in title.lower()
+
+    def test_healthy_account_still_offers_sign_in(self):
+        title = menubar.reauth_menu_title({"five_hour": {"pct": 10.0}}, False)
+        assert title is not None
+        assert "sign in" in title.lower()
+        assert "expired" not in title.lower()      # quiet, not an alarm
+
+    def test_rate_limited_account_offers_sign_in(self):
+        # The state that stranded the user: transient, but re-auth must be reachable.
+        title = menubar.reauth_menu_title("rate limited", False)
+        assert title is not None and "sign in" in title.lower()
+
+    def test_active_account_has_no_reauth_row(self):
+        # Claude Code owns the live credential; it prompts for itself.
+        assert menubar.reauth_menu_title({"five_hour": {"pct": 10.0}}, True) is None
+        assert menubar.reauth_menu_title(menubar.USAGE_TOKEN_EXPIRED, True) is None
