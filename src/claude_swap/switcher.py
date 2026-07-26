@@ -84,7 +84,15 @@ _USAGE_CACHE_TTL = 15  # seconds an ACTIVE account's usage entry stays fresh
 _BACKUP_USAGE_TTL = 60  # seconds a backup account's usage entry stays fresh
 _USAGE_ROUND_BUDGET = 20  # seconds of wall clock a sequential fetch round may take
 _FOREVER = float("inf")  # TTL that ignores cache age (for last-known-good reads)
-_DEAD_REPROBE = 900  # seconds a known-dead credential is skipped before re-probing
+# HARD app-wide ceiling on every backoff. This app exists to catch usage BEFORE a
+# window expires, so no backoff may ever hide an account for more than 5 minutes —
+# a longer stall contradicts the core purpose. Nothing here may exceed it.
+_MAX_BACKOFF = 300
+_DEAD_REPROBE = _MAX_BACKOFF  # a known-dead credential is skipped this long, then re-probed
+# Escalating per-account pause after a TOKEN-endpoint 429, capped at _MAX_BACKOFF.
+# Keeps a saturated bucket from being hammered every roll without ever exceeding
+# the 5-minute ceiling; reset to the first step on any successful fetch.
+_REFRESH_BACKOFF_STEPS = (60, 120, _MAX_BACKOFF)
 
 
 def _usage_cache_entry(value) -> dict:
@@ -239,6 +247,11 @@ class ClaudeAccountSwitcher:
         # only — never a global stall) so cswap stops hammering a revoked token every
         # ~60s. Cleared on recovery; bypassed by force=True ("Refresh now").
         self._usage_dead_until: dict[str, float] = {}
+        # Per-account TOKEN-endpoint (refresh) 429 backoff: when the account may next
+        # attempt a refresh, and which escalation step it is on. Per-account only —
+        # never a global stall — capped at _MAX_BACKOFF and cleared on any success.
+        self._refresh_backoff_until: dict[str, float] = {}
+        self._refresh_backoff_step: dict[str, int] = {}
         self._logger = setup_logging(self.backup_dir, debug=debug)
 
         # Optional swap notifier (cli.main wires this on macOS). Invoked from the
@@ -478,7 +491,8 @@ class ClaudeAccountSwitcher:
         else:
             self._invalidate_session_credentials(account_num, email)
 
-    def _read_account_credentials(self, account_num: str, email: str) -> str:
+    def _read_account_credentials(self, account_num: str, email: str) -> str | None:
+        # ``None`` = Keychain read FAILED (transient); ``""`` = genuinely missing.
         cache = self._backup_read_cache
         if cache is not None:
             key = ("creds", str(account_num), email)
@@ -642,8 +656,12 @@ class ClaudeAccountSwitcher:
         )
 
     def read_account_credentials(self, account_num: str, email: str) -> str:
-        """Public wrapper for session bootstrap. Empty string when missing."""
-        return self._read_account_credentials(account_num, email)
+        """Public wrapper for session bootstrap. Empty string when missing.
+
+        Normalizes an unreadable-Keychain ``None`` to ``""`` so this documented
+        ``str`` contract holds for external callers (session.py).
+        """
+        return self._read_account_credentials(account_num, email) or ""
 
     def write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -2145,6 +2163,12 @@ class ClaudeAccountSwitcher:
             account_info: tuple[int, str, str, str, bool, str]
         ) -> dict | str | None:
             num, email, _, _, is_active, creds = account_info
+            if creds is None:
+                # Could not READ the credential (locked/denied Keychain, or a
+                # fork-starved `security` spawn). Transient — NOT "no credentials":
+                # returning the sentinel here classified healthy accounts as DEAD.
+                # A bare None keeps the last-known usage via the merge's retain branch.
+                return None
             if looks_like_api_key(creds):
                 # Managed API-key account: no subscription quota to fetch.
                 return USAGE_API_KEY
@@ -2183,13 +2207,23 @@ class ClaudeAccountSwitcher:
             # window elapses — per-account only, so healthy accounts keep fetching.
             return now < self._usage_dead_until.get(str(info[0]), 0.0)
 
+        def is_refresh_backed_off(info) -> bool:
+            # This account's last refresh was 429'd by the token endpoint; pause it
+            # (per-account, <= _MAX_BACKOFF) so the bucket isn't hammered every roll.
+            return now < self._refresh_backoff_until.get(str(info[0]), 0.0)
+
         in_scope = (
             accounts_info if only is None
             else [info for info in accounts_info if str(info[0]) in only]
         )
         to_fetch = (
             list(in_scope) if force
-            else [i for i in in_scope if is_stale(i) and not is_dead_backed_off(i)]
+            else [
+                i for i in in_scope
+                if is_stale(i)
+                and not is_dead_backed_off(i)
+                and not is_refresh_backed_off(i)
+            ]
         )
         # Strictly stalest-first — the active account gets NO priority. With
         # stop-on-first-429 below, prioritizing the active account (stale
@@ -2221,21 +2255,21 @@ class ClaudeAccountSwitcher:
             if fetched and time.time() - round_start > _USAGE_ROUND_BUDGET:
                 break
             res = fetch(info)
-            token_rl = res == oauth.TOKEN_RATE_LIMITED
-            if token_rl:
-                # The TOKEN endpoint is rate-limited (shared per-IP). Surface as
-                # "login expired": a refresh-rate-limited backup cannot recover on its
-                # own until the shared limit resets, and a browser re-auth (a fresh
-                # token) sidesteps it entirely. Showing it as token-expired gives the
-                # menu its click-to-sign-in affordance, so the user can renew the login
-                # WITHOUT switching the active account — the only in-place recovery.
-                # The resulting DEAD health arms the per-account dead-reprobe backoff
-                # (900s, in the merge below), so cswap stops hammering the shared limit
-                # instead of retrying every round. (account_headroom -> None, so the
-                # account is still never auto-selected.)
-                res = USAGE_TOKEN_EXPIRED
+            if res == oauth.TOKEN_RATE_LIMITED:
+                # The TOKEN endpoint is rate-limited. This is TRANSIENT and must NEVER
+                # be reported as a logout: doing so caused the 2026-07-26 bug, where a
+                # bad User-Agent 429'd every refresh, each account died on its 8h
+                # access-token clock, and the menu told the user to re-auth — buying
+                # exactly 8 more hours, forever. Arm a per-account backoff (so a
+                # saturated bucket isn't hammered every roll) and render it as the
+                # ordinary transient rate-limited sentinel (account_headroom -> None,
+                # so it is still never auto-selected).
+                self._arm_refresh_backoff(str(info[0]), info[1], now)
+                res = USAGE_RATE_LIMITED
+            elif isinstance(res, dict):
+                self._clear_refresh_backoff(str(info[0]))
             fetched[str(info[0])] = res
-            if token_rl or res == USAGE_RATE_LIMITED:
+            if res == USAGE_RATE_LIMITED:
                 # Stop this round (further calls would only chain 429s). A usage-
                 # endpoint 429 (USAGE_RATE_LIMITED) surfaces as a per-account
                 # HEALTHY->RATE_LIMITED transition in the merge below (edge-only), not
@@ -2371,6 +2405,49 @@ class ClaudeAccountSwitcher:
         """
         self._usage_dead_until.pop(str(account_num), None)
         self._usage_health.pop(str(account_num), None)
+        self._clear_refresh_backoff(str(account_num))
+        self._drop_usage_cache_entry(str(account_num))
+
+    def _drop_usage_cache_entry(self, key: str) -> None:
+        """Forget an account's cached usage so the next round refetches it FIRST.
+
+        Fetch order is stalest-first by ``fetchedAt``, and an account that just
+        showed "login expired" carries a RECENT stamp — so after a re-auth it
+        looked fresh (inside the backup TTL) and sorted LAST, leaving the stale
+        sentinel on screen until the user hit "Refresh now". Dropping the entry
+        makes it maximally stale: fetched first, and never rendered from the old
+        value in the meantime.
+        """
+        path = self.backup_dir / "cache" / "usage.json"
+        raw = read_cache(path, _FOREVER, default=None)
+        if not isinstance(raw, dict) or key not in raw:
+            return
+        del raw[key]
+        write_cache(path, raw)
+
+    def _arm_refresh_backoff(self, key: str, email: str, now: float) -> None:
+        """Pause this account's refreshes after a TOKEN-endpoint 429.
+
+        Escalates through ``_REFRESH_BACKOFF_STEPS`` and holds at ``_MAX_BACKOFF``
+        (5 min — the app-wide ceiling). Logs only on the EDGE (the first 429 of a
+        streak) so a chronic rate-limit doesn't flood the log, and with wording that
+        can never be mistaken for a logout.
+        """
+        step = self._refresh_backoff_step.get(key, 0)
+        if step == 0:
+            self._logger.info(
+                "Account %s (%s) token refresh rate-limited (429) — transient, will "
+                "retry in %ds; NOT a logout (credentials are still valid)",
+                key, email, _REFRESH_BACKOFF_STEPS[0],
+            )
+        delay = _REFRESH_BACKOFF_STEPS[min(step, len(_REFRESH_BACKOFF_STEPS) - 1)]
+        self._refresh_backoff_step[key] = step + 1
+        self._refresh_backoff_until[key] = now + min(delay, _MAX_BACKOFF)
+
+    def _clear_refresh_backoff(self, key: str) -> None:
+        """Drop the refresh backoff after a success (or a credential replacement)."""
+        self._refresh_backoff_until.pop(key, None)
+        self._refresh_backoff_step.pop(key, None)
 
     def _usage_by_account(self) -> dict[str, dict | str | None]:
         """Map account number → usage entry (cache-first) for managed accounts."""

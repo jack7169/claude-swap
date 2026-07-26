@@ -657,8 +657,16 @@ class CredentialStore:
             )
         self._write_backup_enc(account_num, email, credentials)
 
-    def _read_account_credentials(self, account_num: str, email: str) -> str:
-        """Read account credentials from backup. ``""`` when missing.
+    def _read_account_credentials(self, account_num: str, email: str) -> str | None:
+        """Read account credentials from backup.
+
+        Returns the credential string, ``""`` when genuinely **missing**, or
+        ``None`` when the Keychain could not be **read** (locked/denied/timeout, or
+        a fork-starved ``security`` spawn: ``[Errno 35] Resource temporarily
+        unavailable``). Callers must not conflate the two: a failed read is a
+        transient blip, while ``""`` means there is no credential. Reporting a read
+        failure as "no credentials" made healthy accounts log as credentials DEAD
+        (seen live 41x on 2026-07-26).
 
         macOS is ``.enc``-wins (a fallback file beats a possibly-stale Keychain
         copy); only an absent or corrupt ``.enc`` falls through to the Keychain.
@@ -683,7 +691,10 @@ class CredentialStore:
             try:
                 return self._kc_read_backup(account_num, email)
             except macos_keychain.KEYCHAIN_ERRORS as e:
+                # Transient: could NOT read. Distinct from "" (genuinely absent), so
+                # callers retain last-known state instead of declaring the account dead.
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
+                return None
         return ""
 
     def _write_account_credentials(
