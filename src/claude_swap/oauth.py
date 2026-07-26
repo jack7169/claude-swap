@@ -47,6 +47,17 @@ REFRESH_RATE_LIMITED = "rate_limited"
 CLAUDE_CODE_VERSION = "2.1.204"
 CLAUDE_CODE_UA = f"claude-code/{CLAUDE_CODE_VERSION}"
 
+# The TOKEN endpoint (OAUTH_TOKEN_URL) buckets the OPPOSITE way, so it gets its own
+# UA. ``claude-code/*`` is what every real Claude Code install sends, so that bucket
+# is saturated there and refreshes get a hard 429; ``claude-swap/1.0`` has its own
+# quiet bucket. Measured live with the SAME refresh token seconds apart:
+#   claude-code/2.1.204 -> HTTP 429 rate_limit_error
+#   claude-swap/1.0     -> HTTP 200 (expires_in 28800)
+# Sending CLAUDE_CODE_UA here (2026-07-22 .. 2026-07-26) blocked EVERY refresh, so
+# each account died on its 8h access-token clock and looked "logged out" until the
+# user re-authed — every 8 hours. These two UAs must stay DIFFERENT; do not unify.
+TOKEN_ENDPOINT_UA = "claude-swap/1.0"
+
 _logger = logging.getLogger("claude-swap")
 
 
@@ -110,7 +121,7 @@ def _refresh_with_reason(credentials: str) -> tuple[str | None, str]:
             data=body,
             headers={
                 "Content-Type": "application/json",
-                "User-Agent": CLAUDE_CODE_UA,
+                "User-Agent": TOKEN_ENDPOINT_UA,
             },
             method="POST",
         )

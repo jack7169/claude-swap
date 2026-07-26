@@ -990,17 +990,32 @@ def test_fetch_usage_returns_rate_limited_on_429_after_refresh():
 
 
 class TestUserAgent:
-    """The usage endpoint buckets rate limits on User-Agent, per access token.
+    """The two endpoints bucket rate limits on User-Agent — in OPPOSITE directions.
 
-    ``claude-code/<version>`` is the safe bucket (fine at ~180s intervals);
-    anything else hits an aggressively-throttled bucket -> persistent 429s.
-    Confirmed live: all accounts returned HTTP 200 with claude-code/2.1.204
-    while the fleet was 429-storming under claude-swap/1.0. So every
-    authenticated request cswap makes must send the claude-code UA.
+    USAGE endpoint (api.anthropic.com): ``claude-code/<version>`` is the safe
+    bucket; anything else is aggressively throttled. Measured live: every account
+    returned HTTP 200 under claude-code/2.1.204 while the fleet 429-stormed under
+    claude-swap/1.0.
+
+    TOKEN endpoint (platform.claude.com/v1/oauth/token): the OPPOSITE.
+    ``claude-code/*`` is the UA every real Claude Code install sends, so that
+    bucket is saturated -> persistent 429s; ``claude-swap/1.0`` has its own quiet
+    bucket. Measured live with the SAME refresh token seconds apart:
+    claude-code/2.1.204 -> HTTP 429, claude-swap/1.0 -> HTTP 200 (expires_in
+    28800). Sending claude-code here blocked every refresh, so each account died
+    on its 8h access-token clock and looked "logged out" (the 2026-07-26 bug).
+
+    These two UAs MUST stay different. Do not "unify" them.
     """
 
     def test_ua_constant_is_claude_code_prefixed(self):
         assert oauth.CLAUDE_CODE_UA.startswith("claude-code/")
+
+    def test_token_and_usage_uas_are_deliberately_different(self):
+        # Tripwire: a refactor that collapses these two into one breaks either the
+        # usage fetches (429) or every token refresh (429 -> accounts "log out").
+        assert oauth.TOKEN_ENDPOINT_UA != oauth.CLAUDE_CODE_UA
+        assert not oauth.TOKEN_ENDPOINT_UA.startswith("claude-code/")
 
     def test_usage_request_sends_claude_code_user_agent(self):
         captured = {}
@@ -1018,7 +1033,9 @@ class TestUserAgent:
 
         assert captured["req"].get_header("User-agent") == oauth.CLAUDE_CODE_UA
 
-    def test_refresh_request_sends_claude_code_user_agent(self):
+    def test_refresh_request_sends_token_endpoint_user_agent(self):
+        # The refresh POST hits the TOKEN endpoint, where claude-code/* is the
+        # saturated bucket. It must send TOKEN_ENDPOINT_UA, never CLAUDE_CODE_UA.
         captured = {}
 
         def fake_urlopen(req, timeout=0):
@@ -1037,7 +1054,8 @@ class TestUserAgent:
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=fake_urlopen):
             oauth.refresh_oauth_credentials(creds)
 
-        assert captured["req"].get_header("User-agent") == oauth.CLAUDE_CODE_UA
+        assert captured["req"].get_header("User-agent") == oauth.TOKEN_ENDPOINT_UA
+        assert captured["req"].get_header("User-agent") != oauth.CLAUDE_CODE_UA
 
     def test_warm_request_sends_claude_code_user_agent(self):
         captured = {}

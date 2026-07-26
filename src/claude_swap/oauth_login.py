@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode
 
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.oauth import OAUTH_CLIENT_ID, OAUTH_TOKEN_URL
+from claude_swap.oauth import OAUTH_CLIENT_ID, OAUTH_TOKEN_URL, TOKEN_ENDPOINT_UA
 
 AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
 LOGIN_SCOPES = "user:profile user:inference user:sessions:claude_code user:mcp_servers"
@@ -127,7 +127,9 @@ def build_token_exchange(
         "code_verifier": verifier,
         "state": state,
     }
-    headers = {"Content-Type": "application/json", "User-Agent": "claude-swap/1.0"}
+    # Same TOKEN endpoint as the refresh path — share its UA constant so the two
+    # callers can never drift (claude-code/* is 429-saturated there; see oauth.py).
+    headers = {"Content-Type": "application/json", "User-Agent": TOKEN_ENDPOINT_UA}
     return OAUTH_TOKEN_URL, body, headers
 
 
