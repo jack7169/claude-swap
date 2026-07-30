@@ -33,7 +33,6 @@ from claude_swap.process_detection import get_running_instances
 ICON = "⇄"
 REFRESH_CHOICES: tuple[int, ...] = (15, 30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
-AUTO_COOLDOWN_CHOICES: tuple[int, ...] = (300, 600, 1800)
 WARM_COOLDOWN = 600  # seconds an account is skipped after a successful warm/send
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 15, 30, 60, 180, 300)  # 0 == with display refresh
 AUTO_STRATEGY_CHOICES: tuple[str, ...] = ("reactive", "consume-first")
@@ -52,7 +51,6 @@ class MenuBarSettings:
     refresh_interval: int = 60
     auto_switch_enabled: bool = False
     auto_switch_threshold: int = 95
-    auto_switch_cooldown: int = 600
     auto_switch_interval: int = 0  # 0 == evaluate with each display refresh
     auto_switch_strategy: str = "reactive"  # one of AUTO_STRATEGY_CHOICES
     auto_timer_start_enabled: bool = False
@@ -91,14 +89,13 @@ class MenuBarSettings:
 
 @dataclass
 class MenuBarState:
-    """Cooldown/notification timestamps for the auto-switcher, persisted as JSON.
+    """Notification/blocked bookkeeping for the auto-switcher, persisted as JSON.
 
     Separate from MenuBarSettings: settings are user choices, state is runtime
-    bookkeeping. Persisting across restarts means a relaunch respects the
-    cooldown instead of swapping immediately.
+    bookkeeping that survives a relaunch. There is no switch cooldown — the
+    auto-switch logic runs on every check cycle — so no switch timestamp is kept.
     """
 
-    last_switch_at: float = 0.0
     last_noswap_notify_at: float = 0.0
     blocked: list[str] = field(default_factory=list)  # 5h/limit-blocked account nums
 
@@ -736,16 +733,19 @@ def plan_auto_switch(
     settings: "MenuBarSettings",
     now: float,
 ) -> tuple[str, int | None]:
-    """Apply cooldown + notification rate-limiting to a decision.
+    """Apply notification rate-limiting to a decision.
 
-    Returns ``("switch", num)``, ``("cooldown", None)``,
-    ``("notify_noswap", None)``, or ``("noop", None)``. Total — never raises.
+    Returns ``("switch", num)``, ``("notify_noswap", None)``, or
+    ``("noop", None)``. Total — never raises.
+
+    A switch decision is ALWAYS acted on: there is deliberately no cooldown, so
+    the auto-switch logic is live on every check cycle (an account crossing its
+    threshold is swapped away from immediately, not up to N minutes later). Only
+    the "nothing to switch to" NOTIFICATION is rate-limited, so it can't spam.
     """
     kind, num = decision
     if kind == "switch":
-        if now - state.last_switch_at >= settings.auto_switch_cooldown:
-            return ("switch", num)
-        return ("cooldown", None)
+        return ("switch", num)
     if kind == "no_candidate":
         if now - state.last_noswap_notify_at >= NOSWAP_NOTIFY_EVERY:
             return ("notify_noswap", None)
@@ -995,7 +995,6 @@ def _snapshot_signature(snapshot: dict, settings: "MenuBarSettings") -> tuple:
         settings.auto_switch_enabled,
         settings.auto_switch_strategy,
         settings.auto_switch_threshold,
-        settings.auto_switch_cooldown,
         settings.auto_switch_interval,
         settings.refresh_interval,
         settings.auto_timer_start_enabled,
@@ -2272,12 +2271,9 @@ def run(switcher) -> int:
             decision = evaluate_strategy(strategy, accounts, threshold, frozenset(self.state.blocked))
             action, num = plan_auto_switch(decision, self.state, self.settings, now)
             if action == "switch":
-                # Record the switch timestamp up front so the cooldown holds even
-                # if the (offloaded) switch is slow; the keychain + FileLock work
-                # runs off the Cocoa main thread so the UI never freezes (3.2).
-                self.state.last_switch_at = now
-                self.state.save(state_path)
-
+                # No cooldown to stamp — the auto-switch logic is live on every
+                # check cycle. The keychain + FileLock work is still offloaded off
+                # the Cocoa main thread so the UI never freezes (3.2).
                 def do_switch(num=num):
                     try:
                         self.switcher.switch_to(str(num))
@@ -2546,14 +2542,6 @@ def run(switcher) -> int:
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
 
-            cooldown_menu = rumps.MenuItem("Auto-switch cooldown")
-            cd_labels = {300: "5 minutes", 600: "10 minutes", 1800: "30 minutes"}
-            for secs in AUTO_COOLDOWN_CHOICES:
-                ch = rumps.MenuItem(cd_labels[secs], callback=self._make_cooldown(secs))
-                ch.state = 1 if self.settings.auto_switch_cooldown == secs else 0
-                cooldown_menu.add(ch)
-            menu.add(cooldown_menu)
-
             check_menu = rumps.MenuItem("Auto-switch check")
             ck_labels = {0: "With display refresh", 15: "Every 15 seconds",
                          30: "Every 30 seconds", 60: "Every 1 minute",
@@ -2571,7 +2559,7 @@ def run(switcher) -> int:
             self.settings.save(settings_path)
             self.rebuild_menu()
 
-        def _offload_switch(self, fn, *, record_switch=False):
+        def _offload_switch(self, fn):
             """Offload a blocking switcher mutation (switch/add/remove) (3.2).
 
             The keychain-subprocess + FileLock work runs on a daemon worker so
@@ -2579,7 +2567,7 @@ def run(switcher) -> int:
             surfaced via notify.notify — rumps.alert can't be shown from a
             worker thread. On success a full refresh is queued (the swap
             notification itself is posted by the unified notifier wired in
-            cli.main). ``record_switch`` stamps the cooldown timestamp.
+            cli.main).
             """
             def work():
                 try:
@@ -2590,9 +2578,6 @@ def run(switcher) -> int:
                     # thread and isn't safe here.
                     notify.notify(APP_TITLE, str(e))
                     return
-                if record_switch:
-                    self.state.last_switch_at = time.time()
-                    self.state.save(state_path)
                 self.refresh_async(full=True)
             self._offload(work)
 
@@ -2603,14 +2588,14 @@ def run(switcher) -> int:
         def _make_switch_to(self, num):
             def cb(_sender):
                 self._offload_switch(
-                    lambda: self.switcher.switch_to(str(num)), record_switch=True
+                    lambda: self.switcher.switch_to(str(num))
                 )
             return cb
 
         def _switch(self, strategy):
             def cb(_sender):
                 self._offload_switch(
-                    lambda: self.switcher.switch(strategy=strategy), record_switch=True
+                    lambda: self.switcher.switch(strategy=strategy)
                 )
             return cb
 
@@ -2825,12 +2810,6 @@ def run(switcher) -> int:
         def _make_threshold(self, pct):
             def cb(_sender):
                 self.settings.auto_switch_threshold = pct
-                self._save_and_rebuild()
-            return cb
-
-        def _make_cooldown(self, secs):
-            def cb(_sender):
-                self.settings.auto_switch_cooldown = secs
                 self._save_and_rebuild()
             return cb
 

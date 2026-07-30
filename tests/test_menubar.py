@@ -218,7 +218,6 @@ def test_settings_auto_switch_defaults(tmp_path: Path):
     s = menubar.MenuBarSettings.load(tmp_path / "missing.json")
     assert s.auto_switch_enabled is False
     assert s.auto_switch_threshold == 95
-    assert s.auto_switch_cooldown == 600
     assert s.auto_switch_interval == 0
 
 
@@ -227,7 +226,6 @@ def test_settings_auto_switch_round_trip(tmp_path: Path):
     orig = menubar.MenuBarSettings(
         auto_switch_enabled=True,
         auto_switch_threshold=80,
-        auto_switch_cooldown=300,
         auto_switch_interval=180,
     )
     orig.save(path)
@@ -248,13 +246,13 @@ def test_settings_auto_timer_start_round_trip(tmp_path: Path):
 
 def test_state_defaults(tmp_path: Path):
     st = menubar.MenuBarState.load(tmp_path / "missing.json")
-    assert st.last_switch_at == 0.0
     assert st.last_noswap_notify_at == 0.0
+    assert st.blocked == []
 
 
 def test_state_round_trip(tmp_path: Path):
     path = tmp_path / "state.json"
-    st = menubar.MenuBarState(last_switch_at=1750000000.5, last_noswap_notify_at=1750000123.0)
+    st = menubar.MenuBarState(last_noswap_notify_at=1750000123.0)
     st.save(path)
     assert menubar.MenuBarState.load(path) == st
 
@@ -267,11 +265,11 @@ def test_state_corrupt_falls_back(tmp_path: Path):
 
 def test_state_accepts_int_timestamps(tmp_path: Path):
     path = tmp_path / "state.json"
-    path.write_text(json.dumps({"last_switch_at": 1750000000, "last_noswap_notify_at": 0}),
+    path.write_text(json.dumps({"last_noswap_notify_at": 1750000000}),
                     encoding="utf-8")
     st = menubar.MenuBarState.load(path)
-    assert st.last_switch_at == 1750000000.0
-    assert isinstance(st.last_switch_at, float)
+    assert st.last_noswap_notify_at == 1750000000.0
+    assert isinstance(st.last_noswap_notify_at, float)
 
 
 def _acct(num, pct5, pct7, active=False):
@@ -337,16 +335,27 @@ def test_decide_no_active_account():
     assert menubar.decide_auto_switch(accts, 95) == ("none", None)
 
 
-def test_plan_switch_outside_cooldown():
-    st = menubar.MenuBarState(last_switch_at=0.0)
-    s = menubar.MenuBarSettings(auto_switch_cooldown=600)
-    assert menubar.plan_auto_switch(("switch", 2), st, s, 1000.0) == ("switch", 2)
+def test_plan_switch_acts_on_every_cycle_no_cooldown():
+    # The auto-switch cooldown was removed: whenever a check cycle decides to
+    # switch, it switches — including back-to-back cycles. Nothing rate-gates it.
+    st, s = menubar.MenuBarState(), menubar.MenuBarSettings()
+    for now in (0.0, 1.0, 2.0, 3.0):
+        assert menubar.plan_auto_switch(("switch", 2), st, s, now) == ("switch", 2)
 
 
-def test_plan_switch_within_cooldown():
-    st = menubar.MenuBarState(last_switch_at=900.0)
-    s = menubar.MenuBarSettings(auto_switch_cooldown=600)
-    assert menubar.plan_auto_switch(("switch", 2), st, s, 1000.0) == ("cooldown", None)
+def test_cooldown_knobs_are_gone():
+    # No phantom setting/menu that no longer does anything.
+    assert not hasattr(menubar.MenuBarSettings(), "auto_switch_cooldown")
+    assert not hasattr(menubar, "AUTO_COOLDOWN_CHOICES")
+    assert not hasattr(menubar.MenuBarState(), "last_switch_at")
+
+
+def test_no_candidate_notification_is_still_rate_limited():
+    # Only the SWITCH gate was removed; the "nothing to switch to" notification
+    # keeps its rate limit so it can't spam every cycle.
+    st = menubar.MenuBarState(last_noswap_notify_at=4000.0)
+    s = menubar.MenuBarSettings()
+    assert menubar.plan_auto_switch(("no_candidate", None), st, s, 4001.0) == ("noop", None)
 
 
 def test_plan_no_candidate_past_rate_limit():
@@ -407,11 +416,11 @@ def test_settings_strategy_round_trip(tmp_path: Path):
 
 def test_state_blocked_round_trip(tmp_path: Path):
     path = tmp_path / "state.json"
-    st = menubar.MenuBarState(last_switch_at=1.0, blocked=["2", "3"])
+    st = menubar.MenuBarState(last_noswap_notify_at=1.0, blocked=["2", "3"])
     st.save(path)
     loaded = menubar.MenuBarState.load(path)
     assert loaded.blocked == ["2", "3"]
-    assert loaded.last_switch_at == 1.0
+    assert loaded.last_noswap_notify_at == 1.0
 
 
 def test_state_blocked_defaults_when_malformed(tmp_path: Path):

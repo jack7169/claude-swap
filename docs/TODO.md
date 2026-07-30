@@ -4,10 +4,12 @@
 
 Captured 2026-06-29. Feature request, not yet implemented.
 
-### 1. Add a 30-second auto-switch cooldown option
-- `AUTO_COOLDOWN_CHOICES` ([menubar.py:31](../src/claude_swap/menubar.py#L31)) is currently `(300, 600, 1800)` → add `30`.
-- `cd_labels` in `_settings_menu` ([menubar.py:911](../src/claude_swap/menubar.py#L911)) → add `30: "30 seconds"`.
-- Note: 30s is very aggressive vs. the current 5-min floor. Intended for fast testing / power users; the cooldown gate lives in the decision logic around [menubar.py:486-495](../src/claude_swap/menubar.py#L486-L495).
+### 1. ~~Add a 30-second auto-switch cooldown option~~ — DONE (superseded 2026-07-26)
+The auto-switch cooldown was **removed entirely** rather than shortened: the switch
+decision now acts on every check cycle. `AUTO_COOLDOWN_CHOICES`,
+`MenuBarSettings.auto_switch_cooldown`, `MenuBarState.last_switch_at` and the
+"Auto-switch cooldown" settings submenu are all gone. Cadence is controlled solely by
+the auto-switch check interval (item 2). Do not reintroduce a switch-rate gate.
 
 ### 2. Add a 15-second auto-switch check-interval option
 - `AUTO_CHECK_CHOICES` ([menubar.py:32](../src/claude_swap/menubar.py#L32)) is currently `(0, 60, 180, 300)` → add `15`.
@@ -21,7 +23,6 @@ Add a non-interactive summary section to the top-level menu displaying the activ
 - enabled on/off (`auto_switch_enabled`)
 - type / strategy (`auto_switch_strategy`)
 - threshold / "timeout" (`auto_switch_threshold`)
-- cooldown (`auto_switch_cooldown`)
 - check interval (`auto_switch_interval`)
 
 Keep it consistent with the existing per-account usage rows (disabled `callback=None` items, indented).
