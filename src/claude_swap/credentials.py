@@ -53,6 +53,20 @@ CLAUDE_CODE_KEYCHAIN_SERVICE = "Claude Code-credentials"
 CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE = "Claude Code"
 
 
+def _oauth_expires_at(credentials: str) -> float | None:
+    """The ``expiresAt`` inside an OAuth credential blob, or ``None`` if unparseable.
+
+    Used to pick the FRESHEST of two copies of the active credential: each token
+    refresh stamps ``now + 8h``, so a later ``expiresAt`` is a newer rotation.
+    """
+    try:
+        oauth = json.loads(credentials).get("claudeAiOauth")
+        exp = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+        return float(exp) if isinstance(exp, (int, float)) else None
+    except (ValueError, AttributeError):
+        return None
+
+
 def looks_like_api_key(credentials: str | None) -> bool:
     """Whether a stored active credential is a raw managed API key vs OAuth JSON.
 
@@ -190,9 +204,10 @@ class CredentialStore:
             Credential string if found, "" if not found, None on a file read error.
         """
         # 1. OAuth Keychain (macOS, when usable).
+        kc_val = None
         if self._use_keychain():
             try:
-                val = self._kc_call(
+                kc_val = self._kc_call(
                     macos_keychain.get_password,
                     CLAUDE_CODE_KEYCHAIN_SERVICE,
                     macos_keychain.keychain_account_name(),
@@ -203,20 +218,37 @@ class CredentialStore:
                 # mode; fall through to the plaintext file Claude Code uses too.
                 # (A programming error is NOT caught here — it propagates.)
                 self._host._logger.warning(f"Keychain read failed, trying file: {e}")
-                val = None
-            if val:
-                return val
+                kc_val = None
 
-        # 2. OAuth plaintext file (Claude Code's own fallback; every platform).
+        # 2. OAuth plaintext file (Claude Code writes this in fallback paths on
+        # every platform). FRESHEST WINS when both stores parse: Claude Code's
+        # latest rotation may land in either store, and returning the older copy
+        # here would make a switch-away backup capture a stale token whose refresh
+        # token was already rotated away. Later expiresAt == newer rotation (each
+        # refresh stamps now+8h).
+        file_val = None
         cred_file = get_credentials_path()
         if cred_file.exists():
             try:
                 text = cred_file.read_text(encoding="utf-8")
             except Exception as e:
                 self._host._logger.error(f"Failed to read credentials file: {e}")
-                return None
+                if not kc_val:
+                    return None
+                text = ""
             if text.strip():
-                return text
+                file_val = text
+
+        if kc_val and file_val:
+            kc_exp = _oauth_expires_at(kc_val)
+            file_exp = _oauth_expires_at(file_val)
+            if kc_exp is not None and file_exp is not None and file_exp > kc_exp:
+                return file_val
+            return kc_val
+        if kc_val:
+            return kc_val
+        if file_val:
+            return file_val
 
         # 3. Managed API key (Keychain "Claude Code" on macOS, then primaryApiKey).
         key = self._read_managed_key()
@@ -502,16 +534,20 @@ class CredentialStore:
             raise CredentialWriteError(f"Failed to remove credentials file: {e}")
 
     def _write_oauth_credentials(self, credentials: str) -> None:
-        """Write Claude Code's active OAuth credentials.
+        """Write Claude Code's active OAuth credentials — to EVERY store present.
 
-        macOS writes the Keychain when usable (recording backend ``"keychain"``)
-        and **leaves the plaintext file untouched**, mirroring Claude Code, which
-        preserves the file alongside a populated Keychain for container ``~/.claude``
-        sharing (#1414): cswap can't prove an existing file is its own stale fallback
-        vs. a credential another consumer relies on. If the Keychain write fails — or
-        the Keychain is already known unusable — it writes the plaintext file and
-        best-effort clears any stale Keychain entry (#30337), recording backend
-        ``"file"``. Linux/WSL/Windows always write the file.
+        macOS writes the Keychain when usable (recording backend ``"keychain"``),
+        and if a plaintext ``.credentials.json`` ALSO exists it is overwritten with
+        the same credential (best-effort). Claude Code writes that file in fallback
+        paths and may read it back; a switch means "change the login for every
+        consumer", so no store may keep serving the old account. (This replaces the
+        old leave-the-file-untouched behavior, which left running sessions a stale
+        login to read — the "switch doesn't reach running sessions" bug. A file is
+        never CREATED here — keychain-only installs stay plaintext-free.) If the
+        Keychain write fails — or the Keychain is already known unusable — it
+        writes the plaintext file and best-effort clears any stale Keychain entry
+        (#30337), recording backend ``"file"``. Linux/WSL/Windows always write the
+        file.
 
         Raises:
             CredentialWriteError: If writing credentials fails.
@@ -530,6 +566,17 @@ class CredentialStore:
                 self._host._logger.warning(f"Keychain write failed, falling back to file: {e}")
             else:
                 self._last_active_credentials_backend = "keychain"
+                # Mirror into an EXISTING plaintext file so it can't serve the old
+                # login. Best-effort: the keychain (primary) already succeeded, and
+                # a stale file loses freshest-wins reads anyway.
+                cred_file = get_credentials_path()
+                if cred_file.exists():
+                    try:
+                        self._write_active_credentials_file(credentials)
+                    except Exception as e:
+                        self._host._logger.warning(
+                            f"credentials file mirror failed (switch still applied): {e}"
+                        )
                 return
 
         # File mode: non-macOS, macOS Keychain known unusable, or a Keychain write

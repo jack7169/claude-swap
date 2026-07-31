@@ -3660,17 +3660,20 @@ class TestMacosKeychainFallback:
         assert get_credentials_path().read_text() == '{"fresh":1}'
         assert (CLAUDE_CODE_KEYCHAIN_SERVICE, acct) not in block_real_keychain.data
 
-    def test_keychain_write_leaves_existing_file_untouched(
+    def test_keychain_write_mirrors_into_existing_file(
         self, temp_home: Path, block_real_keychain
     ):
-        # #1414: cswap must not delete a plaintext file it can't prove is its own.
+        # A switch must update EVERY store Claude Code reads. Leaving an existing
+        # plaintext file with the OLD login let running sessions keep serving the
+        # pre-switch account (the "switch doesn't reach running sessions" bug).
+        # The file is never DELETED (#1414) — it is brought up to date.
         s = self._macos_switcher()
         cred = get_credentials_path()
         cred.parent.mkdir(parents=True, exist_ok=True)
-        cred.write_text("PRESERVE-ME")
+        cred.write_text('{"stale":1}')
         s._write_credentials('{"fresh":1}')  # keychain usable → writes keychain
         assert s._last_active_credentials_backend == "keychain"
-        assert cred.read_text() == "PRESERVE-ME"
+        assert cred.read_text() == '{"fresh":1}'
 
     # -- backup store: .enc-wins -----------------------------------------
 

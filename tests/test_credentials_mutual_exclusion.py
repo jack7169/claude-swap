@@ -238,3 +238,108 @@ class TestClearBeforeWriteOrdering:
 
         # The OAuth (loser) axis is cleared before the managed key is committed.
         assert calls.index("clear_oauth") < calls.index("write_key_config")
+
+
+# ---------------------------------------------------------------------------
+# (4) Active-store coherence: a switch must update EVERY store Claude Code
+# reads. Leaving .credentials.json stale made running sessions (which Claude
+# Code serves from whichever store it consults) keep the OLD account after a
+# switch, and let switch-away backups capture a stale rotation.
+# ---------------------------------------------------------------------------
+
+
+def _oauth_blob(token: str, expires_at: int) -> str:
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": token, "refreshToken": f"rt-{token}",
+        "expiresAt": expires_at,
+    }})
+
+
+class TestActiveDualWrite:
+    def test_switch_overwrites_existing_stale_credentials_file(self, temp_home):
+        s = _macos_switcher()
+        cred_file = get_credentials_path()
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        cred_file.write_text(_oauth_blob("sk-OLD", 1_000), encoding="utf-8")
+
+        new = _oauth_blob("sk-NEW", 9_999_999_999_000)
+        s._store._write_oauth_credentials(new)
+
+        # Keychain got the new credential AND the pre-existing file was updated
+        # in place — no store may keep serving the old login after a switch.
+        from claude_swap import macos_keychain
+        from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
+        assert macos_keychain.get_password(
+            CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
+        ) == new
+        assert cred_file.read_text(encoding="utf-8") == new
+
+    def test_no_plaintext_file_created_when_absent(self, temp_home):
+        # Keychain-only installs must not gain a plaintext copy from a switch.
+        s = _macos_switcher()
+        cred_file = get_credentials_path()
+        assert not cred_file.exists()
+
+        s._store._write_oauth_credentials(_oauth_blob("sk-NEW", 9_999_999_999_000))
+
+        assert not cred_file.exists()
+
+    def test_file_write_failure_does_not_abort_the_switch(self, temp_home, monkeypatch):
+        # Keychain (primary) succeeded; a file-mirror hiccup must not fail the
+        # switch — the file simply stays stale and loses freshest-wins reads.
+        s = _macos_switcher()
+        cred_file = get_credentials_path()
+        cred_file.parent.mkdir(parents=True, exist_ok=True)
+        cred_file.write_text(_oauth_blob("sk-OLD", 1_000), encoding="utf-8")
+        monkeypatch.setattr(
+            s._store, "_write_active_credentials_file",
+            lambda *a: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        s._store._write_oauth_credentials(_oauth_blob("sk-NEW", 9_999_999_999_000))
+
+
+class TestFreshestWinsActiveRead:
+    def _seed(self, s, keychain_blob=None, file_blob=None):
+        from claude_swap import macos_keychain
+        from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE
+        if keychain_blob is not None:
+            macos_keychain.set_password(
+                CLAUDE_CODE_KEYCHAIN_SERVICE,
+                macos_keychain.keychain_account_name(), keychain_blob)
+        if file_blob is not None:
+            cred_file = get_credentials_path()
+            cred_file.parent.mkdir(parents=True, exist_ok=True)
+            cred_file.write_text(file_blob, encoding="utf-8")
+
+    def test_file_newer_than_keychain_wins(self, temp_home):
+        # Claude Code's latest rotation can land in the file; a switch-away
+        # backup must capture THAT, not the older keychain copy.
+        s = _macos_switcher()
+        older = _oauth_blob("sk-KC", 5_000_000_000_000)
+        newer = _oauth_blob("sk-FILE", 6_000_000_000_000)
+        self._seed(s, keychain_blob=older, file_blob=newer)
+
+        assert s._store._read_credentials() == newer
+
+    def test_keychain_newer_than_file_wins(self, temp_home):
+        s = _macos_switcher()
+        newer = _oauth_blob("sk-KC", 6_000_000_000_000)
+        older = _oauth_blob("sk-FILE", 5_000_000_000_000)
+        self._seed(s, keychain_blob=newer, file_blob=older)
+
+        assert s._store._read_credentials() == newer
+
+    def test_unparseable_file_falls_back_to_keychain(self, temp_home):
+        s = _macos_switcher()
+        kc = _oauth_blob("sk-KC", 5_000_000_000_000)
+        self._seed(s, keychain_blob=kc, file_blob="{not json")
+
+        assert s._store._read_credentials() == kc
+
+    def test_keychain_only_still_reads(self, temp_home):
+        s = _macos_switcher()
+        kc = _oauth_blob("sk-KC", 5_000_000_000_000)
+        self._seed(s, keychain_blob=kc)
+
+        assert s._store._read_credentials() == kc
