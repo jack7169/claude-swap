@@ -1029,6 +1029,9 @@ class TestActiveAccountRefresh:
         switcher = self._switcher(sample_sequence_data)
         backup_creds = json.dumps({"claudeAiOauth": {"accessToken": "sk-backup"}})
 
+        # Already a suspect (one prior expired round) — this round CONFIRMS it,
+        # so the merge renders the sentinel rather than a first-strike transient.
+        switcher._usage_auth_suspect["1"] = 0.0
         with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
              patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
              patch.object(switcher, "_active_cc_running", return_value=True), \

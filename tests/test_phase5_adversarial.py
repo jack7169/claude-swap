@@ -66,6 +66,8 @@ class TestCollectUsageMergeEdges:
 
         monkeypatch.setattr(_oauth, "fetch_usage_for_account", fake)
 
+        # Already a suspect (one prior auth-failure) — this round CONFIRMS death.
+        s._usage_auth_suspect["2"] = 0.0
         out = s._collect_usage(self._two_oauth(), only={"1", "2"})
         assert out[1] == USAGE_TOKEN_EXPIRED
         assert _oauth.account_headroom(out[1]) is None

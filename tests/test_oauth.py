@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import json
+import logging
 import urllib.error
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -587,7 +589,8 @@ class TestFetchUsageForAccount:
         def mock_urlopen(req, timeout=0):
             if "oauth/token" in req.full_url:
                 raise urllib.error.HTTPError(
-                    req.full_url, 400, "Bad Request", hdrs=None, fp=None,
+                    req.full_url, 400, "Bad Request", hdrs=None,
+                    fp=io.BytesIO(b'{"error": "invalid_grant"}'),
                 )
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
@@ -610,7 +613,8 @@ class TestFetchUsageForAccount:
             nonlocal usage_calls
             if "oauth/token" in req.full_url:
                 raise urllib.error.HTTPError(
-                    req.full_url, 401, "Unauthorized", hdrs=None, fp=None,
+                    req.full_url, 401, "Unauthorized", hdrs=None,
+                    fp=io.BytesIO(b'{"error": "invalid_grant"}'),
                 )
             if "oauth/usage" in req.full_url:
                 usage_calls += 1
@@ -659,7 +663,8 @@ class TestFetchUsageForAccount:
                 )
             if "oauth/token" in req.full_url:
                 raise urllib.error.HTTPError(
-                    req.full_url, 400, "Bad Request", hdrs=None, fp=None,
+                    req.full_url, 400, "Bad Request", hdrs=None,
+                    fp=io.BytesIO(b'{"error": "invalid_grant"}'),
                 )
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
@@ -865,9 +870,23 @@ def _http_error(code):
 class TestRefreshWithReason:
     """_refresh_with_reason splits the failure into auth (dead token) vs transient.
 
-    Only a 400/401 from the token endpoint (invalid_grant) is 'auth' (definitively
-    dead); every other failure is 'transient' so good usage is never wiped on a blip.
+    Only a 400/401 whose body carries the OAuth ``invalid_grant`` error is 'auth'
+    (definitively dead). The endpoint serves OTHER 400 classes too (measured
+    2026-08-15: a non-dead 400 uses the Anthropic error envelope with
+    ``invalid_request_error``), so a status code alone must stay 'transient' —
+    treating any 400/401 as death produced false "login expired" states that
+    self-healed on the next reprobe (accounts 11's three false deaths).
     """
+
+    # Both bodies below are verbatim from live probes of the token endpoint.
+    _INVALID_GRANT_BODY = (
+        b'{"error": "invalid_grant", '
+        b'"error_description": "Refresh token not found or invalid"}'
+    )
+    _INVALID_REQUEST_BODY = (
+        b'{"type":"error","error":{"type":"invalid_request_error",'
+        b'"message":"Invalid request format"},"request_id":"req_x"}'
+    )
 
     @staticmethod
     def _creds():
@@ -894,17 +913,41 @@ class TestRefreshWithReason:
         assert reason == "ok"
         assert json.loads(creds)["claudeAiOauth"]["accessToken"] == "new"
 
-    def test_http_400_is_auth(self):
-        creds, reason = self._run(
-            lambda req, timeout=0: (_ for _ in ()).throw(
-                urllib.error.HTTPError(req.full_url, 400, "Bad", None, None)))
+    def _http_error(self, code, body: bytes | None):
+        fp = io.BytesIO(body) if body is not None else None
+        return lambda req, timeout=0: (_ for _ in ()).throw(
+            urllib.error.HTTPError(req.full_url, code, "err", None, fp))
+
+    def test_http_400_invalid_grant_is_auth(self):
+        creds, reason = self._run(self._http_error(400, self._INVALID_GRANT_BODY))
         assert (creds, reason) == (None, oauth.REFRESH_AUTH_FAILED)
 
-    def test_http_401_is_auth(self):
-        creds, reason = self._run(
-            lambda req, timeout=0: (_ for _ in ()).throw(
-                urllib.error.HTTPError(req.full_url, 401, "Unauth", None, None)))
+    def test_http_401_invalid_grant_is_auth(self):
+        creds, reason = self._run(self._http_error(401, self._INVALID_GRANT_BODY))
         assert (creds, reason) == (None, oauth.REFRESH_AUTH_FAILED)
+
+    def test_http_400_invalid_request_error_is_transient(self):
+        # The other measured 400 class: a request-level error, NOT a dead token.
+        creds, reason = self._run(self._http_error(400, self._INVALID_REQUEST_BODY))
+        assert (creds, reason) == (None, oauth.REFRESH_TRANSIENT)
+
+    def test_http_400_without_body_is_transient(self):
+        creds, reason = self._run(self._http_error(400, None))
+        assert (creds, reason) == (None, oauth.REFRESH_TRANSIENT)
+
+    def test_http_401_html_body_is_transient(self):
+        # Edge proxies answer with HTML; that is never proof of a dead token.
+        creds, reason = self._run(
+            self._http_error(401, b"<html><body>Access denied</body></html>"))
+        assert (creds, reason) == (None, oauth.REFRESH_TRANSIENT)
+
+    def test_4xx_body_is_logged_visibly(self, caplog):
+        # The 22:34:51 false DEAD was undiagnosable because the 400 body only
+        # logged at DEBUG (invisible at the INFO the app runs at). Pin INFO.
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            self._run(self._http_error(400, self._INVALID_REQUEST_BODY))
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("invalid_request_error" in m for m in msgs)
 
     def test_http_500_is_transient(self):
         creds, reason = self._run(

@@ -29,10 +29,12 @@ TOKEN_EXPIRED = "token expired"
 # NOT back off — the roll spreads it) is never confused with a refresh-429.
 TOKEN_RATE_LIMITED = "token rate limited"
 
-# Why a refresh failed. A 400/401 from the token endpoint (invalid_grant) proves
-# the refresh token is dead; a 429 is a shared per-IP rate limit (back off, don't
-# hammer); everything else (other HTTP status, network blip, timeout, malformed
-# 200) is transient and must NOT wipe good usage.
+# Why a refresh failed. Only a 400/401 whose BODY carries the OAuth
+# ``invalid_grant`` error proves the refresh token is dead — the endpoint also
+# serves non-dead 400s (invalid_request_error envelopes, measured 2026-08-15),
+# so the status code alone is never a death verdict. A 429 is a shared per-IP
+# rate limit (back off, don't hammer); everything else (other HTTP status,
+# network blip, timeout, malformed 200) is transient and must NOT wipe good usage.
 REFRESH_AUTH_FAILED = "auth"
 REFRESH_TRANSIENT = "transient"
 REFRESH_RATE_LIMITED = "rate_limited"
@@ -93,10 +95,12 @@ def _refresh_with_reason(credentials: str) -> tuple[str | None, str]:
     """Refresh an OAuth access token, and report WHY it failed.
 
     Returns ``(new_credentials, "ok")`` on success, ``(None, REFRESH_AUTH_FAILED)``
-    when the token endpoint returns 400/401 (a dead/revoked refresh token —
-    ``invalid_grant``), and ``(None, REFRESH_TRANSIENT)`` for every other failure
-    (other HTTP status, network/timeout, malformed 200, or a missing/unparseable
-    refresh token). The usage path uses the auth/transient split to surface a
+    only when the token endpoint returns 400/401 with an ``invalid_grant`` body
+    (a dead/revoked refresh token), and ``(None, REFRESH_TRANSIENT)`` for every
+    other failure — including a 400/401 WITHOUT invalid_grant (the endpoint
+    serves non-dead 400s: measured invalid_request_error envelopes), other HTTP
+    statuses, network/timeout, malformed 200, or a missing/unparseable refresh
+    token. The usage path uses the auth/transient split to surface a
     definitively-dead credential (TOKEN_EXPIRED) without wiping good usage data
     on a mere network blip.
     """
@@ -149,14 +153,29 @@ def _refresh_with_reason(credentials: str) -> tuple[str | None, str]:
         data["claudeAiOauth"] = oauth
         return json.dumps(data), "ok"
     except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace") if hasattr(e, "read") else ""
+        try:
+            body = e.read().decode(errors="replace")
+        except Exception:
+            body = ""
+        if e.code in (400, 401):
+            # The endpoint serves MULTIPLE classes of 400/401 (measured
+            # 2026-08-15): a dead/rotated-away refresh token is the flat OAuth
+            # {"error": "invalid_grant", ...}; request-level failures use the
+            # Anthropic error envelope (invalid_request_error). Only
+            # invalid_grant proves the credential is dead — classifying by
+            # status code alone rendered transient 400s as "login expired".
+            # Logged at INFO (not DEBUG) so a death verdict is never again
+            # invisible at the level the app runs at.
+            _logger.info(
+                "OAuth refresh HTTP %s: %s", e.code, body[:300] or "<no body>"
+            )
+            if "invalid_grant" in body:
+                return None, REFRESH_AUTH_FAILED
+            return None, REFRESH_TRANSIENT
         _logger.debug("OAuth refresh failed: %r, body: %s", e, body[:500])
-        reason = (
-            REFRESH_AUTH_FAILED if e.code in (400, 401)
-            else REFRESH_RATE_LIMITED if e.code == 429
-            else REFRESH_TRANSIENT
-        )
-        return None, reason
+        if e.code == 429:
+            return None, REFRESH_RATE_LIMITED
+        return None, REFRESH_TRANSIENT
     except Exception as e:
         _logger.debug("OAuth refresh failed: %r", e)
         return None, REFRESH_TRANSIENT

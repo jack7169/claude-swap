@@ -351,6 +351,8 @@ class TestPerAccountFreshness(_Base):
         calls = []
         self._patch_fetch(monkeypatch, {"1": None, "2": USAGE_TOKEN_EXPIRED}, calls)
 
+        # Already a suspect (one prior auth-failure) — this round CONFIRMS death.
+        s._usage_auth_suspect["2"] = 0.0
         out = s._collect_usage(self._info())
 
         assert out[1] == USAGE_TOKEN_EXPIRED  # never mask a dead credential

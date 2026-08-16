@@ -247,6 +247,13 @@ class ClaudeAccountSwitcher:
         # only — never a global stall) so cswap stops hammering a revoked token every
         # ~60s. Cleared on recovery; bypassed by force=True ("Refresh now").
         self._usage_dead_until: dict[str, float] = {}
+        # Auth-failure confirmation: a single invalid_grant is a SUSPECT, not a
+        # death — single 400s have been measured to self-heal on the next probe
+        # (three false "login expired"s, 2026-08-01/-15). Key present = one
+        # unconfirmed auth-failure; the next one confirms DEAD. Cleared on a
+        # successful fetch or credential replacement; a 429/blip in between
+        # neither confirms nor absolves.
+        self._usage_auth_suspect: dict[str, float] = {}
         # Per-account TOKEN-endpoint (refresh) 429 backoff: when the account may next
         # attempt a refresh, and which escalation step it is on. Per-account only —
         # never a global stall — capped at _MAX_BACKOFF and cleared on any success.
@@ -2298,11 +2305,30 @@ class ClaudeAccountSwitcher:
             if k in fetched:
                 val = fetched[k]
                 # A dead credential is surfaced as USAGE_TOKEN_EXPIRED by the oauth
-                # layer itself (fetch_usage_for_account, on a token-endpoint 400/401
-                # = invalid_grant). _collect_usage does NOT re-derive "login expired"
+                # layer itself (fetch_usage_for_account, on a token-endpoint
+                # invalid_grant). _collect_usage does NOT re-derive "login expired"
                 # from stored-token expiry: a backup's stored access token is expired
                 # as its normal resting state between refreshes, so that proxy would
                 # falsely flag every healthy-but-rate-limited backup in turn.
+                # A FIRST auth-failure is downgraded to a transient (suspect):
+                # single 400s self-heal (measured), so only the second consecutive
+                # one confirms DEAD. USAGE_NO_CREDENTIALS stays immediate — it is
+                # a local fact with nothing transient to confirm.
+                if val == USAGE_TOKEN_EXPIRED:
+                    if (
+                        k not in self._usage_auth_suspect
+                        and self._usage_health.get(k) != "DEAD"
+                    ):
+                        self._usage_auth_suspect[k] = now
+                        self._logger.info(
+                            "Account %s (%s) token refresh auth-failed once — "
+                            "treating as transient; a second consecutive failure "
+                            "will mark it dead",
+                            k, email_by_key.get(k, ""),
+                        )
+                        val = None
+                elif isinstance(val, dict):
+                    self._usage_auth_suspect.pop(k, None)
                 # Health TRANSITIONS drive both edge-only logging (B3) and the
                 # dead-reprobe backoff (B4). A bare-None transient blip carries no
                 # health signal, so it does not churn the recorded state.
@@ -2405,6 +2431,7 @@ class ClaudeAccountSwitcher:
         """
         self._usage_dead_until.pop(str(account_num), None)
         self._usage_health.pop(str(account_num), None)
+        self._usage_auth_suspect.pop(str(account_num), None)
         self._clear_refresh_backoff(str(account_num))
         self._drop_usage_cache_entry(str(account_num))
 

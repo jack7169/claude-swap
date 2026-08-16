@@ -89,6 +89,7 @@ class TestHealthTransitionLogging:
         s = _make_switcher()
         h = _Harness(s, monkeypatch)
         with caplog.at_level(logging.INFO, logger="claude-swap"):
+            h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)            # strike 1
             h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)            # DEAD
             h.round({"2": {"five_hour": {"pct": 3.0}}}, force=True)    # DEAD -> HEALTHY
             h.round({"2": {"five_hour": {"pct": 3.0}}}, force=True)    # stays healthy
@@ -111,11 +112,118 @@ class TestHealthTransitionLogging:
         assert len(rl) == 1
 
 
+class TestDeadRequiresConfirmation:
+    """A single auth-failure (400/401) must NOT mark a credential DEAD.
+
+    Measured 2026-08-01 (twice) and 2026-08-15: single token-endpoint 400s that
+    self-healed on the very next probe — the endpoint serves transient 400s, and
+    one of them rendered a healthy account as "login expired" mid-flap-storm.
+    Death is only declared on the SECOND consecutive auth-failure; the first is
+    a suspect: usage is retained, no dead backoff, one INFO edge line.
+    """
+
+    _OK = {"five_hour": {"pct": 5.0}}
+
+    def test_single_auth_failure_is_not_dead_and_retains_usage(
+        self, temp_home, monkeypatch
+    ):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": self._OK}, force=True)
+        out = h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)   # strike 1
+
+        assert out[1] == self._OK                    # last-known usage retained
+        assert out[1] != USAGE_TOKEN_EXPIRED         # menu must NOT say expired
+        assert s._usage_health.get("2") != "DEAD"
+        assert "2" not in s._usage_dead_until        # not excluded from fetches
+
+    def test_second_consecutive_auth_failure_confirms_dead(
+        self, temp_home, monkeypatch, caplog
+    ):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)         # strike 1
+            out = h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)   # confirmed
+
+        assert out[1] == USAGE_TOKEN_EXPIRED
+        assert s._usage_health.get("2") == "DEAD"
+        assert "2" in s._usage_dead_until
+        dead = [r for r in caplog.records if "DEAD" in r.getMessage()]
+        assert len(dead) == 1                        # edge-only, on confirmation
+
+    def test_success_between_failures_resets_the_strike(
+        self, temp_home, monkeypatch
+    ):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)   # strike 1
+        h.round({"2": self._OK}, force=True)              # recovers -> reset
+        out = h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)  # strike 1 again
+
+        assert out[1] == self._OK                    # still only a suspect
+        assert s._usage_health.get("2") != "DEAD"
+
+    def test_rate_limit_between_failures_does_not_reset_the_strike(
+        self, temp_home, monkeypatch
+    ):
+        # A 429 in between is no evidence either way: it neither confirms nor
+        # absolves. The next auth-failure still confirms death.
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)     # strike 1
+        h.round({"2": USAGE_RATE_LIMITED}, force=True)      # transient noise
+        out = h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)
+
+        assert out[1] == USAGE_TOKEN_EXPIRED
+        assert s._usage_health.get("2") == "DEAD"
+
+    def test_strikes_are_per_account(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"1": USAGE_TOKEN_EXPIRED, "2": self._OK}, force=True)
+        h.round({"1": USAGE_TOKEN_EXPIRED, "2": USAGE_TOKEN_EXPIRED}, force=True)
+
+        assert s._usage_health.get("1") == "DEAD"    # two strikes
+        assert s._usage_health.get("2") != "DEAD"    # only one
+
+    def test_clear_usage_health_resets_the_strike(self, temp_home, monkeypatch):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)   # strike 1
+        s.clear_usage_health("2")                         # re-auth
+        out = h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)
+
+        assert s._usage_health.get("2") != "DEAD"         # back to strike 1
+        assert out[1] != USAGE_TOKEN_EXPIRED
+
+    def test_first_failure_logs_one_info_edge(self, temp_home, monkeypatch, caplog):
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)
+
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("auth-failed once" in m and "2" in m for m in msgs)
+        assert not any("DEAD" in m for m in msgs)
+
+    def test_no_credentials_is_still_immediately_dead(self, temp_home, monkeypatch):
+        # USAGE_NO_CREDENTIALS is a LOCAL fact (nothing stored for the slot) —
+        # no server is involved, so there is nothing transient to confirm.
+        from claude_swap.json_output import USAGE_NO_CREDENTIALS
+        s = _make_switcher()
+        h = _Harness(s, monkeypatch)
+        h.round({"2": USAGE_NO_CREDENTIALS}, force=True)
+        assert s._usage_health.get("2") == "DEAD"
+
+
 class TestDeadReprobeBackoff:
     def test_dead_account_excluded_from_next_round(self, temp_home, monkeypatch):
         s = _make_switcher()
         h = _Harness(s, monkeypatch)
-        h.round({"2": USAGE_TOKEN_EXPIRED})                 # t=1000 -> DEAD, dead_until=+900
+        h.round({"2": USAGE_TOKEN_EXPIRED})                 # t=1000 -> strike 1
+        h.now += 61                                         # past the 60s backup TTL
+        h.round({"2": USAGE_TOKEN_EXPIRED})                 # confirmed -> DEAD
         h.now += 61                                         # past the 60s backup TTL
         out = h.round({"2": {"five_hour": {"pct": 1.0}}})   # would recover IF fetched
 
@@ -145,7 +253,8 @@ class TestDeadReprobeBackoff:
     def test_clear_usage_health_pops_dead_and_health(self, temp_home, monkeypatch):
         s = _make_switcher()
         h = _Harness(s, monkeypatch)
-        h.round({"2": USAGE_TOKEN_EXPIRED})                 # arms dead_until + DEAD
+        h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)     # strike 1
+        h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)     # arms dead_until + DEAD
         assert "2" in s._usage_dead_until
         assert s._usage_health.get("2") == "DEAD"
 
@@ -190,6 +299,8 @@ class TestDeadReprobeBackoff:
         # expired" in the menu. Clearing the health (as re-auth does) un-blocks it.
         s = _make_switcher()
         h = _Harness(s, monkeypatch)
+        h.round({"2": USAGE_TOKEN_EXPIRED})                 # strike 1
+        h.now += 61
         h.round({"2": USAGE_TOKEN_EXPIRED})                 # dead -> backed off
         h.now += 61                                         # stale, but within backoff
         h.round({"2": {"five_hour": {"pct": 5.0}}})         # non-forced
@@ -238,11 +349,12 @@ class TestRefreshRateLimitBackoff:
         assert not any("DEAD" in m for m in msgs)       # must NOT read as a logout
 
     def test_genuine_dead_token_still_reports_logout(self, temp_home, monkeypatch):
-        # Contrast: a real 400/401 (invalid_grant) IS a logout — keeps the sentinel,
-        # the DEAD health and the re-auth prompt.
+        # Contrast: a real invalid_grant IS a logout — after the confirming second
+        # failure it keeps the sentinel, the DEAD health and the re-auth prompt.
         s = _make_switcher()
         h = _Harness(s, monkeypatch)
-        out = h.round({"2": USAGE_TOKEN_EXPIRED})
+        h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)     # strike 1 (suspect)
+        out = h.round({"2": USAGE_TOKEN_EXPIRED}, force=True)
         assert out[1] == USAGE_TOKEN_EXPIRED
         assert s._usage_health.get("2") == "DEAD"
 

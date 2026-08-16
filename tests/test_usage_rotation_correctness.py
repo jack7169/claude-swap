@@ -80,6 +80,8 @@ class TestCollectUsageDefinitiveFailure:
             "2": USAGE_TOKEN_EXPIRED,
         })
 
+        # Already a suspect (one prior auth-failure) — this round CONFIRMS death.
+        s._usage_auth_suspect["2"] = 0.0
         out = s._collect_usage(_info(), only={"1", "2"})
 
         # Slot 2 must report the sentinel, NOT the stale {pct: 20} dict.
@@ -115,6 +117,8 @@ class TestCollectUsageDefinitiveFailure:
             "2": USAGE_TOKEN_EXPIRED,
         })
 
+        # Already a suspect (one prior auth-failure) — this round CONFIRMS death.
+        s._usage_auth_suspect["2"] = 0.0
         s._collect_usage(_info(), only={"1", "2"})
 
         # The cache file wraps the usage map in a {"timestamp", "data"} envelope.
@@ -184,9 +188,14 @@ class TestCollectUsageDeadBackupEndToEnd:
         ]
 
         def mock_urlopen(req, timeout=0):
-            # Slot 2's dead refresh token -> token endpoint 400 (invalid_grant).
+            # Slot 2's dead refresh token -> token endpoint 400 with the
+            # measured invalid_grant body (a bodyless 400 is TRANSIENT now).
             if "oauth/token" in req.full_url:
-                raise urllib.error.HTTPError(req.full_url, 400, "Bad", None, None)
+                import io
+                raise urllib.error.HTTPError(
+                    req.full_url, 400, "Bad", None,
+                    io.BytesIO(b'{"error": "invalid_grant"}'),
+                )
             # Only slot 1 (healthy) reaches the usage endpoint; slot 2 short-circuits.
             if "oauth/usage" in req.full_url:
                 resp = MagicMock()
@@ -198,6 +207,8 @@ class TestCollectUsageDeadBackupEndToEnd:
                 return resp
             raise AssertionError(f"Unexpected URL: {req.full_url}")
 
+        # Already a suspect (one prior auth-failure) — this round CONFIRMS death.
+        s._usage_auth_suspect["2"] = 0.0
         with patch("claude_swap.oauth.urllib.request.urlopen", side_effect=mock_urlopen):
             out = s._collect_usage(info, only={"1", "2"})
 
@@ -268,15 +279,17 @@ class TestHealthyBackupNeverFalselyExpired:
         assert "2" not in s._usage_dead_until
 
     def test_genuine_dead_token_still_surfaces_expired(self, temp_home, monkeypatch):
-        # Contrast: when fetch_usage_for_account itself returns the sentinel (a real
-        # token-endpoint 400/401), the account IS surfaced as login-expired + DEAD.
+        # Contrast: when fetch_usage_for_account itself returns the sentinel (a
+        # real invalid_grant) on two consecutive rounds, the account IS surfaced
+        # as login-expired + DEAD.
         s = _make_switcher()
         monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
         self._seed_stale(s)
         _patch_fetch(monkeypatch, {"2": USAGE_TOKEN_EXPIRED})
         info = [(2, "b@x.com", "", "", False, self._expired_creds())]
 
-        out = s._collect_usage(info, only={"2"})
+        s._collect_usage(info, only={"2"}, force=True)     # strike 1 (suspect)
+        out = s._collect_usage(info, only={"2"}, force=True)
 
         assert out[0] == USAGE_TOKEN_EXPIRED
         assert s._usage_health.get("2") == "DEAD"
