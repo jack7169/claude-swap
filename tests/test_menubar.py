@@ -559,6 +559,42 @@ def test_consume_first_equal_reset_moves_on_when_active_is_consumed():
     assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
 
 
+def test_consume_first_jittered_reset_boundary_is_a_tie():
+    # Live-measured 2026-08-15: the API quantizes 5h resets to 10-min boundaries
+    # but reports them with sub-second jitter that is RE-ROLLED on every fetch
+    # (acct 9: 04:59:59.818, acct 10: 05:00:00.447 — same 05:00 boundary). Raw
+    # comparison made the PRIMARY sort key flip order between refreshes, so the
+    # active-wins tiebreak never engaged -> a switch every refresh cycle. Resets
+    # within the same 5-min bucket must compare EQUAL, letting activeness decide.
+    j9 = "2026-08-16T04:59:59.818076+00:00"
+    j10 = "2026-08-16T05:00:00.447370+00:00"
+    a_active = [_cf(9, 20, 38, j9, active=True), _cf(10, 2, 23, j10)]
+    b_active = [_cf(9, 20, 38, j9), _cf(10, 2, 23, j10, active=True)]
+    assert menubar.decide_consume_first(a_active, 90, frozenset()) == ("none", None)
+    assert menubar.decide_consume_first(b_active, 90, frozenset()) == ("none", None)
+
+
+def test_consume_first_jitter_rerolled_across_fetches_stays_stable():
+    # The jitter direction can INVERT between fetches (9 later than 10 on one
+    # fetch, earlier on the next). Whichever way it lands, the decision must not
+    # change while the same account is active.
+    for r9, r10 in [
+        ("2026-08-16T05:00:00.9+00:00", "2026-08-16T04:59:59.1+00:00"),
+        ("2026-08-16T04:59:59.1+00:00", "2026-08-16T05:00:00.9+00:00"),
+    ]:
+        accts = [_cf(9, 20, 38, r9, active=True), _cf(10, 2, 23, r10)]
+        assert menubar.decide_consume_first(accts, 90, frozenset()) == ("none", None)
+
+
+def test_consume_first_distinct_boundaries_still_ordered():
+    # Genuinely different reset boundaries (10-min quantized -> >=10 min apart)
+    # must NOT merge: soonest reset still wins across buckets.
+    early = "2026-08-16T04:50:00.3+00:00"
+    late = "2026-08-16T05:00:00.1+00:00"
+    accts = [_cf(1, 10, 20, late, active=True), _cf(2, 10, 20, early)]
+    assert menubar.decide_consume_first(accts, 90, frozenset()) == ("switch", 2)
+
+
 def test_consume_first_all_session_limited_is_silent():
     # everyone 5h-saturated but weekly has room -> temporary, silent stay.
     accts = [_cf(1, 99, 10, _R_EARLY, active=True), _cf(2, 98, 20, _R_LATE)]

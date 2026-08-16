@@ -545,6 +545,27 @@ def _resets_at_ts(window: dict | str | None) -> float:
     return float("inf")
 
 
+_RESET_BUCKET = 300.0  # seconds; resets are 10-min quantized server-side, so
+# 5-min rounding merges the reported jitter without merging distinct boundaries.
+
+
+def _reset_bucket(ts: float) -> float:
+    """Round a reset timestamp to its logical boundary for COMPARISON.
+
+    The API quantizes 5h resets to 10-minute boundaries but reports them with
+    sub-second jitter that is re-rolled on every fetch (measured 2026-08-15:
+    04:59:59.818 vs 05:00:00.447 for the same boundary). Comparing raw values
+    made consume-first's primary sort key flip order between refreshes — the
+    active-wins tiebreak never engaged, and auto-switch flapped every cycle.
+    Rounding to the nearest 5 minutes makes same-boundary resets compare EQUAL
+    while keeping genuinely different (>=10 min apart) boundaries distinct.
+    Total: inf/NaN pass through unchanged.
+    """
+    if ts != ts or ts == float("inf") or ts == float("-inf"):
+        return ts
+    return round(ts / _RESET_BUCKET) * _RESET_BUCKET
+
+
 def decide_auto_switch(
     accounts: list[tuple[int, str, bool, dict | str | None]],
     threshold: float,
@@ -626,7 +647,9 @@ def decide_consume_first(
     # The active account's known 5h (session) reset; if it's missing/unparseable
     # we treat it as "no information" rather than the worst case, so a peer never
     # displaces a healthy active account just because the API omitted its resets_at.
-    active_reset = _resets_at_ts(active[3].get("five_hour"))
+    # Bucketed (5-min) so same-boundary resets compare equal despite the API's
+    # re-rolled sub-second jitter — see _reset_bucket.
+    active_reset = _reset_bucket(_resets_at_ts(active[3].get("five_hour")))
 
     eligible: list[tuple[float, float, int, int, int, bool]] = []
     any_unverifiable = False
@@ -642,7 +665,7 @@ def decide_consume_first(
             any_weekly_room = True
         limit5 = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
         if five < limit5 and seven < threshold:
-            reset = _resets_at_ts(usage.get("five_hour"))
+            reset = _reset_bucket(_resets_at_ts(usage.get("five_hour")))
             # If the active account's reset is unknown, don't let a peer's known
             # (finite) reset rank ahead of it: raise the peer's reset to the
             # active's (inf) so only headroom/rotation can distinguish them.
