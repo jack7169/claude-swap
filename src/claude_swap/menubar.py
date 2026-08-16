@@ -603,13 +603,15 @@ def decide_consume_first(
     """Proactive 'consume the soonest-resetting session first' strategy.
 
     Eligible accounts have 5h not blocked (hysteresis) AND 7d (weekly) below the
-    threshold; the eligible account whose 5h (session) window resets soonest (then
-    most headroom, then rotation order) is optimal. The weekly-below-cutoff gate
-    means a weekly-exhausted account is never chosen even if its session resets
-    soon. The active account wins exact ties (it is already optimal — never switch
-    to an equally-good peer), and a missing/unparseable 5h reset time on the active
-    account never demotes it below peers (an unknown reset means "no information",
-    not "resets last"). Returns ``("switch", num)``, ``("none", None)`` (already
+    threshold; the eligible account whose 5h (session) window resets soonest is
+    optimal (reset ties: the ACTIVE account first, then most headroom, then
+    rotation order). The weekly-below-cutoff gate means a weekly-exhausted account
+    is never chosen even if its session resets soon. The active account winning
+    reset ties is load-bearing: reset times are server-quantized, so equal resets
+    are common, and any tiebreak that can rank a peer above the active account
+    flip-flops as usage leapfrogs — the active account is consumed fully, then the
+    peer. A missing/unparseable 5h reset time on the active account never demotes
+    it below peers (an unknown reset means "no information", not "resets last"). Returns ``("switch", num)``, ``("none", None)`` (already
     optimal), ``("unknown_active", None)``, ``("no_candidate", None)`` (all
     weekly-exhausted -> notify), ``("no_candidate_unverifiable", None)``, or
     ``("all_session_limited", None)`` (weekly room but all 5h-blocked -> silent).
@@ -657,10 +659,16 @@ def decide_consume_first(
         if any_weekly_room:
             return ("all_session_limited", None)
         return ("no_candidate", None)
-    # Tie-break order: soonest 5h reset, most headroom, then the active account
-    # (not is_active == False sorts first), then rotation index. The is_active
-    # term makes an equally-optimal active account always win.
-    eligible.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
+    # Tie-break order: soonest 5h reset, then the ACTIVE account (not is_active ==
+    # False sorts first), then most headroom, then rotation index. Activeness MUST
+    # outrank headroom: reset times are server-quantized (:30 boundaries), so two
+    # accounts consumed in the same period tie exactly — and with headroom ranked
+    # higher, usage leapfrogs each check cycle (the active one accrues, drops
+    # behind the peer, switch, repeat) -> constant A<->B flapping. Sticking with
+    # the active account on reset ties consumes it fully (until the threshold /
+    # hysteresis blocks it), THEN moves to the peer. Peer-vs-peer ties still rank
+    # by headroom, then rotation.
+    eligible.sort(key=lambda e: (e[0], e[2], e[1], e[3]))
     # Last-resort Fable avoidance (peers only): prefer a Fable-healthy candidate;
     # fall back to a Fable-exhausted one only if every candidate is exhausted.
     fable_ok = [e for e in eligible if not e[5]]

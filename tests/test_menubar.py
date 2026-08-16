@@ -533,6 +533,32 @@ def test_consume_first_tie_break_by_rotation_index():
     assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
 
 
+def test_consume_first_equal_reset_sticks_with_active_despite_peer_headroom():
+    # Reset TIES must never demote the active account — not even for a peer with
+    # far more headroom. Reset times are server-quantized (:30 boundaries), so two
+    # accounts consumed in the same period tie exactly; ranking headroom above
+    # activeness made usage leapfrog each check cycle -> constant A<->B switching.
+    # Consume-first means: drain the current one, THEN the other.
+    accts = [_cf(1, 60, 60, _R_EARLY, active=True), _cf(2, 10, 10, _R_EARLY)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("none", None)
+
+
+def test_consume_first_equal_reset_no_pingpong_either_orientation():
+    # Whichever of the two equal-reset accounts is active, it stays active:
+    # the decision is stable under the usage leapfrog that a switch causes.
+    a_active = [_cf(1, 60, 60, _R_EARLY, active=True), _cf(2, 59, 59, _R_EARLY)]
+    b_active = [_cf(1, 60, 60, _R_EARLY), _cf(2, 61, 61, _R_EARLY, active=True)]
+    assert menubar.decide_consume_first(a_active, 95, frozenset()) == ("none", None)
+    assert menubar.decide_consume_first(b_active, 95, frozenset()) == ("none", None)
+
+
+def test_consume_first_equal_reset_moves_on_when_active_is_consumed():
+    # ...and once the active account IS consumed (over threshold -> ineligible),
+    # the equal-reset peer takes over: one, then the other.
+    accts = [_cf(1, 96, 60, _R_EARLY, active=True), _cf(2, 40, 40, _R_EARLY)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
+
+
 def test_consume_first_all_session_limited_is_silent():
     # everyone 5h-saturated but weekly has room -> temporary, silent stay.
     accts = [_cf(1, 99, 10, _R_EARLY, active=True), _cf(2, 98, 20, _R_LATE)]
