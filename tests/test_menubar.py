@@ -283,13 +283,19 @@ def test_decide_active_has_headroom():
 
 
 def test_decide_active_over_5h_picks_best():
+    # Headroom is compared on the SESSION scale: #3's weekly 80% is worth a whole
+    # session of quota (0 on that scale), so #3 (5h 10%) has more immediate
+    # headroom than #2 (5h 40%) and wins. No weekly resets -> ranking by headroom.
     accts = [_acct(1, 96, 10, active=True), _acct(2, 40, 30), _acct(3, 10, 80)]
-    assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 3)
 
 
 def test_decide_active_over_7d():
-    accts = [_acct(1, 10, 97, active=True), _acct(2, 50, 20)]
+    # A 95% session threshold is a 99% WEEKLY threshold (weekly_threshold).
+    accts = [_acct(1, 10, 99, active=True), _acct(2, 50, 20)]
     assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+    accts = [_acct(1, 10, 97, active=True), _acct(2, 50, 20)]
+    assert menubar.decide_auto_switch(accts, 95) == ("none", None)
 
 
 def test_decide_skips_saturated_candidates():
@@ -298,15 +304,16 @@ def test_decide_skips_saturated_candidates():
 
 
 def test_decide_tie_break_by_7d_then_5h():
-    # both candidates worst=40; lower 7d wins -> acct 2 (7d 30 < 7d 40)
-    accts = [_acct(1, 99, 10, active=True), _acct(2, 40, 30), _acct(3, 20, 40)]
-    assert menubar.decide_auto_switch(accts, 95) == ("switch", 2)
+    # both candidates limiting=40 (5h-bound); lower raw 7d wins -> acct 3 (20 < 30)
+    accts = [_acct(1, 99, 10, active=True), _acct(2, 40, 30), _acct(3, 40, 20)]
+    assert menubar.decide_auto_switch(accts, 95) == ("switch", 3)
 
 
 def test_decide_tie_break_by_5h_when_worst_and_7d_equal():
-    # Both candidates: worst=40, 7d=40; differ only on 5h -> lower 5h wins.
+    # Same raw 7d (40 -> far below the session axis on the weekly scale), so each
+    # candidate's limiting % IS its 5h -> the lower 5h (acct 3) wins.
     accts = [_acct(1, 99, 10, active=True), _acct(2, 30, 40), _acct(3, 20, 40)]
-    # acct2 key=(40,40,30), acct3 key=(40,40,20) -> acct3 (lower 5h)
+    # acct2 key=(inf,30,40,30), acct3 key=(inf,20,40,20) -> acct3
     assert menubar.decide_auto_switch(accts, 95) == ("switch", 3)
 
 
@@ -383,7 +390,7 @@ def test_snapshot_full_fetches_all(monkeypatch):
         def _build_accounts_info(self):
             creds = ""
             return [(1, "a@x", "", "", True, creds), (2, "b@x", "", "", False, creds)]
-        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None, max_age=None):
             seen["only"] = only
             return [None, None]
     menubar._snapshot(_SW(), full=True)
@@ -396,7 +403,7 @@ def test_snapshot_incremental_fetches_active_only():
         _logger = type("L", (), {"debug": staticmethod(lambda *a, **k: None)})()
         def _build_accounts_info(self):
             return [(1, "a@x", "", "", False, ""), (2, "b@x", "", "", True, "")]
-        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None, max_age=None):
             seen["only"] = only
             return [None, None]
     menubar._snapshot(_SW(), full=False)
@@ -508,9 +515,13 @@ def test_consume_first_picks_soonest_session_reset():
 
 def test_consume_first_session_reset_gated_on_weekly_room():
     # #2's session resets soonest, but its weekly is over the cutoff -> excluded;
-    # stay on the active, whose weekly still has room.
-    accts = [_cf(1, 10, 20, _R_LATE, active=True), _cf(2, 10, 98, _R_EARLY)]
+    # stay on the active, whose weekly still has room. The weekly cutoff is on
+    # the session scale: a 95% threshold gates weekly at 99% (weekly_threshold).
+    accts = [_cf(1, 10, 20, _R_LATE, active=True), _cf(2, 10, 99, _R_EARLY)]
     assert menubar.decide_consume_first(accts, 95, frozenset()) == ("none", None)
+    # 98% weekly is still below that cutoff -> eligible -> switch.
+    accts = [_cf(1, 10, 20, _R_LATE, active=True), _cf(2, 10, 98, _R_EARLY)]
+    assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
 
 
 def test_consume_first_stays_when_active_is_optimal():
@@ -519,10 +530,10 @@ def test_consume_first_stays_when_active_is_optimal():
 
 
 def test_consume_first_tie_break_headroom_then_rotation():
-    # equal reset -> more headroom (lower worst) wins; then rotation order.
+    # equal reset -> more headroom (lower limiting %) wins; then rotation order.
     accts = [_cf(1, 99, 99, _R_LATE, active=True),
-             _cf(2, 40, 30, _R_EARLY), _cf(3, 10, 80, _R_EARLY)]
-    # #2 worst=40, #3 worst=80 -> #2
+             _cf(2, 40, 30, _R_EARLY), _cf(3, 60, 30, _R_EARLY)]
+    # #2 limiting=40, #3 limiting=60 -> #2
     assert menubar.decide_consume_first(accts, 95, frozenset()) == ("switch", 2)
 
 
@@ -1202,7 +1213,7 @@ class _SnapSW:
     def _build_accounts_info(self):
         return [(1, "a@x", "", "", True, "")]
 
-    def _collect_usage(self, info, only=None, force=False, max_fetch=None):
+    def _collect_usage(self, info, only=None, force=False, max_fetch=None, max_age=None):
         return [None]
 
 

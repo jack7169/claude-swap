@@ -128,31 +128,52 @@ second or two) detects that the live login isn't in your account list, adds it
 as a new slot, marks it active, and posts a notification. API-key logins can't
 be captured this way — add those with *From setup-token…* / `cswap --add-token`.
 
-**Auto-switch.** Enable *Settings → Auto-switch accounts* to have the app
-switch automatically when the active account crosses a usage threshold. When the
-active account hits the threshold on its 5h or 7d window, it switches to the
-account with the most headroom (skipping any that are themselves at the
-threshold), then notifies you to restart Claude Code. Configure:
+**Refresh cadence.** *Settings → Refresh interval* (1 / 2 / 5 minutes) is how
+often each **backup** account's usage is re-fetched. The **active** account — the
+one burning quota — polls **4× faster** (1 min → every 15s, 2 min → 30s, 5 min →
+75s), and drops to every 15s whenever it is within 10 points of the auto-switch
+threshold. Fetches are spread out one account at a time so the usage API's
+per-IP rate limit is never tripped by a burst. Switching accounts (from the menu,
+the CLI or the auto-switcher) is reflected in the open menu immediately — the
+checkmark, title and rows update in place, no need to close and reopen it.
 
-- **Threshold** (80% / 90% / 95%) — the usage level that triggers a switch.
-- **Cooldown** (5m / 10m / 30m) — minimum time between automatic switches.
-- **Check** — evaluate *with each display refresh*, or on an independent
-  1m / 3m / 5m timer.
+**Auto-switch.** Click the *Auto-swap* line at the top of the menu to have the
+app switch automatically when the active account reaches a usage threshold. It
+then switches to another account (skipping any that are themselves at the
+threshold) and notifies you. Configure under *Settings*:
 
-Defaults are 95% / 10m / with-display-refresh, and auto-switch is off until you
-enable it.
+- **Threshold** (80% / 90% / 95%) — the **session (5h)** usage that triggers a
+  switch. The **weekly (7d)** window is judged on a 5×-compressed scale, since a
+  week's quota is worth about five sessions: a 90% threshold means **98% weekly**
+  (80% → 96%, 95% → 99%), so a busy week doesn't swap you out days early. The
+  menu shows both numbers next to each choice.
+- **Check** — the periodic re-evaluation cadence (*with display refresh*, or
+  15s … 5m). Independently of it, the auto-switcher evaluates **the moment new
+  usage data lands** and **the moment the projected usage reaches the threshold**
+  (see below).
+
+Auto-switch is off until you enable it; the default threshold is 95%.
+
+**Catching a limit between polls.** The app keeps the last few usage samples per
+account and derives the active account's **burn rate** from them. Between polls
+the active usage is **projected forward** at that rate (bounded to 60s past the
+last sample), and the switch decision uses the projected value — so several
+agents burning through 88% → 100% inside one refresh interval trigger the swap
+as the estimate crosses the threshold, not after the next poll shows 100%.
 
 **Strategies.** *Settings → Auto-switch strategy*:
 
 - **Reactive** (default) — stays put until the active account crosses the
-  threshold, then switches to the account with the most headroom.
+  threshold, then switches to the eligible account whose **weekly window resets
+  soonest** (its remaining weekly quota is the closest to being lost), breaking
+  ties by most headroom.
 - **Consume-first** — proactively moves you to the account whose **session (5h)
   window resets soonest** (use-it-or-lose-it), among accounts whose **weekly (7d)
-  usage is still below the cutoff**. It polls all accounts each tick (needed to
-  rank them).
+  usage is still below the (scaled) cutoff**.
 
 A small hysteresis dead band prevents switching back and forth when an account
-hovers at the threshold.
+hovers at the threshold; an account swapped away from on a projection stays
+blocked until its real usage drops below the dead band.
 
 **Start at login.** Install the menu-bar app as a per-user login item so it
 launches automatically and keeps running (it loads into your GUI session so it

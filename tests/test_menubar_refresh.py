@@ -67,7 +67,7 @@ class _RefreshHarness:
     def _build_accounts_info(self):
         return [(1, "a@x", "", "", True, "")]
 
-    def _collect_usage(self, info, only=None, force=False, max_fetch=None):
+    def _collect_usage(self, info, only=None, force=False, max_fetch=None, max_age=None):
         return [None]
 
     # spawn worker threads synchronously-joinable for tests
@@ -84,11 +84,12 @@ class _RefreshHarness:
 
 
 def test_worker_stamps_full_fetch(monkeypatch):
-    """A full refresh stamps ``_last_full_fetch`` (there is no rate-limit backoff
-    to suppress it), so plan_auto_tick's evaluation follows on the next tick."""
+    """A completed refresh stamps ``_last_full_fetch`` (there is no rate-limit
+    backoff to suppress it), so plan_auto_tick's evaluation follows on the next
+    tick. Every snapshot carries every account's row, so any scope counts."""
     monkeypatch.setattr(
         menubar, "_snapshot",
-        lambda switcher, full=True, force=False, max_fetch=None: {
+        lambda switcher, full=True, force=False, max_fetch=None, scope=None, max_age=None: {
             "accounts": [], "active_email": None, "active_usage": None,
             "instances": [],
         },
@@ -105,7 +106,7 @@ def test_refresh_async_force_threads_force_to_snapshot(monkeypatch):
     """on_refresh_now -> refresh_async(force=True) -> _snapshot(force=True)."""
     seen = {}
 
-    def fake_snapshot(switcher, full=True, force=False, max_fetch=None):
+    def fake_snapshot(switcher, full=True, force=False, max_fetch=None, scope=None, max_age=None):
         seen["full"] = full
         seen["force"] = force
         return {"accounts": [], "active_email": None, "active_usage": None,
@@ -131,7 +132,7 @@ def test_snapshot_threads_force_to_collect_usage(monkeypatch):
         def _build_accounts_info(self):
             return [(1, "a@x", "", "", True, "")]
 
-        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None, max_age=None):
             seen["force"] = force
             seen["only"] = only
             return [None]
@@ -153,7 +154,7 @@ def test_forced_refresh_while_in_flight_schedules_followup(monkeypatch):
     release = threading.Event()
     first_in_snapshot = threading.Event()
 
-    def fake_snapshot(switcher, full=True, force=False, max_fetch=None):
+    def fake_snapshot(switcher, full=True, force=False, max_fetch=None, scope=None, max_age=None):
         started.append(force)
         if len(started) == 1:
             first_in_snapshot.set()
@@ -213,13 +214,15 @@ def test_worker_census_logs_anomaly_when_concurrency_exceeds_one(monkeypatch):
     menubar._census_release()
 
 
-def test_nonforced_refresh_while_in_flight_is_dropped(monkeypatch):
-    """A plain (non-forced) tick while in flight is still dropped (no follow-up)."""
+def test_nonforced_refresh_while_in_flight_is_queued_unforced(monkeypatch):
+    """A plain (non-forced) refresh while in flight is queued as ONE follow-up
+    that is itself non-forced (TTL-gated) — a post-switch refresh is never lost,
+    and it never turns into a burst of forced fetches."""
     started = []
     release = threading.Event()
     first_in_snapshot = threading.Event()
 
-    def fake_snapshot(switcher, full=True, force=False, max_fetch=None):
+    def fake_snapshot(switcher, full=True, force=False, max_fetch=None, scope=None, max_age=None):
         started.append(force)
         if len(started) == 1:
             first_in_snapshot.set()
@@ -232,12 +235,17 @@ def test_nonforced_refresh_while_in_flight_is_dropped(monkeypatch):
     app = _RefreshHarness()
     menubar._refresh_async_impl(app, full=True, force=True)
     assert first_in_snapshot.wait(timeout=5)
-    # Non-forced tick while in flight: dropped, no queued follow-up.
+    # Two non-forced requests while in flight: coalesced into one follow-up.
     menubar._refresh_async_impl(app, full=False, force=False)
+    menubar._refresh_async_impl(app, full=True, force=False)
     release.set()
     app.join_all()
+    deadline = time.time() + 5
+    while len(started) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    app.join_all()
 
-    assert started == [True]  # only the first worker ran
+    assert started == [True, False]  # first worker, then one unforced follow-up
 
 
 # ---------------------------------------------------------------------------
@@ -250,17 +258,17 @@ def test_guard_try_begin_force_records_pending_when_in_flight():
     assert guard.try_begin(force=True) is True  # wins the slot
     # in flight; a forced request is rejected but remembered
     assert guard.try_begin(force=True) is False
-    # finishing reports there is a queued forced refresh
-    assert guard.finish_and_take_pending() is True
-    # the pending flag is consumed (one follow-up only)
-    assert guard.finish_and_take_pending() is False
+    # finishing reports there is a queued refresh, and that it is forced
+    assert guard.finish_and_take_pending() == (True, True)
+    # the pending flags are consumed (one follow-up only)
+    assert guard.finish_and_take_pending() == (False, False)
 
 
-def test_guard_nonforced_while_in_flight_sets_no_pending():
+def test_guard_nonforced_while_in_flight_queues_unforced_followup():
     guard = menubar._RefreshGuard()
     assert guard.try_begin(force=False) is True
-    assert guard.try_begin(force=False) is False  # dropped
-    assert guard.finish_and_take_pending() is False  # nothing queued
+    assert guard.try_begin(force=False) is False  # rejected but queued
+    assert guard.finish_and_take_pending() == (True, False)  # follow-up, not forced
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +372,7 @@ def test_snapshot_computes_instances_once(monkeypatch):
         def _build_accounts_info(self):
             return [(1, "a@x", "", "", True, "")]
 
-        def _collect_usage(self, info, only=None, force=False, max_fetch=None):
+        def _collect_usage(self, info, only=None, force=False, max_fetch=None, max_age=None):
             return [None]
 
     menubar._snapshot(_SW(), full=True)
@@ -568,14 +576,19 @@ class _RollApp:
         self._refresh_guard = type("G", (), {"in_flight": in_flight})()
         self.calls = []
 
-    def refresh_async(self, full=False, force=False, max_fetch=None):
+    def refresh_async(self, full=False, force=False, max_fetch=None, scope=None,
+                      max_age=None):
         self.calls.append((full, force, max_fetch))
+        self.scopes = getattr(self, "scopes", []) + [scope]
 
 
 def test_maybe_roll_fetches_one_account_when_due():
+    # _RollApp's accounts are all backups (none active), so the backups roll
+    # covers every one of them.
     app = _RollApp(last_roll=0.0, n=5, refresh_interval=30)
     menubar._maybe_roll(app)
     assert app.calls == [(True, False, 1)]  # full, not forced, one account
+    assert app.scopes == ["backups"]
     assert app._last_roll > 0.0
 
 
@@ -696,7 +709,7 @@ def test_worker_updates_packet_monitor_target_pids(monkeypatch):
     # Keep the snapshot itself trivial and side-effect free.
     monkeypatch.setattr(
         menubar, "_snapshot",
-        lambda switcher, full=True, force=False, max_fetch=None: {
+        lambda switcher, full=True, force=False, max_fetch=None, scope=None, max_age=None: {
             "accounts": [], "active_email": None, "active_usage": None,
             "instances": [],
         },

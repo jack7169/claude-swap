@@ -2123,6 +2123,7 @@ class ClaudeAccountSwitcher:
         only: set[str] | None = None,
         force: bool = False,
         max_fetch: int | None = None,
+        max_age: float | None = None,
     ) -> list[dict | str | None]:
         """Fetch usage per account (cache-first), with per-IP 429 backoff.
 
@@ -2148,6 +2149,12 @@ class ClaudeAccountSwitcher:
         refresh always re-fetches over the network. It deliberately does NOT
         bypass the per-IP 429 backoff — a forced refresh must never hammer a
         rate-limited endpoint.
+
+        ``max_age`` (seconds) replaces BOTH role TTLs for this call: a caller
+        that schedules its own cadence (the menu bar's rolling drivers) says how
+        fresh is fresh enough, so a poll due at exactly the TTL can't be skipped
+        on timer jitter. Unlike ``force`` it only relaxes freshness — the
+        per-account dead/refresh backoffs still apply.
         """
         usage_cache_path = self.backup_dir / "cache" / "usage.json"
         account_keys = [str(info[0]) for info in accounts_info]
@@ -2206,7 +2213,10 @@ class ClaudeAccountSwitcher:
             entry = prior.get(str(info[0]))
             if entry is None:
                 return True
-            ttl = _USAGE_CACHE_TTL if info[4] else _BACKUP_USAGE_TTL
+            if max_age is not None:
+                ttl = max_age
+            else:
+                ttl = _USAGE_CACHE_TTL if info[4] else _BACKUP_USAGE_TTL
             return not _usage_entry_fresh(entry, ttl, now)
 
         def is_dead_backed_off(info) -> bool:

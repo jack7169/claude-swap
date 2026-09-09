@@ -430,3 +430,84 @@ class TestActiveAccountUsageFormat(_Base):
         assert entries["1"] == {"usage": {"five_hour": {"pct": 50.0}},
                                 "fetchedAt": FROZEN,
                                 "validAt": FROZEN}  # new format, valid fetch stamped
+
+
+class TestMaxAgeOverride(_Base):
+    """``max_age`` lets a scheduler that owns its own cadence (the menu bar's
+    rolling drivers) declare how fresh is fresh enough, instead of relying on the
+    fixed per-role TTLs — a 15s active poll must never be skipped by the 15s TTL on
+    timer jitter, and a backup due at its period must not be held back by the 60s
+    backup TTL."""
+
+    def test_max_age_makes_recent_active_entry_stale(
+        self, temp_home, frozen_now, monkeypatch
+    ):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        write_cache(self._cache_path(s), {
+            "1": _entry({"five_hour": {"pct": 11.0}}, age=10),  # fresh by 15s TTL
+            "2": _entry({"five_hour": {"pct": 22.0}}, age=10),
+        })
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 33.0}},
+                                        "2": {"five_hour": {"pct": 44.0}}}, calls)
+
+        out = s._collect_usage(self._info(), only={"1"}, max_age=7.5)
+
+        assert calls == ["1"]
+        assert out[0] == {"five_hour": {"pct": 33.0}}
+
+    def test_max_age_still_dedupes_a_just_fetched_entry(
+        self, temp_home, frozen_now, monkeypatch
+    ):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        write_cache(self._cache_path(s), {
+            "1": _entry({"five_hour": {"pct": 11.0}}, age=3),
+        })
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 33.0}}}, calls)
+
+        out = s._collect_usage(self._info(n=1), only={"1"}, max_age=7.5)
+
+        assert calls == []
+        assert out[0] == {"five_hour": {"pct": 11.0}}
+
+    def test_max_age_overrides_backup_ttl_too(
+        self, temp_home, frozen_now, monkeypatch
+    ):
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        write_cache(self._cache_path(s), {
+            "1": _entry({"five_hour": {"pct": 11.0}}, age=1),
+            "2": _entry({"five_hour": {"pct": 22.0}}, age=30),  # fresh by 60s TTL
+        })
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 33.0}},
+                                        "2": {"five_hour": {"pct": 44.0}}}, calls)
+
+        out = s._collect_usage(self._info(), only={"2"}, max_age=15.0)
+
+        assert calls == ["2"]
+        assert out[1] == {"five_hour": {"pct": 44.0}}
+
+    def test_max_age_does_not_bypass_backoffs(
+        self, temp_home, frozen_now, monkeypatch
+    ):
+        """Unlike ``force``, ``max_age`` only relaxes freshness — a dead or
+        refresh-429'd account keeps its per-account backoff."""
+        s = self._setup(temp_home)
+        monkeypatch.setattr(s, "_live_session_pids", lambda *a: [])
+        write_cache(self._cache_path(s), {
+            "1": _entry({"five_hour": {"pct": 11.0}}, age=100),
+            "2": _entry({"five_hour": {"pct": 22.0}}, age=100),
+        })
+        s._usage_dead_until["1"] = FROZEN + 600
+        s._refresh_backoff_until["2"] = FROZEN + 600
+        calls = []
+        self._patch_fetch(monkeypatch, {"1": {"five_hour": {"pct": 33.0}},
+                                        "2": {"five_hour": {"pct": 44.0}}}, calls)
+
+        s._collect_usage(self._info(), max_age=1.0)
+
+        assert calls == []

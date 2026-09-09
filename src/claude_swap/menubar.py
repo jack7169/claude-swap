@@ -31,7 +31,12 @@ from claude_swap.printer import abbreviate_path, entrypoint_label, ide_short_nam
 from claude_swap.process_detection import get_running_instances
 
 ICON = "⇄"
-REFRESH_CHOICES: tuple[int, ...] = (15, 30, 60, 300)
+# Backup accounts each refresh once per interval; the ACTIVE account polls
+# ACTIVE_REFRESH_FACTOR times faster (see _active_roll_interval). The old 15s/30s
+# choices are gone: with the active account already at the endpoint's 15s floor
+# from the 1-minute setting, they only added requests without adding freshness.
+REFRESH_CHOICES: tuple[int, ...] = (60, 120, 300)
+ACTIVE_REFRESH_FACTOR = 4
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95)
 WARM_COOLDOWN = 600  # seconds an account is skipped after a successful warm/send
 AUTO_CHECK_CHOICES: tuple[int, ...] = (0, 15, 30, 60, 180, 300)  # 0 == with display refresh
@@ -79,12 +84,33 @@ class MenuBarSettings:
         for f in fields(cls):
             if f.name in raw and isinstance(raw[f.name], type(getattr(defaults, f.name))):
                 kwargs[f.name] = raw[f.name]
+        # A persisted interval from a build with other choices (15s/30s) maps to
+        # the nearest valid choice, so the Settings submenu always has a checked
+        # entry and the rolling drivers never run off an unsupported cadence.
+        if "refresh_interval" in kwargs:
+            kwargs["refresh_interval"] = normalize_refresh_interval(kwargs["refresh_interval"])
         return cls(**kwargs)
 
     def save(self, path: Path) -> None:
         """Write settings as pretty JSON, creating parent directories."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+
+def normalize_refresh_interval(value) -> int:
+    """Snap a refresh interval to :data:`REFRESH_CHOICES`.
+
+    A valid choice is kept; anything else rounds UP to the next choice (a legacy
+    15s/30s setting becomes 1 minute) and caps at the longest; a non-positive or
+    non-numeric value falls back to the default. Pure / import-safe.
+    """
+    default = MenuBarSettings.refresh_interval
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return default
+    for choice in REFRESH_CHOICES:
+        if value <= choice:
+            return choice
+    return REFRESH_CHOICES[-1]
 
 
 @dataclass
@@ -222,6 +248,7 @@ def auto_switch_countdown_text(seconds_to_next: float, cadence: int) -> str:
     return f"Next check: {_fmt_mmss(seconds_to_next)} (every {cadence}s)"
 
 
+_AUTO_SWITCH_FAIL_COOLDOWN = 60.0  # seconds before retrying after a failed auto-switch
 _ROLL_MIN_INTERVAL = 15.0  # never fetch faster than this, however many accounts:
 # matches the usage endpoint's observed ~1-success/15s per-IP tolerance so a full
 # account list doesn't re-trip the 429 storm (a 5s floor let 8 accounts flap 429s).
@@ -234,23 +261,121 @@ def _roll_interval(refresh_interval: float, n_accounts: int) -> float:
     return max(_ROLL_MIN_INTERVAL, refresh_interval / max(1, n_accounts))
 
 
-def _maybe_roll(app) -> None:
-    """Fetch ONE account's usage if a roll is due (rolling refresh).
+def _active_roll_interval(refresh_interval: float, near_limit: bool) -> float:
+    """Seconds between polls of the ACTIVE account.
 
-    Spreads usage-API calls across the refresh interval — one account per
-    :func:`_roll_interval` — so a burst never trips the endpoint's per-IP 429.
-    Driven by the common-modes tick so it rolls whether the menu is open or
-    closed. ``_collect_usage``'s stalest-first order means successive rolls
-    naturally rotate across all accounts (and favor the short-TTL active one).
+    The active account is the one burning quota, so it refreshes
+    :data:`ACTIVE_REFRESH_FACTOR` times faster than the backups (1 min -> 15s,
+    2 min -> 30s, 5 min -> 75s), floored at the endpoint's tolerance. Inside the
+    near-limit band of the auto-switch threshold it drops to the floor whatever
+    the setting: that is exactly when a poll-to-poll gap can hide the crossing.
+    """
+    if near_limit:
+        return _ROLL_MIN_INTERVAL
+    return max(_ROLL_MIN_INTERVAL, refresh_interval / ACTIVE_REFRESH_FACTOR)
+
+
+_DISPATCH_GAP = _ROLL_MIN_INTERVAL / 2  # min spacing between ANY two fetch dispatches:
+# the two drivers exclude each other via the guard, but exclusion alone lets them
+# fire one round-trip apart whenever both are due (both sit on the 15s floor at a
+# 1-min interval with 4+ backups) — the burst pattern that 429s the endpoint. A
+# half-floor gap interleaves them evenly instead, and each keeps its own period.
+
+
+def _dispatch_allowed(app, now: float) -> bool:
+    """May a rolling driver start a fetch now? (no worker in flight, gap elapsed)"""
+    if app._refresh_guard.in_flight:
+        return False
+    return now - getattr(app, "_last_fetch_dispatch", 0.0) >= _DISPATCH_GAP
+
+
+def _active_roll_state(app, now: float) -> tuple[float, float] | None:
+    """``(seconds since the last active poll, its period)`` or None if nothing to poll."""
+    accounts = app.snapshot.get("accounts") or ()
+    if not accounts:
+        return None
+    near = active_near_limit(
+        accounts, getattr(app, "_usage_samples", {}) or {},
+        app.settings.auto_switch_threshold, now,
+    )
+    return now - app._last_active_roll, _active_roll_interval(app.settings.refresh_interval, near)
+
+
+def _backup_roll_state(app, now: float) -> tuple[float, float] | None:
+    """``(seconds since the last backups roll, its period)`` or None if no backups."""
+    accounts = app.snapshot.get("accounts") or ()
+    n_backups = sum(1 for a in accounts if not a[2])
+    if n_backups == 0:
+        return None
+    return now - app._last_roll, _roll_interval(app.settings.refresh_interval, n_backups)
+
+
+def _maybe_roll_active(app) -> bool:
+    """Poll the ACTIVE account's usage if its (fast) cadence is due.
+
+    Separate driver from the backups roll (:func:`_maybe_roll`) so the two
+    cadences never compete for the single stalest-first slot. ``max_age`` is
+    half the period: the driver owns the cadence, so the cache TTL must never be
+    able to skip a due poll on timer jitter, yet a poll moments after a manual
+    "Refresh now" is still deduplicated. Skips (without stamping) while a worker
+    is in flight or within :data:`_DISPATCH_GAP` of the last dispatch, so it
+    retries on the next tick. Returns True if it dispatched.
     """
     now = time.time()
-    n = len(app.snapshot.get("accounts") or ()) or 1
-    if now - app._last_roll < _roll_interval(app.settings.refresh_interval, n):
-        return
-    if app._refresh_guard.in_flight:
-        return
+    state = _active_roll_state(app, now)
+    if state is None:
+        return False
+    age, interval = state
+    if age < interval or not _dispatch_allowed(app, now):
+        return False
+    app._last_active_roll = now
+    app._last_fetch_dispatch = now
+    app.refresh_async(full=False, max_fetch=1, scope="active", max_age=interval / 2)
+    return True
+
+
+def _maybe_roll(app) -> bool:
+    """Fetch ONE backup account's usage if the backups roll is due.
+
+    Spreads the backups' usage-API calls across the refresh interval — one
+    account per :func:`_roll_interval` of the BACKUP count — so each backup
+    refreshes once per interval and a burst never trips the endpoint's per-IP
+    429. ``_collect_usage``'s stalest-first order rotates successive rolls across
+    the backups. The active account has its own, faster driver
+    (:func:`_maybe_roll_active`). Driven by the common-modes tick so it rolls
+    whether the menu is open or closed. Returns True if it dispatched.
+    """
+    now = time.time()
+    state = _backup_roll_state(app, now)
+    if state is None:
+        return False
+    age, interval = state
+    if age < interval or not _dispatch_allowed(app, now):
+        return False
     app._last_roll = now
-    app.refresh_async(full=True, max_fetch=1)
+    app._last_fetch_dispatch = now
+    app.refresh_async(full=True, max_fetch=1, scope="backups", max_age=interval / 2)
+    return True
+
+
+def _maybe_roll_all(app) -> None:
+    """Run the rolling drivers: at most ONE dispatch per tick, most-overdue first.
+
+    "Overdue" is relative to each driver's own period (``age / period``), so when
+    both are due neither can systematically win the slot — the one that has
+    waited the larger fraction of its period goes first and the other follows
+    once :data:`_DISPATCH_GAP` has elapsed. With both on the 15s floor this
+    settles into an even 7.5s interleave with each driver keeping its period.
+    """
+    now = time.time()
+    a = _active_roll_state(app, now)
+    b = _backup_roll_state(app, now)
+    a_overdue = (a[0] / a[1]) if a else -1.0
+    b_overdue = (b[0] / b[1]) if b else -1.0
+    order = (_maybe_roll_active, _maybe_roll) if a_overdue >= b_overdue else (_maybe_roll, _maybe_roll_active)
+    for driver in order:
+        if driver(app):
+            return
 
 
 def auto_switch_header_lines(
@@ -465,12 +590,56 @@ def _window_pct(usage: dict | str | None, key: str) -> float | None:
 
 
 def _worst_pct(usage: dict | str | None) -> float | None:
-    """Higher of the 5h/7d utilization, or None if either window is unknown."""
+    """Higher of the RAW 5h/7d utilization, or None if either window is unknown.
+
+    Informational (usage alerts): the auto-switch decisions use
+    :func:`_limiting_pct`, which puts the weekly window on the session scale.
+    """
     five = _window_pct(usage, "five_hour")
     seven = _window_pct(usage, "seven_day")
     if five is None or seven is None:
         return None
     return max(five, seven)
+
+
+WEEKLY_SCALE = 5.0  # a weekly window is worth this many sessions of quota
+
+
+def weekly_equivalent_pct(seven: float) -> float:
+    """Map a WEEKLY utilization onto the SESSION scale for threshold checks.
+
+    The weekly budget is about :data:`WEEKLY_SCALE` sessions' worth, so weekly
+    headroom is worth five times session headroom: 98% weekly (2% left, i.e. a
+    tenth of a session) is as tight as 90% session; 96% weekly ~ 80% session.
+    ``100 - (100 - seven) * WEEKLY_SCALE`` — 100 stays 100; low weekly usage goes
+    (harmlessly) negative, so it never out-ranks the session axis in a ``max``.
+    """
+    return 100.0 - (100.0 - float(seven)) * WEEKLY_SCALE
+
+
+def weekly_threshold(threshold: float) -> float:
+    """The weekly % at which a SESSION threshold triggers (90 -> 98, 80 -> 96)."""
+    return 100.0 - (100.0 - float(threshold)) / WEEKLY_SCALE
+
+
+def _limiting_pct(usage: dict | str | None) -> float | None:
+    """Auto-switch 'limiting %' on the session scale: ``max(5h, weekly-equiv(7d))``.
+
+    None if either window is unknown (an account with unreadable usage is never
+    auto-selected). This is what every decision compares against the user's
+    threshold, so "switch at 90%" means 90% of a session OR 98% of the week —
+    not 90% of the week, which used to swap accounts days early.
+    """
+    five = _window_pct(usage, "five_hour")
+    seven = _window_pct(usage, "seven_day")
+    if five is None or seven is None:
+        return None
+    return max(five, weekly_equivalent_pct(seven))
+
+
+def threshold_label(pct: int) -> str:
+    """Settings-row text for a threshold choice, with its weekly equivalent."""
+    return f"{pct}%  (weekly {weekly_threshold(pct):.0f}%)"
 
 
 def fable_exhausted(usage: dict | str | None) -> bool:
@@ -573,9 +742,18 @@ def decide_auto_switch(
 ) -> tuple[str, int | None]:
     """Reactive auto-switch: switch when the active account hits the threshold.
 
-    ``blocked`` is the hysteresis set (account-number strings at/over limit); a
-    blocked candidate must clear ``threshold - AUTO_HYSTERESIS`` to be eligible
-    again. Returns ``("switch", num)``, ``("none", None)``,
+    "Hits the threshold" is on the session scale (:func:`_limiting_pct`): the
+    5h window at ``threshold`` OR the 7d window at :func:`weekly_threshold`.
+    Candidates must be below the same (scaled) limit; ``blocked`` is the
+    hysteresis set (account-number strings at/over limit) and a blocked
+    candidate must clear ``threshold - AUTO_HYSTERESIS`` to be eligible again.
+
+    Candidate ranking: the account whose WEEKLY window resets soonest first —
+    its remaining weekly quota is the closest to being lost, so spend it — then
+    most headroom (lowest limiting %, then raw 7d, then 5h). Weekly resets are
+    bucketed (:func:`_reset_bucket`) so the API's re-rolled jitter can't reorder
+    same-boundary resets between refreshes; a missing reset (idle window) ranks
+    after every known one. Returns ``("switch", num)``, ``("none", None)``,
     ``("unknown_active", None)``, ``("no_candidate", None)`` (all peers exhausted),
     or ``("no_candidate_unverifiable", None)`` (a peer's usage was unreadable).
     Total — never raises.
@@ -583,37 +761,38 @@ def decide_auto_switch(
     active = next((a for a in accounts if a[2]), None)
     if active is None:
         return ("none", None)
-    active_worst = _worst_pct(active[3])
-    if active_worst is None:
+    active_limiting = _limiting_pct(active[3])
+    if active_limiting is None:
         return ("unknown_active", None)
-    if active_worst < threshold:
+    if active_limiting < threshold:
         return ("none", None)
 
-    candidates: list[tuple[float, float, float, int, bool]] = []
+    candidates: list[tuple[float, float, float, float, int, bool]] = []
     any_unverifiable = False
     for num, _email, is_active, usage in accounts:
         if is_active:
             continue
-        worst = _worst_pct(usage)
-        if worst is None:
+        limiting = _limiting_pct(usage)
+        if limiting is None:
             any_unverifiable = True
             continue
         limit = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
-        if worst >= limit:
+        if limiting >= limit:
             continue
         seven = _window_pct(usage, "seven_day")
         five = _window_pct(usage, "five_hour")
-        candidates.append((worst, seven, five, num, fable_exhausted(usage)))
+        weekly_reset = _reset_bucket(_resets_at_ts(usage.get("seven_day")))
+        candidates.append((weekly_reset, limiting, seven, five, num, fable_exhausted(usage)))
     if not candidates:
         return ("no_candidate_unverifiable", None) if any_unverifiable else ("no_candidate", None)
-    candidates.sort(key=lambda c: (c[0], c[1], c[2]))
+    candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3]))
     # Last-resort Fable avoidance: prefer a Fable-healthy candidate (in the ranked
     # order); fall back to a Fable-exhausted one only if EVERY candidate is
-    # exhausted (never stall). Fable is not in the sort key, so the primary 5h/7d
+    # exhausted (never stall). Fable is not in the sort key, so the primary
     # ranking is unchanged within each group.
-    fable_ok = [c for c in candidates if not c[4]]
+    fable_ok = [c for c in candidates if not c[5]]
     chosen = fable_ok[0] if fable_ok else candidates[0]
-    return ("switch", chosen[3])
+    return ("switch", chosen[4])
 
 
 def decide_consume_first(
@@ -624,7 +803,8 @@ def decide_consume_first(
     """Proactive 'consume the soonest-resetting session first' strategy.
 
     Eligible accounts have 5h not blocked (hysteresis) AND 7d (weekly) below the
-    threshold; the eligible account whose 5h (session) window resets soonest is
+    threshold — on the session scale, i.e. below :func:`weekly_threshold` (see
+    :func:`weekly_equivalent_pct`); the eligible account whose 5h (session) window resets soonest is
     optimal (reset ties: the ACTIVE account first, then most headroom, then
     rotation order). The weekly-below-cutoff gate means a weekly-exhausted account
     is never chosen even if its session resets soon. The active account winning
@@ -661,10 +841,11 @@ def decide_consume_first(
             if not is_active:
                 any_unverifiable = True
             continue
-        if seven < threshold:
+        seven_equiv = weekly_equivalent_pct(seven)  # weekly on the session scale
+        if seven_equiv < threshold:
             any_weekly_room = True
         limit5 = threshold - AUTO_HYSTERESIS if str(num) in blocked else threshold
-        if five < limit5 and seven < threshold:
+        if five < limit5 and seven_equiv < threshold:
             reset = _reset_bucket(_resets_at_ts(usage.get("five_hour")))
             # If the active account's reset is unknown, don't let a peer's known
             # (finite) reset rank ahead of it: raise the peer's reset to the
@@ -675,7 +856,7 @@ def decide_consume_first(
             # never demoted for Fable (the goal is to avoid switching TO an
             # exhausted account, not to switch AWAY from an exhausted active one).
             fable_bad = fable_exhausted(usage) and not is_active
-            eligible.append((reset, _worst_pct(usage), not is_active, idx, num, fable_bad))
+            eligible.append((reset, _limiting_pct(usage), not is_active, idx, num, fable_bad))
     if not eligible:
         if any_unverifiable:
             return ("no_candidate_unverifiable", None)
@@ -708,14 +889,15 @@ def limiting_pct_by_account(
 ) -> dict[str, float | None]:
     """Per-account 'limiting %' feeding the hysteresis FSM, per strategy.
 
-    reactive -> worst-of(5h, 7d); consume-first -> the 5h axis. None when unknown.
+    reactive -> max(5h, weekly-equivalent 7d) (:func:`_limiting_pct`);
+    consume-first -> the 5h axis. None when unknown.
     """
     out: dict[str, float | None] = {}
     for num, _email, _is_active, usage in accounts:
         if strategy == "consume-first":
             out[str(num)] = _window_pct(usage, "five_hour")
         else:
-            out[str(num)] = _worst_pct(usage)
+            out[str(num)] = _limiting_pct(usage)
     return out
 
 
@@ -756,6 +938,41 @@ def plan_auto_tick(
     if now - last_full_fetch > cadence:
         return "wait" if in_flight else "refresh"
     return "evaluate"
+
+
+def plan_auto_eval(
+    *,
+    snapshot_taken_at: float,
+    last_eval_snapshot_at: float,
+    switch_done_at: float,
+    active_over: bool,
+    now: float,
+    fail_until: float,
+) -> str:
+    """Event-driven auto-switch gate: ``hold`` / ``evaluate`` / ``periodic``.
+
+    The periodic cadence (:func:`plan_auto_tick`) alone let a limit be burned
+    through between checks. So, on every tick:
+
+    * ``hold`` — a switch finished AFTER the current snapshot was taken (the
+      rows still show the old active account; deciding on them would re-issue
+      the switch), the auto-switch failure cooldown is running, or there is no
+      snapshot yet.
+    * ``evaluate`` — a NEW snapshot landed since the last evaluation (fresh data
+      -> decide now, not up to a cadence later), or the PROJECTED active usage
+      (:func:`project_active`) is at/over the threshold (the burn rate says the
+      limit is being reached before the next poll).
+    * ``periodic`` — nothing new; fall through to the cadence planner.
+    """
+    if now < fail_until:
+        return "hold"
+    if snapshot_taken_at <= switch_done_at:
+        return "hold"
+    if snapshot_taken_at > last_eval_snapshot_at:
+        return "evaluate"
+    if active_over:
+        return "evaluate"
+    return "periodic"
 
 
 def plan_auto_switch(
@@ -934,30 +1151,41 @@ def run_warm_cycle(
 
 
 def _snapshot(
-    switcher, full: bool = True, force: bool = False, max_fetch: int | None = None
+    switcher,
+    full: bool = True,
+    force: bool = False,
+    max_fetch: int | None = None,
+    scope: str | None = None,
+    max_age: float | None = None,
 ) -> dict:
     """Fetch accounts + usage off the main thread. Returns a render snapshot.
 
     Shape: ``{"accounts": [(num, email, is_active, usage), ...],
     "active_email": str | None, "active_usage": dict | str | None,
     "instances": [(label, folder, session_count, has_ide), ...]}``.
-    ``full=False`` fetches only the active account over the network (backups come
-    from cache); ``full=True`` considers all accounts. ``max_fetch`` caps how many
-    are actually fetched this pass (the rolling driver passes 1 so calls spread
-    across the refresh period). ``force=True`` bypasses ``_collect_usage``'s 15s
-    fresh-cache shortcut so an explicit user refresh always re-fetches. The
-    running-instance list is computed once per refresh and reused. Never raises —
-    failures degrade to empty/unknown.
+    Every snapshot carries EVERY account's row; ``scope`` says which may hit the
+    network this pass — ``"all"``, ``"active"`` (the active account only; nothing
+    when none is active) or ``"backups"`` (every non-active account) — the rest
+    come from cache. ``scope=None`` derives it from the legacy ``full`` flag
+    (``True`` -> all, ``False`` -> active). ``max_fetch`` caps how many are
+    actually fetched (the rolling drivers pass 1 so calls spread across the
+    refresh period); ``max_age`` overrides the cache TTLs (see
+    ``_collect_usage``). ``force=True`` bypasses the fresh-cache shortcut so an
+    explicit user refresh always re-fetches. The running-instance list is computed
+    once per refresh and reused. Never raises — failures degrade to empty/unknown.
     """
+    if scope is None:
+        scope = "all" if full else "active"
     instances = _snapshot_instances(switcher)
     try:
         accounts_info = switcher._build_accounts_info()
         only = None
-        if not full:
-            active = next((str(info[0]) for info in accounts_info if info[4]), None)
-            only = {active} if active else None
+        if scope == "active":
+            only = {str(info[0]) for info in accounts_info if info[4]}
+        elif scope == "backups":
+            only = {str(info[0]) for info in accounts_info if not info[4]}
         usages = switcher._collect_usage(
-            accounts_info, only=only, force=force, max_fetch=max_fetch
+            accounts_info, only=only, force=force, max_fetch=max_fetch, max_age=max_age
         )
         # Attach the per-account "last valid fetch" epoch to a DISPLAY copy of
         # each usage dict (kept off the switcher's cached dicts / CLI / JSON) so
@@ -1068,6 +1296,150 @@ def _usage_signature(usage: dict | str | None):
                 ))
         return tuple(parts)
     return usage  # str sentinel ("no credentials" / "rate limited") or None
+
+
+# --- real-time usage estimation ----------------------------------------------
+# A limit can be burned through between two polls (measured: <90% at one check,
+# 100% before the next, at a 60s interval, with several agents running). The
+# menu bar therefore keeps a short per-account sample history, derives the
+# active account's burn rate from the last two successful fetches, and lets the
+# auto-switcher decide on the PROJECTED usage (and poll faster) near the limit.
+_MAX_SAMPLES = 4  # per account: (validAt, 5h pct, 7d pct) of the last fetches
+_PROJECTION_HORIZON = 60.0  # seconds; never extrapolate further than this past
+# the last sample — a stalled poll must not inflate the estimate without bound.
+NEAR_LIMIT_BAND = 10.0  # percent points below the threshold that count as "near"
+
+
+def record_usage_samples(samples: dict, accounts) -> dict:
+    """Append each account's latest successful fetch to its sample history.
+
+    ``accounts`` are the snapshot's ``(num, email, is_active, usage)`` rows; a
+    row contributes a ``(validAt, 5h pct, 7d pct)`` sample when its usage dict
+    carries a ``validAt`` (attached by :func:`_snapshot` on a successful fetch)
+    that differs from the last recorded one — a retained dict under a 429 keeps
+    its old ``validAt`` and is not double-counted. A window with unknown pct is
+    recorded as ``None``. Histories are capped at :data:`_MAX_SAMPLES`; accounts
+    no longer present are dropped. Returns a NEW dict (the worker rebinds it for
+    the main thread; nothing is mutated in place). Pure / import-safe.
+    """
+    out: dict[str, tuple] = {}
+    for num, _email, _is_active, usage in accounts:
+        key = str(num)
+        hist = list(samples.get(key, ()))
+        if isinstance(usage, dict):
+            at = usage.get("validAt")
+            five = _window_pct(usage, "five_hour")
+            seven = _window_pct(usage, "seven_day")
+            if (
+                isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0
+                and (five is not None or seven is not None)
+                and (not hist or hist[-1][0] != float(at))
+            ):
+                hist.append((float(at), five, seven))
+                hist = hist[-_MAX_SAMPLES:]
+        if hist:
+            out[key] = tuple(hist)
+    return out
+
+
+def usage_rates(history) -> tuple[float, float]:
+    """Burn rate (percent points per second) of the 5h and 7d windows.
+
+    From the LAST TWO samples only — responsive to a burst that started since
+    the previous poll (one new sample is enough to see it). Clamped at zero: a
+    drop means the window reset, and a negative slope must never be projected.
+    Fewer than two samples, a non-positive time delta, or an unknown window ->
+    0.0 for that axis. Pure / total.
+    """
+    if len(history) < 2:
+        return (0.0, 0.0)
+    (t0, f0, s0), (t1, f1, s1) = history[-2], history[-1]
+    dt = t1 - t0
+    if dt <= 0:
+        return (0.0, 0.0)
+
+    def rate(a, b) -> float:
+        if a is None or b is None:
+            return 0.0
+        return max(0.0, (float(b) - float(a)) / dt)
+
+    return (rate(f0, f1), rate(s0, s1))
+
+
+def project_usage(
+    usage: dict | str | None, history, now: float, horizon: float = _PROJECTION_HORIZON
+) -> dict | str | None:
+    """The usage dict extrapolated from its ``validAt`` to ``now`` at the burn rate.
+
+    Each window's pct becomes ``pct + rate * elapsed`` (capped at 100), where
+    ``elapsed`` is the time since the sample, bounded by ``horizon``. Returns the
+    input object itself when there is nothing to project (no history, flat rate,
+    sentinel/None usage, no ``validAt``) so callers can rely on identity for the
+    no-op case; otherwise a shallow copy — the cached dict is never mutated.
+    """
+    if not isinstance(usage, dict) or not history:
+        return usage
+    at = usage.get("validAt")
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or at <= 0:
+        return usage
+    r5, r7 = usage_rates(history)
+    if r5 <= 0 and r7 <= 0:
+        return usage
+    elapsed = max(0.0, min(now - float(at), horizon))
+    out = dict(usage)
+    for key, rate in (("five_hour", r5), ("seven_day", r7)):
+        pct = _window_pct(usage, key)
+        if pct is None or rate <= 0:
+            continue
+        window = dict(usage[key])
+        window["pct"] = min(100.0, pct + rate * elapsed)
+        out[key] = window
+    return out
+
+
+def project_active(accounts, samples: dict, now: float) -> list:
+    """Snapshot rows with the ACTIVE account's usage projected to ``now``.
+
+    Only the active account is burning quota, so only its row is extrapolated;
+    backups keep their last real sample (a stale burn rate from when THEY were
+    active must not inflate them — it would flip-flop the switch right back).
+    """
+    return [
+        (num, email, is_active,
+         project_usage(usage, samples.get(str(num), ()), now) if is_active else usage)
+        for num, email, is_active, usage in accounts
+    ]
+
+
+def active_limiting_pct(accounts) -> float | None:
+    """The active account's limiting % on the session scale, or None.
+
+    Lenient where :func:`_limiting_pct` is strict: with only one window known
+    it returns that axis (this feeds "is it worth polling faster / evaluating
+    now", not the switch decision itself, which stays strict).
+    """
+    for _num, _email, is_active, usage in accounts:
+        if not is_active:
+            continue
+        five = _window_pct(usage, "five_hour")
+        seven = _window_pct(usage, "seven_day")
+        axes = [p for p in (five, weekly_equivalent_pct(seven) if seven is not None else None)
+                if p is not None]
+        return max(axes) if axes else None
+    return None
+
+
+def active_near_limit(
+    accounts, samples: dict, threshold: float, now: float, band: float = NEAR_LIMIT_BAND
+) -> bool:
+    """True when the PROJECTED active usage is within ``band`` of ``threshold``.
+
+    Drives the active poll down to the 15s floor (see
+    :func:`_active_roll_interval`) exactly when a poll-to-poll gap could hide
+    the crossing. Unknown usage is never "near".
+    """
+    pct = active_limiting_pct(project_active(accounts, samples, now))
+    return pct is not None and pct >= threshold - band
 
 
 def detect_dead_credential_edges(
@@ -1202,6 +1574,53 @@ def reauth_outcome_message(
     )
 
 
+def _apply_live_rows(app, now: float) -> None:
+    """In-place refresh of everything a row shows, from the CURRENT snapshot.
+
+    Rebuilding the NSMenu while it is open collapses it, so structural rebuilds
+    are deferred to close (see :func:`_maybe_rebuild_on_dirty`); everything that
+    is NOT structural is re-applied here on every common-modes tick, open or
+    closed: the menu-bar title, each account row's label (usage %, countdowns,
+    refresh age), its CHECKMARK (``state``), its detail lines and its sign-in row
+    (hidden for the active account, titled for its login state). That is what
+    makes a switch — from the menu, the CLI or the auto-switcher — visible while
+    the menu is still dropped down, instead of after a close-and-reopen. Only
+    values that actually differ are assigned (each assignment is a redraw).
+    ``app._account_rows`` holds ``(num, label_item, [detail_items], reauth_item)``;
+    items are duck-typed (``title`` / ``state`` / ``hidden``) so this is
+    import-safe and unit-testable without rumps.
+    """
+    snap = app.snapshot
+    title = format_title(snap.get("active_email"), snap.get("active_usage"), app.settings)
+    if app.title != title:
+        app.title = title
+    by_num = {
+        num: (email, is_active, usage)
+        for (num, email, is_active, usage) in snap.get("accounts", [])
+    }
+    for num, label_item, detail_items, reauth_item in app._account_rows:
+        cur = by_num.get(num)
+        if cur is None:
+            continue
+        email, is_active, usage = cur
+        new_label = format_account_label(num, email, usage, now)
+        if label_item.title != new_label:
+            label_item.title = new_label
+        state = 1 if is_active else 0
+        if label_item.state != state:
+            label_item.state = state
+        for ditem, line in zip(detail_items, account_detail_lines(usage)):
+            text = f"    {line}"
+            if ditem.title != text:
+                ditem.title = text
+        if reauth_item is not None:
+            if reauth_item.hidden != is_active:
+                reauth_item.hidden = is_active
+            reauth_title = reauth_menu_title(usage, False)
+            if reauth_title is not None and reauth_item.title != reauth_title:
+                reauth_item.title = reauth_title
+
+
 def _maybe_rebuild_on_dirty(app) -> bool:
     """Rebuild the menu only when the rendered-state signature actually changed.
 
@@ -1273,17 +1692,24 @@ def _census_release() -> None:
 
 
 def _refresh_async_impl(
-    app, full: bool = False, force: bool = False, max_fetch: int | None = None
+    app,
+    full: bool = False,
+    force: bool = False,
+    max_fetch: int | None = None,
+    scope: str | None = None,
+    max_age: float | None = None,
 ) -> bool:
     """Start a background refresh worker, honoring the in-flight guard.
 
     Compare-and-set under the guard's lock so at most one worker runs at a time.
-    A burst of callers (refresh timer, sync tick, manual "Refresh now") can't
-    each pass the check and spawn a duplicate worker. When ``force=True`` loses
-    the slot to an in-flight worker, the guard records a pending forced refresh
-    so the running worker launches a follow-up — the click is queued, never
-    dropped. Returns True if this call started a worker. Import-safe: spawning
-    goes through ``app._spawn`` so tests can drive it without rumps.
+    A burst of callers (rolling drivers, manual "Refresh now", post-switch
+    refresh) can't each pass the check and spawn a duplicate worker. A request
+    that loses the slot to an in-flight worker is QUEUED (coalesced into one
+    pending follow-up; forced if any queued request was forced) and the running
+    worker launches it on completion — so neither a "Refresh now" click nor the
+    refresh after a switch is ever dropped. Returns True if this call started a
+    worker. Import-safe: spawning goes through ``app._spawn`` so tests can drive
+    it without rumps.
     """
     if not app._refresh_guard.try_begin(force=force):
         return False
@@ -1292,7 +1718,7 @@ def _refresh_async_impl(
     # failed thread-create can't wedge future refreshes.
     _census_admit(app)
     try:
-        app._spawn(_worker_impl, (app, full, force, max_fetch))
+        app._spawn(_worker_impl, (app, full, force, max_fetch, scope, max_age))
     except BaseException:
         _census_release()
         app._refresh_guard.finish()
@@ -1301,20 +1727,28 @@ def _refresh_async_impl(
 
 
 def _worker_impl(
-    app, full: bool, force: bool = False, max_fetch: int | None = None
+    app,
+    full: bool,
+    force: bool = False,
+    max_fetch: int | None = None,
+    scope: str | None = None,
+    max_age: float | None = None,
 ) -> None:
     """Background-refresh worker body (runs off the Cocoa main thread).
 
     Rebinds plain attributes (atomic in CPython) that the main-thread sync tick
     reads. At most one worker runs at a time (see ``_refresh_async_impl``). On
-    completion, if a forced refresh was queued while this worker ran, it starts
-    the follow-up forced refresh so a "Refresh now" click never gets dropped.
-    Import-safe so the force-threading and follow-up logic are unit-testable.
+    completion, if a refresh was queued while this worker ran, it starts the
+    follow-up (forced if the queued request was) so neither a "Refresh now"
+    click nor a post-switch refresh gets dropped. Import-safe so the
+    force-threading and follow-up logic are unit-testable.
     """
     try:
-        now = time.time()
-        if now - app._last_full_fetch >= _FULL_REFRESH_EVERY:
-            full = True
+        started = time.time()
+        if started - app._last_full_fetch >= _FULL_REFRESH_EVERY:
+            # Safety net: nothing has completed for a long time -> fetch every
+            # stale account this pass (TTL-gated), whatever scope was asked for.
+            full, scope, max_fetch, max_age = True, "all", None, None
         # Re-arm Keychain probing each cycle (a one-off `security` timeout flips
         # the store to file mode and sticks for the process); confine the
         # capability-cache mutation under the guard's exclusive lock so a
@@ -1326,9 +1760,24 @@ def _worker_impl(
             # (otherwise the live login is invisible: bare-icon title, no
             # active row, auto-switch inert).
             _maybe_adopt_unmanaged(app)
-            snap = _snapshot(app.switcher, full=full, force=force, max_fetch=max_fetch)
+            snap = _snapshot(
+                app.switcher, full=full, force=force, max_fetch=max_fetch,
+                scope=scope, max_age=max_age,
+            )
         app.snapshot = snap
         app._snapshot_at = time.time()
+        # When the rows were READ (not when the pass finished): the auto-switch
+        # gate compares this against the completion time of a switch to know
+        # whether the snapshot already reflects it.
+        app._snapshot_taken_at = started
+        # Extend the per-account sample history (burn-rate estimation); rebinding
+        # a new dict keeps the main-thread reader from ever seeing a half-update.
+        try:
+            app._usage_samples = record_usage_samples(
+                getattr(app, "_usage_samples", {}) or {}, snap.get("accounts", [])
+            )
+        except Exception:
+            app.switcher._logger.debug("usage sample bookkeeping failed", exc_info=True)
         # Tell the user (once) when a BACKUP credential goes dead — otherwise a
         # revoked refresh token is invisible: the row just reads "token expired".
         # notify.notify (osascript) works from the non-bundled LaunchAgent, where
@@ -1375,11 +1824,11 @@ def _worker_impl(
                 app.switcher._logger.debug(
                     "packet monitor pid update failed", exc_info=True
                 )
-        # A full pass re-fetched over the network (there is no rate-limit backoff
-        # to suppress it), so stamp it as the freshest full fetch — this is what
-        # gates the auto-switch evaluation in plan_auto_tick.
-        if full:
-            app._last_full_fetch = app._snapshot_at
+        # Every completed snapshot carries every account's row (backups from
+        # cache, refreshed on their own roll), so any scope counts as fresh data
+        # for the auto-switch gate in plan_auto_tick and for the safety-net
+        # promotion above.
+        app._last_full_fetch = app._snapshot_at
         # Auto timer start: keep every idle account's 5-hour window warm. Runs
         # here on the worker thread (off the Cocoa main thread) where the fresh
         # usage snapshot is available; urllib sends only, no fork, so it's
@@ -1396,11 +1845,13 @@ def _worker_impl(
         # Record this worker as finished (paired with the _census_admit at its
         # spawn) BEFORE any follow-up admit, so the census reflects reality.
         _census_release()
-        # Release the slot and atomically learn whether a forced refresh was
-        # queued meanwhile; if so, run it now (exactly one worker still active
-        # at a time, since the follow-up re-claims the freed slot).
-        if app._refresh_guard.finish_and_take_pending():
-            _refresh_async_impl(app, full=True, force=True)
+        # Release the slot and atomically learn whether a refresh was queued
+        # meanwhile; if so, run it now (exactly one worker still active at a
+        # time, since the follow-up re-claims the freed slot). Forced only if a
+        # queued request was — a queued post-switch refresh stays TTL-gated.
+        pending, forced = app._refresh_guard.finish_and_take_pending()
+        if pending:
+            _refresh_async_impl(app, full=True, force=forced)
 
 
 def _run_warm_from_snapshot(app, snap: dict) -> None:
@@ -1689,6 +2140,7 @@ class _RefreshGuard:
         self._flag_lock = threading.Lock()
         self._cap_lock = threading.Lock()
         self._in_flight = False
+        self._pending = False
         self._pending_force = False
 
     @property
@@ -1704,15 +2156,16 @@ class _RefreshGuard:
         done under the lock so concurrent callers serialize and exactly one
         wins.
 
-        When a worker is already in flight and ``force=True``, the request is
-        rejected (False) but a pending-forced-refresh flag is recorded so the
-        running worker can launch a follow-up forced refresh on completion —
-        i.e. a user "Refresh now" click is queued, never silently dropped. A
-        non-forced request that loses the slot is dropped as before (the next
-        timer tick will refresh anyway).
+        When a worker is already in flight the request is rejected (False) but
+        QUEUED: a pending flag is recorded so the running worker launches one
+        follow-up refresh on completion — forced if any queued request was
+        forced. So a user "Refresh now" click and the refresh after a switch are
+        never silently dropped (the rolling drivers check ``in_flight`` first
+        and simply retry next tick, so they don't pile up here).
         """
         with self._flag_lock:
             if self._in_flight:
+                self._pending = True
                 if force:
                     self._pending_force = True
                 return False
@@ -1724,20 +2177,21 @@ class _RefreshGuard:
         with self._flag_lock:
             self._in_flight = False
 
-    def finish_and_take_pending(self) -> bool:
-        """Release the slot and atomically consume any queued forced refresh.
+    def finish_and_take_pending(self) -> tuple[bool, bool]:
+        """Release the slot and atomically consume any queued refresh.
 
-        Returns True if a forced refresh was queued while this worker ran (the
-        caller should then start a follow-up forced refresh), False otherwise.
-        Clearing the slot and reading-and-clearing the pending flag happen under
-        the same lock so a forced request arriving in this instant is never lost
-        nor double-counted.
+        Returns ``(pending, forced)``: whether a refresh was queued while this
+        worker ran (the caller should then start one follow-up), and whether
+        that follow-up must be forced. Clearing the slot and reading-and-clearing
+        the pending flags happen under the same lock so a request arriving in
+        this instant is never lost nor double-counted.
         """
         with self._flag_lock:
             self._in_flight = False
-            pending = self._pending_force
+            pending, forced = self._pending, self._pending_force
+            self._pending = False
             self._pending_force = False
-            return pending
+            return pending, forced
 
     def run_exclusive(self):
         """Context manager serializing its body against other callers."""
@@ -2024,14 +2478,18 @@ def run(switcher) -> int:
 
         def tick_(self, _timer):
             app = self.app
-            # Rolling refresh: keep usage current one account at a time, whether
-            # the menu is open or closed (the default-mode refresh_timer is paused
-            # during menu tracking, so drive rolling from the common-modes tick).
-            # This also keeps _last_full_fetch fresh, so the auto-switch below just
+            # Rolling refresh: keep usage current — the active account on its
+            # fast cadence, the backups one at a time — whether the menu is open
+            # or closed (the default-mode refresh_timer is paused during menu
+            # tracking, so drive rolling from the common-modes tick). This also
+            # keeps _last_full_fetch fresh, so the auto-switch below just
             # evaluates on the rolling snapshot rather than bursting its own fetch.
-            _maybe_roll(app)
+            _maybe_roll_all(app)
             if app.settings.auto_switch_enabled:
                 app._auto_tick()  # run the check in common modes (works while open)
+            # Notice an external switch (CLI / auto-switch) while the menu is
+            # open too — the refresh it kicks feeds the in-place row update.
+            app._detect_active_change()
             app._update_live_rows()
 
         def graphTick_(self, _timer):
@@ -2057,13 +2515,22 @@ def run(switcher) -> int:
             self._dirty = False
             self._menu_sig = None  # signature of the last rendered menu (3.3)
             self._countdown_item = None  # live "Next check:" header item, if any
-            self._account_rows = []  # [(num, label_item, [detail_items])] for live updates
+            self._account_rows = []  # [(num, label_item, [detail_items], reauth_item)]
             self._menu_open = False  # set by the NSMenu delegate; gates rebuilds
             self.state = MenuBarState.load(state_path)
             self._snapshot_at = 0.0
+            self._snapshot_taken_at = 0.0  # when the current snapshot's rows were read
             self._last_auto_eval = 0.0
+            self._last_eval_snapshot_at = 0.0  # snapshot the last evaluation decided on
+            self._switch_done_at = 0.0  # completion time of the last auto-switch
+            self._auto_fail_until = 0.0  # auto-switch failure cooldown
             self._last_full_fetch = 0.0
-            self._last_roll = 0.0  # last single-account rolling-refresh fetch
+            self._last_roll = 0.0  # last backups rolling-refresh fetch
+            self._last_active_roll = 0.0  # last active-account (fast) poll
+            self._last_fetch_dispatch = 0.0  # last dispatch by EITHER driver (pacing)
+            # Per-account usage sample history (num-str -> ((validAt, 5h, 7d), ...))
+            # for the burn-rate projection; rebound (never mutated) by the worker.
+            self._usage_samples: dict[str, tuple] = {}
             # Per-account warm cooldown (account-num-str -> last successful warm
             # epoch); prevents a double-send in the gap before a just-started
             # window's resets_at is reflected. In-memory for the MVP.
@@ -2151,13 +2618,18 @@ def run(switcher) -> int:
             ``_refresh_async_impl`` can spawn without referencing rumps)."""
             threading.Thread(target=target, args=args, daemon=True).start()
 
-        def refresh_async(self, full=False, force=False, max_fetch=None):
+        def refresh_async(self, full=False, force=False, max_fetch=None, scope=None,
+                          max_age=None):
             # Compare-and-set under a lock: at most one worker runs at a time.
-            # A forced refresh (manual "Refresh now") that loses the slot is
-            # queued (not dropped); a non-forced tick is dropped as before. See
-            # _refresh_async_impl / _RefreshGuard. ``max_fetch`` caps how many
-            # accounts a single refresh fetches (the rolling driver passes 1).
-            return _refresh_async_impl(self, full=full, force=force, max_fetch=max_fetch)
+            # A refresh that loses the slot is queued as one follow-up (forced if
+            # it was forced), never dropped. See _refresh_async_impl /
+            # _RefreshGuard. ``max_fetch`` caps how many accounts a single refresh
+            # fetches (the rolling drivers pass 1); ``scope``/``max_age`` pick
+            # which accounts may hit the network and how fresh is fresh enough.
+            return _refresh_async_impl(
+                self, full=full, force=force, max_fetch=max_fetch, scope=scope,
+                max_age=max_age,
+            )
 
         def _worker(self, full, force=False):
             # Handoff: the worker rebinds plain attributes (atomic in CPython);
@@ -2165,7 +2637,7 @@ def run(switcher) -> int:
             # Keychain probing each cycle so a transient `security` timeout
             # self-heals; the capability-cache mutation is confined under the
             # guard's exclusive lock. force threads through to bypass the 15s
-            # cache TTL; a queued forced refresh runs as a follow-up on finish.
+            # cache TTL; a queued refresh runs as a follow-up on finish.
             _worker_impl(self, full, force=force)
 
         def _offload(self, work):
@@ -2183,35 +2655,35 @@ def run(switcher) -> int:
             )
 
         def on_refresh_tick(self, _timer):
-            # Rolling refresh: fetch one account per roll, spaced across the
-            # refresh interval, so a burst never trips the usage endpoint's 429.
-            # Driven here (default mode, menu closed) and from the common-modes
-            # tick (menu open); both go through _maybe_roll, coordinated by
-            # _last_roll so they never double-fetch.
-            _maybe_roll(self)
+            # Rolling refresh: the active account on its fast cadence, the
+            # backups one per roll spaced across the refresh interval, so a
+            # burst never trips the usage endpoint's 429. Driven here (default
+            # mode, menu closed) and from the common-modes tick (menu open);
+            # both go through the same drivers, coordinated by their last-roll
+            # stamps so they never double-fetch.
+            _maybe_roll_all(self)
 
         def on_sync_tick(self, _timer):
             # Rebuild the menu only when the rendered-state signature changed
             # (3.3) — avoids a full NSMenu teardown every refresh when nothing
-            # the user sees has changed.
+            # the user sees has changed. Everything else (live rows, active-
+            # change detection, the auto-switch evaluation) runs on the
+            # common-modes timer (see _MenuObserver.tick_ / __init__) so it keeps
+            # working while the menu is open — this default-mode sync timer is
+            # suspended during menu tracking, and a rebuild is deferred then anyway.
             _maybe_rebuild_on_dirty(self)
-            self._detect_active_change()
-            # Live row updates AND the auto-switch evaluation run on the
-            # common-modes timer (see _MenuObserver.tick_ / __init__) so they
-            # keep working while the menu is open — the default-mode sync timer
-            # is suspended during menu tracking.
 
         def _update_live_rows(self):
-            """Live, in-place refresh of all time-/usage-derived menu text.
+            """Live, in-place refresh of all time-/usage-/state-derived menu text.
 
-            Covers the auto-switch 'next check' countdown and every account
-            row's reset countdowns + usage %, re-titling in place (no structural
-            rebuild, which would flicker). Driven by the common-modes timer so it
-            ticks while the menu is open. Account text is read from the *current*
-            snapshot, so a refresh that lands while the menu is open is reflected
-            too. Skipped while a child submenu is showing (mutating the parent
-            dismisses it); only titles that actually changed are set, to avoid
-            needless redraws.
+            Covers the auto-switch 'next check' countdown and, via
+            :func:`_apply_live_rows`, the menu-bar title and every account row's
+            label, checkmark, detail lines and sign-in row — re-titled in place
+            (no structural rebuild, which would flicker). Driven by the
+            common-modes timer so it ticks while the menu is open. Everything is
+            read from the *current* snapshot, so a switch or refresh that lands
+            while the menu is open is reflected without closing it. Skipped while
+            a child submenu is showing (mutating the parent dismisses it).
             """
             highlighted = self.menu._menu.highlightedItem()
             if highlighted is not None and highlighted.hasSubmenu():
@@ -2227,22 +2699,7 @@ def run(switcher) -> int:
                 if item.title != text:
                     item.title = text
 
-            by_num = {
-                num: (email, usage)
-                for (num, email, _active, usage) in self.snapshot["accounts"]
-            }
-            for num, label_item, detail_items in self._account_rows:
-                cur = by_num.get(num)
-                if cur is None:
-                    continue
-                email, usage = cur
-                new_label = format_account_label(num, email, usage, now)
-                if label_item.title != new_label:
-                    label_item.title = new_label
-                for ditem, line in zip(detail_items, account_detail_lines(usage)):
-                    text = f"    {line}"
-                    if ditem.title != text:
-                        ditem.title = text
+            _apply_live_rows(self, now)
 
         def _detect_active_change(self):
             # Reflect account switches from any source (menu, CLI, auto-switcher)
@@ -2268,6 +2725,28 @@ def run(switcher) -> int:
 
         def _auto_tick(self):
             now = time.time()
+            threshold = self.settings.auto_switch_threshold
+            # Event-driven gate first: decide the moment fresh data lands, or the
+            # moment the PROJECTED active usage (burn rate since the last two
+            # polls) reaches the threshold — not up to a cadence later, by which
+            # time a busy account has hit 100% and every agent has died.
+            projected = project_active(self.snapshot["accounts"], self._usage_samples, now)
+            pct = active_limiting_pct(projected)
+            gate = plan_auto_eval(
+                snapshot_taken_at=self._snapshot_taken_at,
+                last_eval_snapshot_at=self._last_eval_snapshot_at,
+                switch_done_at=self._switch_done_at,
+                active_over=pct is not None and pct >= threshold,
+                now=now,
+                fail_until=self._auto_fail_until,
+            )
+            if gate == "hold":
+                return
+            if gate == "evaluate":
+                self._last_auto_eval = now
+                self._last_eval_snapshot_at = self._snapshot_taken_at
+                self._maybe_auto_switch(now, projected)
+                return
             cadence = self.settings.auto_switch_interval or self.settings.refresh_interval
             action = plan_auto_tick(
                 now=now,
@@ -2288,23 +2767,35 @@ def run(switcher) -> int:
                 self.refresh_async(full=True)
                 return
             self._last_auto_eval = now
-            self._maybe_auto_switch(now)
+            self._last_eval_snapshot_at = self._snapshot_taken_at
+            self._maybe_auto_switch(now, projected)
 
-        def _maybe_auto_switch(self, now):
-            accounts = self.snapshot["accounts"]
+        def _maybe_auto_switch(self, now, accounts=None):
+            # ``accounts`` is the snapshot with the ACTIVE row projected to now
+            # (project_active): the hysteresis set and the decision both see the
+            # estimated usage, so an account switched away from on a projection
+            # is blocked (no immediate switch back) until it really drops below
+            # threshold - hysteresis.
+            if accounts is None:
+                accounts = project_active(self.snapshot["accounts"], self._usage_samples, now)
             strategy = self.settings.auto_switch_strategy
             threshold = self.settings.auto_switch_threshold
             limiting = limiting_pct_by_account(accounts, strategy)
-            self.state.blocked = sorted(
+            blocked = sorted(
                 next_blocked(limiting, threshold, AUTO_HYSTERESIS, frozenset(self.state.blocked))
             )
-            self.state.save(state_path)
+            if blocked != self.state.blocked:
+                self.state.blocked = blocked
+                self.state.save(state_path)  # evaluated often now; write only on change
             decision = evaluate_strategy(strategy, accounts, threshold, frozenset(self.state.blocked))
             action, num = plan_auto_switch(decision, self.state, self.settings, now)
             if action == "switch":
                 # No cooldown to stamp — the auto-switch logic is live on every
                 # check cycle. The keychain + FileLock work is still offloaded off
-                # the Cocoa main thread so the UI never freezes (3.2).
+                # the Cocoa main thread so the UI never freezes (3.2). Completion
+                # is stamped (success or failure) so plan_auto_eval holds until a
+                # snapshot taken AFTER the switch lands — deciding on the old rows
+                # would re-issue the switch.
                 def do_switch(num=num):
                     try:
                         self.switcher.switch_to(str(num))
@@ -2313,7 +2804,13 @@ def run(switcher) -> int:
                         # notify.notify (osascript) works from this non-bundled
                         # LaunchAgent process; rumps.notification would raise here.
                         notify.notify(APP_TITLE, f"Auto-switch failed: {e}")
+                        # Back off: with evaluation now event-driven, a failing
+                        # target would otherwise be retried (and re-notified)
+                        # every poll.
+                        self._auto_fail_until = time.time() + _AUTO_SWITCH_FAIL_COOLDOWN
                         return
+                    finally:
+                        self._switch_done_at = time.time()
                     # No rumps.notification here: the swap notification is posted
                     # by the unified notifier (switch_to -> _perform_switch ->
                     # _announce_switch -> notify.notify), wired in cli.main.
@@ -2410,18 +2907,18 @@ def run(switcher) -> int:
                 # runs the browser sign-in for THIS account (no switch, no terminal),
                 # re-authenticating it in place. Loud when the login is expired, quiet
                 # otherwise — but ALWAYS present, so no account state can strand the
-                # user without a way to renew its login. Static title, so it's left
-                # out of detail_items (the in-place sync-tick refresh only touches
-                # usage %/countdowns).
-                reauth_title = reauth_menu_title(usage, is_active)
-                if reauth_title is not None:
-                    reauth = rumps.MenuItem(
-                        reauth_title, callback=self._make_reauth(num, email)
-                    )
-                    self.menu[f"reauth-{num}"] = reauth
+                # user without a way to renew its login. The row is built for EVERY
+                # account and hidden for the active one (Claude Code owns that
+                # credential), so a switch while the menu is open can move the
+                # row in place (_apply_live_rows) instead of needing a rebuild.
+                reauth = rumps.MenuItem(
+                    reauth_menu_title(usage, False), callback=self._make_reauth(num, email)
+                )
+                reauth.hidden = is_active
+                self.menu[f"reauth-{num}"] = reauth
                 # Keep references so the common-modes timer can refresh each
-                # row's reset countdowns + usage % in place (no rebuild).
-                self._account_rows.append((num, item, detail_items))
+                # row's label, checkmark, detail lines and sign-in row in place.
+                self._account_rows.append((num, item, detail_items, reauth))
             if not accounts:
                 self.menu.add(rumps.MenuItem("No managed accounts", callback=None))
 
@@ -2537,10 +3034,16 @@ def run(switcher) -> int:
                 ch.state = 1 if self.settings.title_pct == mode else 0
                 title_pct.add(ch)
             menu.add(title_pct)
+            # Backups refresh once per interval; the active account 4x as often
+            # (see _active_roll_interval), so the label says both.
             interval = rumps.MenuItem("Refresh interval")
-            labels = {15: "15 seconds", 30: "30 seconds", 60: "60 seconds", 300: "5 minutes"}
+            labels = {60: "1 minute", 120: "2 minutes", 300: "5 minutes"}
             for secs in REFRESH_CHOICES:
-                choice = rumps.MenuItem(labels[secs], callback=self._make_interval(secs))
+                active_every = int(_active_roll_interval(secs, near_limit=False))
+                choice = rumps.MenuItem(
+                    f"{labels[secs]}  (active every {active_every}s)",
+                    callback=self._make_interval(secs),
+                )
                 choice.state = 1 if self.settings.refresh_interval == secs else 0
                 interval.add(choice)
             menu.add(interval)
@@ -2568,7 +3071,7 @@ def run(switcher) -> int:
 
             threshold_menu = rumps.MenuItem("Auto-switch threshold")
             for pct in AUTO_THRESHOLD_CHOICES:
-                ch = rumps.MenuItem(f"{pct}%", callback=self._make_threshold(pct))
+                ch = rumps.MenuItem(threshold_label(pct), callback=self._make_threshold(pct))
                 ch.state = 1 if self.settings.auto_switch_threshold == pct else 0
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
